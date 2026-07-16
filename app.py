@@ -9,7 +9,13 @@ import streamlit.components.v1 as components
 
 from agent_service import CampusAgentService
 from campus_service import CampusError, CampusService
-from config import DB_PATH, MATERIALS_DIR, MAX_EVIDENCE_CHARS
+from config import (
+    DB_PATH,
+    MATERIALS_DIR,
+    MAX_EVIDENCE_CHARS,
+    get_ai_settings,
+    save_user_ai_settings,
+)
 from database import LearningDatabase
 from llm_provider import backend_provider_status
 from ui import inject_theme
@@ -117,10 +123,58 @@ with st.sidebar:
     user_id = st.text_input("学生 ID", value="demo_student_001").strip() or "demo_student_001"
     ai_status = backend_provider_status()
     if ai_status["configured"]:
-        st.success("千问智能体已配置")
+        mode_label = {
+            "relay": "默认云端服务",
+            "custom": "自定义接口",
+            "qwen": "本机管理员配置",
+        }.get(str(ai_status["mode"]), "智能接口")
+        st.success(f"智能服务已连接：{mode_label}")
     else:
-        st.error("千问智能体尚未配置")
-    st.caption(f"{ai_status['provider']} · {ai_status['model']} · 用户端不接触 API Key")
+        st.error("智能服务尚未完成配置")
+    st.caption(f"{ai_status['provider']} · {ai_status['model']}")
+    with st.expander("AI 服务设置"):
+        current_ai = get_ai_settings()
+        selected_mode = st.radio(
+            "调用方式",
+            ["默认云端服务", "使用我自己的接口"],
+            index=0 if current_ai["mode"] == "relay" else 1,
+            help="默认云端服务不会把千问 API Key 下载到本机。",
+        )
+        if selected_mode == "默认云端服务":
+            st.caption("调用项目维护者部署的中转服务；真实千问 Key 只保存在云服务器。")
+            if st.button("切换到默认云端服务", use_container_width=True):
+                if run(lambda: (save_user_ai_settings("relay"), True)[1],
+                       "已切换到默认云端服务"):
+                    st.rerun()
+        else:
+            with st.form("custom_ai_settings"):
+                custom_base_url = st.text_input(
+                    "OpenAI 兼容 Base URL",
+                    value=str(current_ai["base_url"]) if current_ai["mode"] == "custom" else "",
+                    placeholder="https://example.com/v1",
+                )
+                custom_model = st.text_input(
+                    "模型名称",
+                    value=str(current_ai["model"]) if current_ai["mode"] == "custom" else "qwen-plus",
+                )
+                custom_api_key = st.text_input(
+                    "API Key",
+                    type="password",
+                    help="仅保存到本机 user_ai.env，该文件已被 Git 排除。",
+                )
+                save_custom = st.form_submit_button("保存并使用自定义接口")
+            if save_custom:
+                if run(lambda: (
+                    save_user_ai_settings(
+                        "custom",
+                        base_url=custom_base_url,
+                        api_key=custom_api_key,
+                        model=custom_model,
+                    ),
+                    True,
+                )[1], "自定义接口已保存"):
+                    st.rerun()
+        st.caption("公共部署场景不要开放本机 Key 配置；此入口用于用户自行下载运行。")
     st.caption("教师端已按当前阶段要求禁用")
 
 hero()

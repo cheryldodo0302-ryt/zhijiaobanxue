@@ -1,0 +1,7 @@
+fastapi==0.115.14
+uvicorn==0.34.3
+h11==0.14.0
+requests==2.32.4
+certifi==2025.6.15
+# Required by AnyIO on the Function Compute Python 3.10 runtime.
+exceptiongroup==1.3.0

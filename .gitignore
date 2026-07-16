@@ -15,6 +15,11 @@ venv/
 env/
 build/
 dist/
+relay_build_*/
+relay_deploy/
+relay-deploy.zip
+relay-deploy-ready.zip
+relay-deploy-linux-x64.zip
 *.egg-info/
 
 # Runtime data and local logs
@@ -36,6 +41,7 @@ temp/
 server.env
 server.env.*
 !server.env.example
+user_ai.env
 .streamlit/secrets.toml
 
 # Editors and operating-system files

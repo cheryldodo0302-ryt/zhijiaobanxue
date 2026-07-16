@@ -70,7 +70,7 @@ switch ($Mode) {
     "ai-check" {
         & $pythonExe @pythonArgs qwen_check.py
         if ($LASTEXITCODE -ne 0) {
-            throw "Qwen backend connectivity check failed."
+            throw "AI backend connectivity check failed."
         }
         break
     }
