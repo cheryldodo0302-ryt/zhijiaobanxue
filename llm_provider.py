@@ -10,7 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from config import AI_API_KEY, AI_BASE_URL, AI_MODEL, AI_PROVIDER
+from config import get_ai_settings
 
 
 class TLS12Adapter(HTTPAdapter):
@@ -52,10 +52,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self.session.mount("https://", TLS12Adapter(max_retries=retries))
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("尚未配置智能服务 Base URL")
         base_urls = [self.base_url]
-        public_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        if self.base_url != public_url:
-            base_urls.append(public_url)
         failures = []
         response = None
         for base_url in base_urls:
@@ -78,10 +77,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 failures.append(f"{endpoint} -> {type(exc).__name__}: {exc}")
         if response is None:
-            raise RuntimeError(
-                "千问专属地址和北京公共地址均无法建立连接。请检查校园网、防火墙、VPN、"
-                "HTTP_PROXY/HTTPS_PROXY。详情：" + " | ".join(failures)
-            )
+            raise RuntimeError("无法连接智能服务，请检查网络或接口配置。详情：" + " | ".join(failures))
         try:
             data = response.json()
         except ValueError as exc:
@@ -143,20 +139,30 @@ class QwenProvider(OpenAICompatibleProvider):
 
 
 def build_backend_provider() -> LLMProvider:
-    if AI_PROVIDER in {"qwen", "dashscope", "aliyun"}:
-        if not AI_API_KEY:
-            raise RuntimeError("千问大模型尚未配置：请由部署管理员执行 configure_qwen.ps1")
-        return QwenProvider(AI_API_KEY, AI_BASE_URL, AI_MODEL)
-    if AI_PROVIDER in {"openai", "openai_compatible"}:
-        if not all((AI_API_KEY, AI_BASE_URL, AI_MODEL)):
-            raise RuntimeError("后端智能体配置不完整")
-        return OpenAICompatibleProvider(AI_API_KEY, AI_BASE_URL, AI_MODEL)
-    raise RuntimeError(f"后端智能体类型不受支持：{AI_PROVIDER}")
+    settings = get_ai_settings()
+    provider = str(settings["provider"])
+    api_key = str(settings["api_key"])
+    base_url = str(settings["base_url"])
+    model = str(settings["model"])
+    if not settings["configured"]:
+        if provider == "relay":
+            raise RuntimeError("默认云端智能服务尚未部署或客户端中转配置缺失")
+        raise RuntimeError("自定义智能服务配置不完整")
+    if provider in {"relay", "qwen", "dashscope", "aliyun"}:
+        return QwenProvider(api_key, base_url, model)
+    if provider in {"openai", "openai_compatible"}:
+        # Use QwenProvider here because it also implements the OpenAI-compatible
+        # multimodal OCR request used by the student material workflow.
+        return QwenProvider(api_key, base_url, model)
+    raise RuntimeError(f"后端智能体类型不受支持：{provider}")
 
 
 def backend_provider_status() -> dict[str, str | bool]:
+    settings = get_ai_settings()
     return {
-        "provider": AI_PROVIDER,
-        "model": AI_MODEL or "not_configured",
-        "configured": bool(AI_API_KEY and AI_BASE_URL and AI_MODEL),
+        "mode": str(settings["mode"]),
+        "provider": str(settings["provider"]),
+        "model": str(settings["model"]) or "not_configured",
+        "base_url": str(settings["base_url"]),
+        "configured": bool(settings["configured"]),
     }

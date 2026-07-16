@@ -47,11 +47,19 @@ python -m streamlit run app.py
 .\start.ps1 ui
 ```
 
-系统后端固定接入北京地域业务空间 `ws-c4qflt1k6x8xwd4f` 的阿里云百炼 OpenAI 兼容接口，默认模型为 `qwen-plus`。学生和教师端不会出现模型配置输入框。学生演示账号是 `demo_student_001`，教师演示账号是 `demo_teacher_001`；首次启动会创建公开虚拟课程“人工智能基础（虚拟课程）”并导入两份演示资料。
+`cloud` 分支已内置云端中转连接。GitHub 下载者不需要填写千问 API Key，系统默认通过阿里云函数计算中转调用北京地域业务空间中的模型。学生演示账号是 `demo_student_001`，教师演示账号是 `demo_teacher_001`；首次启动会创建公开虚拟课程“人工智能基础（虚拟课程）”并导入两份演示资料。
 
 学生端所有智能能力统一经过 `student_assistant` 编排轻量化 Skill：课程检索与课后答疑、课堂互动练习、作答评价、错题与薄弱点研判。共享课程中的学习反馈只以匿名聚合形式交给 `teacher_assistant`，用于资料覆盖分析和课程内容迭代建议；个人课程数据不会进入教师端。
 
-首次部署时，由管理员在服务器执行一次 `./configure_qwen.ps1`，安全输入百炼 `DASHSCOPE_API_KEY`。脚本会把密钥、业务空间地址和模型写入仅后端读取、受当前 Windows 用户权限保护的 `server.env`，随后自动执行真实接口连通性检查。该文件不会发送到浏览器、写入 SQLite 或提交到代码仓库。系统不会用本地模板伪装大模型回答；密钥缺失或真实接口调用失败时会明确报错。也可随时执行 `./start.ps1 ai-check` 单独检查模型连接。
+下载后可先执行以下命令验证云端模型：
+
+```powershell
+.\start.ps1 ai-check
+```
+
+正常会显示 `SUCCESS: 智能服务连接成功`。真实 `DASHSCOPE_API_KEY` 只保存在阿里云函数计算环境变量中，不会下载到本机、写入 SQLite 或提交到仓库。学生也可在侧栏“AI 服务设置”中选择自己的 OpenAI 兼容 Base URL、API Key 和模型；自定义配置仅保存在本机且不会被 Git 跟踪。
+
+如果是系统管理员需要绕过中转进行本机直连，仍可执行 `.\configure_qwen.ps1`，该模式会把 Key 保存到已被 Git 排除的 `server.env`。
 
 启动 FastAPI：
 
@@ -77,3 +85,12 @@ python -m pytest -q
 如需把运行数据放到其他位置，可设置环境变量 `ZHIJIAO_DATA_DIR`。
 
 个人课程不会进入教师统计；教师端的班级分析只读取共享课程数据且不返回学生 ID。Streamlit、FastAPI 和统一 Agent 接口均复用 `CampusService`，不能绕过这些规则。
+
+## GitHub 下载者共享云端 AI
+
+项目支持“云端中转”和“用户自定义 OpenAI 兼容接口”两种方式。真实千问
+`DASHSCOPE_API_KEY` 只放在中转服务器环境变量中，不进入 GitHub；下载者默认通过
+`relay_client.env` 连接中转服务，也可在学生端侧栏“AI 服务设置”中填写自己的
+Base URL、API Key 和模型。本机自定义配置保存在已被 Git 排除的 `user_ai.env`。
+
+完整部署步骤见 [CLOUD_RELAY_DEPLOYMENT.md](CLOUD_RELAY_DEPLOYMENT.md)。
