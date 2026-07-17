@@ -12,7 +12,11 @@ def main() -> None:
     print(f"Mode: {status['mode']}")
     print(f"Provider: {status['provider']}")
     print(f"Model: {status['model']}")
-    print(f"Endpoint: {base_url}/chat/completions")
+    if status["provider"] == "gemini":
+        endpoint = base_url if ":generateContent" in base_url else f"{base_url}/models/{status['model']}:generateContent"
+    else:
+        endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+    print(f"Endpoint: {endpoint}")
     if not status["configured"]:
         raise SystemExit("FAILED: AI service configuration is incomplete.")
     parsed = urlparse(base_url)

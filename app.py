@@ -128,7 +128,7 @@ with st.sidebar:
             "custom": "自定义接口",
             "qwen": "本机管理员配置",
         }.get(str(ai_status["mode"]), "智能接口")
-        st.success(f"智能服务已连接：{mode_label}")
+        st.success(f"智能服务已配置：{mode_label}")
     else:
         st.error("智能服务尚未完成配置")
     st.caption(f"{ai_status['provider']} · {ai_status['model']}")
@@ -148,10 +148,26 @@ with st.sidebar:
                     st.rerun()
         else:
             with st.form("custom_ai_settings"):
+                provider_labels = {
+                    "自动识别（推荐）": "auto",
+                    "OpenAI 兼容接口": "openai_compatible",
+                    "Google Gemini 原生接口": "gemini",
+                }
+                current_provider = str(current_ai["provider"])
+                default_provider_label = next(
+                    (label for label, value in provider_labels.items() if value == current_provider),
+                    "自动识别（推荐）",
+                )
+                custom_provider_label = st.selectbox(
+                    "接口协议",
+                    list(provider_labels),
+                    index=list(provider_labels).index(default_provider_label),
+                )
                 custom_base_url = st.text_input(
-                    "OpenAI 兼容 Base URL",
+                    "API Base URL 或完整请求地址",
                     value=str(current_ai["base_url"]) if current_ai["mode"] == "custom" else "",
-                    placeholder="https://example.com/v1",
+                    placeholder="OpenAI: https://example.com/v1；Gemini: https://generativelanguage.googleapis.com/v1beta",
+                    help="可填写根地址，也可粘贴以 /chat/completions 或 :generateContent 结尾的完整地址。",
                 )
                 custom_model = st.text_input(
                     "模型名称",
@@ -160,7 +176,11 @@ with st.sidebar:
                 custom_api_key = st.text_input(
                     "API Key",
                     type="password",
-                    help="仅保存到本机 user_ai.env，该文件已被 Git 排除。",
+                    help=(
+                        "仅保存到本机 user_ai.env，该文件已被 Git 排除。"
+                        "Gemini 原生接口必须使用 Google AI Studio 创建且可调用 Gemini API 的 Key，"
+                        "不能使用千问、OpenAI 或其他平台的 Key。"
+                    ),
                 )
                 save_custom = st.form_submit_button("保存并使用自定义接口")
             if save_custom:
@@ -170,6 +190,7 @@ with st.sidebar:
                         base_url=custom_base_url,
                         api_key=custom_api_key,
                         model=custom_model,
+                        provider=provider_labels[custom_provider_label],
                     ),
                     True,
                 )[1], "自定义接口已保存"):
@@ -217,25 +238,41 @@ with tab_course:
                             "file_name": f"{text_name or '文本材料'}.txt", "mime_type": "text/plain",
                             "content_base64": base64.b64encode(pasted.encode("utf-8")).decode("ascii"),
                         })
-                        if result: st.success(f"已保存并解析为 {result['chunk_count']} 个文字片段"); st.rerun()
+                        if result:
+                            st.success(f"已保存并解析为 {result['chunk_count']} 个文字片段")
                 with file_tab:
-                    uploaded = st.file_uploader("上传 PDF 或 Word", type=["pdf", "docx"], key="student_docs")
-                    if uploaded and st.button("解析文档", type="primary"):
+                    with st.form(f"document_upload_{selected_id}", clear_on_submit=True):
+                        uploaded = st.file_uploader(
+                            "上传 PDF 或 Word", type=["pdf", "docx"], key=f"student_docs_{selected_id}"
+                        )
+                        submit_document = st.form_submit_button("解析文档", type="primary")
+                    if uploaded and submit_document:
                         result = invoke("student_document_upload", selected_id, {
                             "file_name": uploaded.name, "mime_type": uploaded.type or "application/octet-stream",
                             "content_base64": base64.b64encode(uploaded.getvalue()).decode("ascii"),
                         })
-                        if result: st.success(f"文档已解析为 {result['chunk_count']} 个后端文字片段"); st.rerun()
+                        if result:
+                            st.success(f"文档已解析为 {result['chunk_count']} 个后端文字片段")
                 with image_tab:
-                    image_file = st.file_uploader("上传带文字的图片", type=["png", "jpg", "jpeg", "webp"], key="student_image")
-                    if image_file:
-                        st.image(image_file, width=360)
-                        if st.button("调用千问 OCR 并保存文字", type="primary"):
-                            result = invoke("image_text_extract", selected_id, {
-                                "file_name": image_file.name, "mime_type": image_file.type,
-                                "content_base64": base64.b64encode(image_file.getvalue()).decode("ascii"),
-                            })
-                            if result: st.success("图片文字已提取并保存到课程后端"); st.text_area("提取结果", result["extracted_text"], height=180); st.rerun()
+                    with st.form(f"image_upload_{selected_id}", clear_on_submit=True):
+                        image_file = st.file_uploader(
+                            "上传带文字的图片", type=["png", "jpg", "jpeg", "webp"],
+                            key=f"student_image_{selected_id}",
+                        )
+                        if image_file:
+                            st.image(image_file, width=360)
+                        submit_image = st.form_submit_button("调用当前视觉模型并保存文字", type="primary")
+                    if image_file and submit_image:
+                        result = invoke("image_text_extract", selected_id, {
+                            "file_name": image_file.name, "mime_type": image_file.type,
+                            "content_base64": base64.b64encode(image_file.getvalue()).decode("ascii"),
+                        })
+                        if result:
+                            st.success("图片文字已提取并保存到课程后端")
+                            st.text_area(
+                                "提取结果", result["extracted_text"], height=180,
+                                key=f"ocr_result_{selected_id}", disabled=True,
+                            )
             else:
                 st.info("这是教师共享课程，学生可使用资料，但不能修改源文件。")
             documents = invoke("document_status", selected_id) or []

@@ -58,7 +58,7 @@ class OpenAICompatibleProvider(LLMProvider):
         failures = []
         response = None
         for base_url in base_urls:
-            endpoint = f"{base_url}/chat/completions"
+            endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
             try:
                 response = self.session.post(
                     endpoint,
@@ -81,10 +81,10 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             data = response.json()
         except ValueError as exc:
-            raise RuntimeError(f"千问返回了非 JSON 内容（HTTP {response.status_code}）：{response.text[:300]}") from exc
+            raise RuntimeError(f"智能服务返回了非 JSON 内容（HTTP {response.status_code}）：{response.text[:300]}") from exc
         if response.status_code >= 400:
             message = data.get("message") or data.get("error", {}).get("message") or str(data)
-            raise RuntimeError(f"千问 API 调用失败（HTTP {response.status_code}）：{message}")
+            raise RuntimeError(f"智能服务 API 调用失败（HTTP {response.status_code}）：{message}")
         return data
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
@@ -100,9 +100,9 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             content = data["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"千问 API 返回格式异常：{str(data)[:300]}") from exc
+            raise RuntimeError(f"智能服务 API 返回格式异常：{str(data)[:300]}") from exc
         if not content:
-            raise RuntimeError("千问返回了空内容")
+            raise RuntimeError("智能服务返回了空内容")
         return content
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> Any:
@@ -111,7 +111,7 @@ class OpenAICompatibleProvider(LLMProvider):
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"千问未返回有效 JSON：{raw[:300]}") from exc
+            raise RuntimeError(f"智能服务未返回有效 JSON：{raw[:300]}") from exc
 
 
 class QwenProvider(OpenAICompatibleProvider):
@@ -138,6 +138,83 @@ class QwenProvider(OpenAICompatibleProvider):
             raise RuntimeError("千问 OCR 返回格式异常") from exc
 
 
+class GeminiProvider(OpenAICompatibleProvider):
+    """Google Gemini native generateContent API provider."""
+
+    def _endpoint(self, model: str | None = None) -> str:
+        base_url = self.base_url.strip().strip("\"'").rstrip("/")
+        if ":generateContent" in base_url:
+            return base_url
+        model_name = (model or self.model).strip()
+        return f"{base_url}/models/{model_name}:generateContent"
+
+    def _post_gemini(self, payload: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+        endpoint = self._endpoint(model)
+        try:
+            response = self.session.post(
+                endpoint,
+                headers={
+                    "x-goog-api-key": self.api_key,
+                    "Content-Type": "application/json",
+                    "User-Agent": "ZhijiaoBanxue/1.0",
+                },
+                json=payload,
+                timeout=(10, self.timeout),
+                verify=certifi.where(),
+            )
+            self.last_endpoint = endpoint
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError,
+                requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            raise RuntimeError(
+                "无法连接 Gemini 服务。若当前网络无法访问 Google API，请改用可访问该服务的代理或云端中转。"
+                f"详情：{endpoint} -> {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Gemini 返回了非 JSON 内容（HTTP {response.status_code}）：{response.text[:300]}") from exc
+        if response.status_code >= 400:
+            message = data.get("error", {}).get("message") or str(data)
+            if response.status_code in {400, 401, 403} and "api key" in message.lower():
+                raise RuntimeError(
+                    "Gemini API Key 无效或无权调用该接口。请在 Google AI Studio 创建/检查 Gemini Key；"
+                    "千问、OpenAI 或其他平台的 Key 不能用于 Google Gemini。"
+                    f"原始信息：{message}"
+                )
+            raise RuntimeError(f"Gemini API 调用失败（HTTP {response.status_code}）：{message}")
+        return data
+
+    @staticmethod
+    def _content(data: dict[str, Any]) -> str:
+        try:
+            parts = data["candidates"][0]["content"]["parts"]
+            content = "".join(str(part.get("text", "")) for part in parts).strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Gemini API 返回格式异常：{str(data)[:300]}") from exc
+        if not content:
+            raise RuntimeError(f"Gemini 返回了空内容：{str(data)[:300]}")
+        return content
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        data = self._post_gemini({
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 3500},
+        })
+        return self._content(data)
+
+    def extract_image_text(self, image_bytes: bytes, mime_type: str,
+                           ocr_model: str = "") -> str:
+        data = self._post_gemini({
+            "contents": [{"role": "user", "parts": [
+                {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(image_bytes).decode("ascii")}},
+                {"text": "请完整提取图片中的文字，保持原有段落顺序，只输出提取结果。"},
+            ]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 3000},
+        })
+        return self._content(data)
+
+
 def build_backend_provider() -> LLMProvider:
     settings = get_ai_settings()
     provider = str(settings["provider"])
@@ -154,6 +231,8 @@ def build_backend_provider() -> LLMProvider:
         # Use QwenProvider here because it also implements the OpenAI-compatible
         # multimodal OCR request used by the student material workflow.
         return QwenProvider(api_key, base_url, model)
+    if provider in {"gemini", "google", "google_gemini"}:
+        return GeminiProvider(api_key, base_url, model)
     raise RuntimeError(f"后端智能体类型不受支持：{provider}")
 
 
