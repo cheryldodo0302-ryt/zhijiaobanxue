@@ -42,6 +42,7 @@ server.env
 server.env.*
 !server.env.example
 user_ai.env
+relay_client.env
 .streamlit/secrets.toml
 
 # Editors and operating-system files

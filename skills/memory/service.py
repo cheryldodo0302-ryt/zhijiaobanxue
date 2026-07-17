@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from campus_service import CampusService, NotFound, PermissionDenied, ValidationError
-from llm_provider import QwenProvider
 
 
 def _loads(value: str | None) -> Any:
@@ -142,9 +141,10 @@ class MemoryLearningSkill:
         if not image_bytes or len(image_bytes) > 10 * 1024 * 1024:
             raise ValidationError("图片不能为空且不能超过 10MB")
         provider = self.campus.provider_factory()
-        if not isinstance(provider, QwenProvider):
-            raise ValidationError("图片文字提取需要千问视觉 OCR 模型")
-        text = provider.extract_image_text(image_bytes, mime_type)
+        extract_image_text = getattr(provider, "extract_image_text", None)
+        if not callable(extract_image_text):
+            raise ValidationError("当前智能接口不支持图片文字提取，请选择支持视觉输入的模型")
+        text = extract_image_text(image_bytes, mime_type)
         if not text.strip():
             raise ValidationError("图片中没有提取到有效文字")
         safe_stem = Path(file_name).stem[:60] or "图片文字"

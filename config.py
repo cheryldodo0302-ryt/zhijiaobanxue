@@ -16,6 +16,7 @@ _AI_NAMES = {
     "ZHIJIAO_CUSTOM_BASE_URL",
     "ZHIJIAO_CUSTOM_API_KEY",
     "ZHIJIAO_CUSTOM_MODEL",
+    "ZHIJIAO_CUSTOM_PROVIDER",
     "DASHSCOPE_API_KEY",
     "ZHIJIAO_AI_PROVIDER",
     "ZHIJIAO_AI_BASE_URL",
@@ -73,8 +74,10 @@ def get_ai_settings() -> dict[str, str | bool]:
             mode = "relay"
 
     if mode == "custom":
-        provider = "openai_compatible"
+        provider = values.get("ZHIJIAO_CUSTOM_PROVIDER", "auto").lower()
         base_url = values.get("ZHIJIAO_CUSTOM_BASE_URL", "")
+        if provider == "auto":
+            provider = "gemini" if "generativelanguage.googleapis.com" in base_url.lower() else "openai_compatible"
         api_key = values.get("ZHIJIAO_CUSTOM_API_KEY", "")
         model = values.get("ZHIJIAO_CUSTOM_MODEL", "")
     elif mode == "qwen":
@@ -92,7 +95,8 @@ def get_ai_settings() -> dict[str, str | bool]:
         api_key = values.get("ZHIJIAO_RELAY_TOKEN", "")
         model = "server-managed"
 
-    base_url = base_url.rstrip("/")
+    # Be forgiving when a URL was copied from a quoted command or web page.
+    base_url = base_url.strip().strip("\"'").rstrip("/")
     return {
         "mode": mode,
         "provider": provider,
@@ -109,6 +113,7 @@ def save_user_ai_settings(
     base_url: str = "",
     api_key: str = "",
     model: str = "",
+    provider: str = "auto",
 ) -> None:
     """Save an optional per-computer override. This file is excluded from Git."""
     if mode not in {"relay", "custom"}:
@@ -117,13 +122,18 @@ def save_user_ai_settings(
         raise ValueError("AI 配置不能包含换行符")
     lines = [f"ZHIJIAO_AI_MODE={mode}"]
     if mode == "custom":
-        parsed = urlparse(base_url.strip())
+        clean_base_url = base_url.strip().strip("\"'").rstrip("/")
+        provider = provider.strip().lower()
+        if provider not in {"auto", "openai_compatible", "gemini"}:
+            raise ValueError("自定义接口类型无效")
+        parsed = urlparse(clean_base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("Base URL 必须是有效的 http:// 或 https:// 地址")
         if not api_key.strip() or not model.strip():
             raise ValueError("自定义 API Key 和模型名称不能为空")
         lines.extend([
-            f"ZHIJIAO_CUSTOM_BASE_URL={base_url.strip().rstrip('/')}",
+            f"ZHIJIAO_CUSTOM_PROVIDER={provider}",
+            f"ZHIJIAO_CUSTOM_BASE_URL={clean_base_url}",
             f"ZHIJIAO_CUSTOM_API_KEY={api_key.strip()}",
             f"ZHIJIAO_CUSTOM_MODEL={model.strip()}",
         ])

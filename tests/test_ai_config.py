@@ -44,6 +44,34 @@ def test_local_custom_settings_override_bundled_relay(monkeypatch, tmp_path):
     assert settings["model"] == "custom-model"
 
 
+def test_gemini_custom_settings_are_detected_and_quotes_are_removed(monkeypatch, tmp_path):
+    _isolate_settings(monkeypatch, tmp_path)
+    config.save_user_ai_settings(
+        "custom",
+        base_url='https://generativelanguage.googleapis.com/v1beta/"',
+        api_key="gemini-secret",
+        model="gemini-2.5-flash",
+        provider="auto",
+    )
+    settings = config.get_ai_settings()
+    assert settings["provider"] == "gemini"
+    assert settings["base_url"] == "https://generativelanguage.googleapis.com/v1beta"
+
+
+def test_existing_quoted_gemini_endpoint_is_cleaned(monkeypatch, tmp_path):
+    _isolate_settings(monkeypatch, tmp_path)
+    config.USER_AI_ENV.write_text(
+        "ZHIJIAO_AI_MODE=custom\n"
+        "ZHIJIAO_CUSTOM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent\"\n"
+        "ZHIJIAO_CUSTOM_API_KEY=secret\n"
+        "ZHIJIAO_CUSTOM_MODEL=gemini-flash-latest\n",
+        encoding="utf-8",
+    )
+    settings = config.get_ai_settings()
+    assert settings["provider"] == "gemini"
+    assert settings["base_url"].endswith(":generateContent")
+
+
 def test_legacy_server_key_overrides_bundled_relay(monkeypatch, tmp_path):
     _isolate_settings(monkeypatch, tmp_path)
     config.BUNDLED_RELAY_ENV.write_text(

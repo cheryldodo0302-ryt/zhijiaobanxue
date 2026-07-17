@@ -14,7 +14,8 @@ GitHub 项目中不保存真实千问 `DASHSCOPE_API_KEY`。下载者默认调�
 ```
 
 侧栏“AI 服务设置”也允许下载者选择自己的 OpenAI 兼容 Base URL、API Key
-和模型。该配置只写入本机 `user_ai.env`，已被 `.gitignore` 排除。
+和模型，也支持 Google Gemini 原生接口。该配置只写入本机 `user_ai.env`，已被
+`.gitignore` 排除。
 
 ## 1. 生成中转客户端令牌
 
@@ -71,6 +72,34 @@ https://你的中转域名/health
 
 应返回 `{"status":"ok"}`。
 
+### 使用 `cheryldodo0302.xyz` 自定义域名
+
+自定义域名只改变访问入口，不会恢复函数计算免费额度。额度耗尽后，必须为原函数
+开通按量付费/资源包，或把 relay 迁移到仍有计算资源的服务器。
+
+建议使用子域名 `api.cheryldodo0302.xyz`：
+
+1. 在函数计算控制台打开对应函数，进入“自定义域名”，复制控制台给出的公网
+   CNAME 目标（通常形如 `<account-id>.cn-beijing.fc.aliyuncs.com`）。
+2. 若继续使用阿里云 DNS，在云解析 DNS 添加 `api` 的 CNAME，记录值填写上一步的
+   目标。若使用 Cloudflare，则先把全部 DNS 记录迁入 Cloudflare，再到阿里云域名
+   控制台把 NS 改为 Cloudflare 分配的两台服务器；已启用 DNSSEC 时先关闭旧
+   DNSSEC/删除旧 DS。
+3. Cloudflare 中添加 `CNAME api -> FC 公网 CNAME`，首次必须使用灰云
+   **DNS only**。等 FC 完成域名校验后再考虑切为橙云。
+4. 回到 FC 创建 `api.cheryldodo0302.xyz` 自定义域名，将路径 `/*` 路由到 relay
+   函数和当前版本，并配置与该子域名匹配的 HTTPS 证书。
+5. 验证 `https://api.cheryldodo0302.xyz/health` 返回 `{"status":"ok"}`。如开启
+   Cloudflare 橙云，将 SSL/TLS 模式设置为 **Full (strict)**。
+6. 最后把 `relay_client.env` 中的地址改成：
+
+```text
+ZHIJIAO_RELAY_URL=https://api.cheryldodo0302.xyz/compatible-mode/v1
+```
+
+中国内地地域的 FC 自定义域名需要完成 ICP 备案；Cloudflare 免费版不提供中国大陆
+网络节点。主要用户在大陆时，保持阿里云 DNS 直连或 Cloudflare 灰云通常更简单。
+
 ## 3. 把中转连接写入 GitHub 客户端
 
 复制 `relay_client.env.example` 为 `relay_client.env`：
@@ -92,3 +121,30 @@ ZHIJIAO_RELAY_TOKEN=上一步生成的令牌
 - 日志不得记录 Authorization 请求头或完整学习材料；
 - 泄漏或滥用时轮换客户端令牌，并重新发布 `relay_client.env`；
 - 正式公开前增加用户登录、个人额度和服务条款。
+
+## 5. 用户自定义 API 示例
+
+在学生端侧栏“AI 服务设置”选择“使用我自己的接口”。
+
+OpenAI 兼容接口：
+
+```text
+接口协议：OpenAI 兼容接口
+Base URL：https://你的服务地址/v1
+模型名称：服务商提供的模型 ID
+```
+
+Gemini 原生接口：
+
+```text
+接口协议：Google Gemini 原生接口
+Base URL：https://generativelanguage.googleapis.com/v1beta
+模型名称：gemini-2.5-flash（以账号实际可用模型为准）
+```
+
+也可以把完整的 `.../models/<模型>:generateContent` 地址粘贴到 Base URL。程序还
+支持 Gemini 的 OpenAI 兼容地址 `https://generativelanguage.googleapis.com/v1beta/openai`。
+
+若正确地址仍报 `ConnectTimeout`，表示请求尚未到达 Gemini，通常是当前网络无法
+连接 Google API。应用会读取系统的 `HTTPS_PROXY`；也可以改用当前网络可访问的
+OpenAI 兼容服务或云端中转。仅修改 URL 无法解决网络层不可达。
