@@ -25,6 +25,7 @@ QWEN_TEXT_MODEL = os.environ.get("ZHIJIAO_QWEN_TEXT_MODEL", "qwen-plus").strip()
 QWEN_OCR_MODEL = os.environ.get("ZHIJIAO_QWEN_OCR_MODEL", "qwen-vl-ocr").strip()
 MAX_BODY_BYTES = int(os.environ.get("ZHIJIAO_RELAY_MAX_BODY_BYTES", 18 * 1024 * 1024))
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("ZHIJIAO_RELAY_RATE_LIMIT", 30))
+UPSTREAM_READ_TIMEOUT = int(os.environ.get("ZHIJIAO_RELAY_UPSTREAM_TIMEOUT", 105))
 
 app = FastAPI(title="智教伴学云端中转", version="1.0.0")
 session = requests.Session()
@@ -53,7 +54,7 @@ session.mount(
     TLS12Adapter(max_retries=Retry(
         total=1,
         connect=1,
-        read=1,
+        read=0,
         backoff_factor=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"POST"}),
@@ -131,7 +132,7 @@ async def chat_completions(
                 "Content-Type": "application/json",
             },
             json=upstream_payload,
-            timeout=(10, 120),
+            timeout=(10, UPSTREAM_READ_TIMEOUT),
             verify=certifi.where(),
         )
     except requests.RequestException as exc:

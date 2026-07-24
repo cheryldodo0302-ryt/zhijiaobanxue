@@ -1,0 +1,3 @@
+# Deprecated compatibility marker. Teacher knowledge analysis now uses the
+# built-in evidence Map-Reduce pipeline and must not install Docling/Torch.
+-r requirements.txt

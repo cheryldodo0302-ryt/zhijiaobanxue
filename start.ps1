@@ -1,6 +1,6 @@
 param(
-    [ValidateSet("ui", "api", "test", "ai-check")]
-    [string]$Mode = "ui"
+    [ValidateSet("all", "ui", "api", "worker", "web-dev", "web-build", "test", "ai-check")]
+    [string]$Mode = "all"
 )
 
 $ErrorActionPreference = "Stop"
@@ -8,8 +8,12 @@ $project = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $project
 
 $requiredImport = switch ($Mode) {
+    "all" { "uvicorn, fastapi, pypdf, docx, pptx, openpyxl, requests, certifi, jwt, argon2" }
     "ui" { "streamlit, pypdf, docx, pptx, openpyxl, requests, certifi" }
-    "api" { "uvicorn, fastapi, pypdf, docx, pptx, openpyxl, requests, certifi" }
+    "api" { "uvicorn, fastapi, pypdf, docx, pptx, openpyxl, requests, certifi, jwt, argon2" }
+    "worker" { "pypdf, docx, pptx, openpyxl, requests" }
+    "web-dev" { "" }
+    "web-build" { "" }
     "test" { "pytest" }
     "ai-check" { "requests, certifi" }
 }
@@ -47,6 +51,16 @@ foreach ($candidate in $candidates) {
         break
     }
 }
+if ($Mode -in @("web-dev", "web-build")) {
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) { throw "Node.js/npm is not installed or is not available in PATH." }
+    Push-Location (Join-Path $project "web")
+    try {
+        if ($Mode -eq "web-dev") { & $npm.Source run dev }
+        else { & $npm.Source run build }
+    } finally { Pop-Location }
+    exit $LASTEXITCODE
+}
 
 if (-not $pythonExe) {
     throw "No Python runtime with the required module was found. Run: python -m pip install -r requirements.txt"
@@ -55,12 +69,20 @@ if (-not $pythonExe) {
 Write-Host "Using Python: $pythonExe"
 
 switch ($Mode) {
+    "all" {
+        & $pythonExe @pythonArgs scripts/run_all.py
+        break
+    }
     "ui" {
         & $pythonExe @pythonArgs -m streamlit run app.py
         break
     }
     "api" {
         & $pythonExe @pythonArgs -m uvicorn api:app --host 127.0.0.1 --port 8000
+        break
+    }
+    "worker" {
+        & $pythonExe @pythonArgs scripts/run_ingestion_worker.py
         break
     }
     "test" {

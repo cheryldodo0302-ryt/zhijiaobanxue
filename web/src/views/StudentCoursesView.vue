@@ -1,0 +1,5 @@
+<script setup lang="ts">
+import { onMounted, ref } from 'vue';import { ElMessage } from 'element-plus';import { api } from '../api';import { useAuthStore } from '../stores/auth'
+const courses=ref<any[]>([]),loading=ref(true),auth=useAuthStore();async function load(){try{courses.value=(await api.get('/student/courses')).data}catch(e:any){ElMessage.error(e.response?.data?.detail||'课程加载失败')}finally{loading.value=false}}async function logout(){await auth.logout();location.href='/login'}onMounted(load)
+</script>
+<template><main class="content student-courses" v-loading="loading"><div class="card-header"><div class="page-title"><span class="eyebrow">STUDENT PORTAL</span><h1>已授权课程</h1><p class="muted">本轮提供最小学生入口，完整问答与练习功能将在后续迁移。</p></div><el-button @click="logout">退出</el-button></div><el-row :gutter="18"><el-col v-for="course in courses" :key="course.course_id" :xs="24" :sm="12" :lg="8"><el-card shadow="never"><h3>{{course.course_name}}</h3><p class="muted">{{course.description||'教师共享课程'}}</p><el-tag>已授权</el-tag></el-card></el-col></el-row><el-empty v-if="!loading&&!courses.length" description="暂无已授权课程，请联系任课教师导入名单"/></main></template>

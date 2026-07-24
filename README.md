@@ -1,6 +1,6 @@
 # 智教伴学
 
-一个可本地运行和部署的学生智能学习 MVP。当前阶段教师端已禁用且不在主页面显示，优先稳定学生端“材料导入—智能分块—记忆训练—AI 检测—个性化答疑”闭环。所有访问、写入和删除权限都在服务层校验。
+一个可本地运行和部署的校园智能学习系统。学生端保留现有 Streamlit MVP，教师端采用 Vue 3 + FastAPI；所有访问、写入和删除权限都在服务层校验。
 
 ## 已实现功能
 
@@ -19,9 +19,22 @@
 - AI 智能出题并导出 Word 练习册
 - 课程隔离检索、带文件名/章节/页码/证据片段的个性化答疑
 
-### 教师端状态
+### 教师端
 
-教师端当前在页面和统一 Agent 层均处于 `disabled`，保留后端代码但不继续修改、不在主页面展示。待学生端最小闭环稳定验收后再开放。
+- 教师账号登录与刷新令牌
+- 创建共享课程、学期、班级及导入班级成员
+- 上传课程资料并查看持久化解析任务
+- 原生 Office/数字 PDF 优先解析，扫描件降级到本地 MinerU
+- MinerU 与 Pix2Text 双引擎公式复核，保留原图、页码、bbox 和两份 LaTeX
+- DocumentIR 知识块审核及 `PUBLIC/GUIDANCE/ASSESSMENT/VAULT` 可见域
+- 资料体检单、任务取消/重试与知识库版本发布
+- 学生检索只读取已发布、已验证且属于 `PUBLIC` 的知识块
+- 扫描 PDF 支持左侧 Markdown、右侧原页的逐页对照审核
+- 原始 PDF/PPTX/DOCX 与检索用 Markdown 分离授权；教师可单独决定学生能否查看原文件
+- 教师端默认支持最大 500MB 单文件流式上传，可用 `ZHIJIAO_MAX_UPLOAD_MB` 调整
+- 导入学生前必须在真实 `server.env` 或系统环境变量中配置非空的 `ZHIJIAO_STUDENT_DEFAULT_PASSWORD`；短密码允许使用但教师端会显示弱密码警告。数据库仅保存 Argon2 哈希，学生首次登录必须改密。`server.env.example` 仅是模板，不参与运行时读取。
+- 教师资料在 DocumentIR 解析后进入独立语义分析队列；必须同时运行 `./start.ps1 worker`。旧资料不会自动消耗 API，需要在“知识中心”逐文档点击“完整重新分析”。
+- 语义分析会生成文档独立目录、课程统一目录和知识关系草稿；教师批准后才进入发布版本和学生检索。
 
 ### 接口
 
@@ -66,6 +79,44 @@ python -m streamlit run app.py
 ```powershell
 .\start.ps1 api
 # API 文档：http://127.0.0.1:8000/docs
+```
+
+### 启动 Vue 教师端
+
+首次使用先创建教师账号：
+
+```powershell
+D:\anapython\python.exe scripts\create_teacher.py teacher01 --display-name "教师"
+```
+
+先在未提交的 `server.env` 中配置远程 MinerU/Pix2Text，再分别打开三个终端：
+
+```powershell
+# 终端一：教师 API
+.\start.ps1 api
+
+# 终端二：持久化知识入库 Worker
+.\start.ps1 worker
+
+# 终端三：Vue 开发服务器
+.\start.ps1 web-dev
+```
+
+访问 `http://127.0.0.1:5173`。解析容器的安装与检查说明见 [docker/INGESTION.md](docker/INGESTION.md)。
+
+教师共享课程的 PDF 固定由 MinerU `auto` 模式生成规范 Markdown；TXT、Markdown、DOCX、PPTX 有有效文字时只走原生解析。正式部署推荐带 Bearer Token 和 TLS 的校内/远程解析服务；本地 Docker 与 SSH 隧道仅作为可选开发方式。PPTX/DOCX 网页预览还需要服务器安装 LibreOffice，缺失时界面会明确提示并保留原文件下载。
+
+### 教师知识树抽取
+
+教师共享课程统一使用内置证据 Map–Reduce 后端：PDF 读取 MinerU 的完整 Markdown，其他格式读取原生 Markdown；AI 只生成分类、章节、分节、知识点标题和关键词，正文始终由原文块拼接。每个知识点必须绑定真实 `block_id`、页码和逐字证据。该流程不导入 Docling、Torch，也不需要额外模型或 Token。
+
+旧环境中的 `ZHIJIAO_KNOWLEDGE_EXTRACTOR=docling_graph` 会映射到内置后端，并在系统状态中显示弃用提示。
+
+如需修改上传上限：
+
+```powershell
+$env:ZHIJIAO_MAX_UPLOAD_MB = "800"
+.\start.ps1 api
 ```
 
 ## 测试
