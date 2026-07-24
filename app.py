@@ -207,6 +207,12 @@ if courses:
 else:
     selected_id = None; course = None
 
+guided_sessions = st.session_state.setdefault("guided_qa_sessions", {})
+previous_qa_course = st.session_state.get("guided_qa_active_course")
+if previous_qa_course is not None and previous_qa_course != selected_id:
+    guided_sessions.pop(previous_qa_course, None)
+st.session_state["guided_qa_active_course"] = selected_id
+
 tab_course, tab_blocks, tab_train, tab_check, tab_profile, tab_qa = st.tabs([
     "① 我的课程与材料", "② 智能知识块", "③ 多模式训练", "④ AI 智能出题",
     "⑤ 个人画像与统计", "个性化答疑"
@@ -289,7 +295,8 @@ with tab_course:
                     delete_confirm = st.text_input("输入课程名称以确认", key="delete_course_confirm")
                     if st.button("永久删除课程", type="primary", disabled=delete_confirm != course["course_name"]):
                         if invoke("personal_course_delete", selected_id):
-                            for key in ("cloze", "cloze_result", "memory_questions", "practice_grade", "qa_answer"):
+                            for key in ("cloze", "cloze_result", "memory_questions", "practice_grade", "qa_answer",
+                                        "guided_qa_sessions", "guided_qa_active_course"):
                                 st.session_state.pop(key, None)
                             st.success("个人课程已删除")
                             st.rerun()
@@ -399,7 +406,113 @@ with tab_train:
                 if recording: st.audio(recording)
 
 with tab_check:
-    if not course:
+    if course and course["course_type"] == "shared_course":
+        st.markdown("#### 教师审核题库")
+        st.caption("这里只展示教师从 Excel 题库导入、审核并发布的题目；教材例题不会自动进入正式题库。")
+        bank_key = f"published_question_bank_{selected_id}"
+        grade_key = f"published_question_grade_{selected_id}"
+        folders_key = f"published_question_folders_{selected_id}"
+        if st.button("刷新已发布试卷与作业", use_container_width=True):
+            st.session_state[folders_key] = invoke("quiz_generate", selected_id, {
+                "source": "published_question_folders",
+            }) or []
+        publications = st.session_state.get(folders_key)
+        if publications is None:
+            publications = invoke("quiz_generate", selected_id, {
+                "source": "published_question_folders",
+            }) or []
+            st.session_state[folders_key] = publications
+        selected_publication = None
+        if publications:
+            publication_ids = [item["folder_id"] for item in publications]
+            selected_folder_id = st.selectbox(
+                "选择教师发布的试卷、作业或章节练习",
+                publication_ids,
+                format_func=lambda value: next(
+                    f"{item['folder_name']}（{item['item_count']} 题）"
+                    for item in publications if item["folder_id"] == value
+                ),
+            )
+            selected_publication = next(
+                item for item in publications if item["folder_id"] == selected_folder_id
+            )
+        if st.button("载入整份任务", type="primary", use_container_width=True,
+                     disabled=not selected_publication):
+            bank = invoke("quiz_generate", selected_id, {
+                "source": "published_question_bank", "count": 100,
+                "folder_id": selected_publication["folder_id"],
+            })
+            if bank is not None:
+                st.session_state[bank_key] = bank
+                st.session_state.pop(grade_key, None)
+        bank = st.session_state.get(bank_key)
+        if not bank:
+            st.info("点击上方按钮载入教师已发布题库。")
+        elif not bank.get("items"):
+            st.info("当前课程还没有已发布的审核题目，请等待教师发布。")
+        else:
+            st.caption(
+                f"题库版本 v{bank['version_number']} · 共 {bank['total']} 题"
+                f" · 当前载入 {len(bank['items'])} 题"
+            )
+            with st.form(f"published_bank_form_{selected_id}"):
+                responses = []
+                for index, item in enumerate(bank["items"], 1):
+                    st.markdown(f"**{index}. {item['question']}**")
+                    option_rows = item.get("options", [])
+                    option_labels = {
+                        option["key"]: f"{option['key']}. {option['text']}"
+                        for option in option_rows
+                    }
+                    if item["type"] == "multiple_choice":
+                        responses.append(st.multiselect(
+                            "请选择所有正确选项", list(option_labels),
+                            format_func=option_labels.get,
+                            key=f"published_multi_{selected_id}_{item['item_id']}",
+                        ))
+                    elif item["type"] == "true_false":
+                        judge_options = [
+                            str(option.get("text") or option.get("key") or "").strip()
+                            for option in option_rows
+                            if str(option.get("text") or option.get("key") or "").strip()
+                        ]
+                        if len(judge_options) < 2:
+                            judge_options = ["T", "F"]
+                        responses.append(st.radio(
+                            "请选择", list(dict.fromkeys(judge_options)), index=None,
+                            key=f"published_judge_{selected_id}_{item['item_id']}",
+                        ))
+                    elif item["type"] == "single_choice":
+                        responses.append(st.radio(
+                            "请选择", list(option_labels), index=None,
+                            format_func=option_labels.get,
+                            key=f"published_single_{selected_id}_{item['item_id']}",
+                        ))
+                    else:
+                        responses.append(st.text_area(
+                            "请输入答案",
+                            key=f"published_text_{selected_id}_{item['item_id']}",
+                        ))
+                submit_published = st.form_submit_button("提交本次答案", type="primary")
+            if submit_published:
+                result = invoke("quiz_submit", selected_id, {
+                    "version_id": bank["version_id"],
+                    "items": bank["items"],
+                    "responses": responses,
+                })
+                if result:
+                    st.session_state[grade_key] = result
+            grade = st.session_state.get(grade_key)
+            if grade:
+                st.metric("本次正确率", f"{grade['accuracy']:.1f}%")
+                for index, result in enumerate(grade["results"], 1):
+                    state = "✅" if result["correct"] else "❌"
+                    with st.expander(f"{state} 第 {index} 题", expanded=not result["correct"]):
+                        st.write("你的答案：", result.get("response"))
+                        st.write("正确答案：", result.get("correct_answer"))
+                        if result.get("explanation"):
+                            st.info(result["explanation"])
+    elif not course:
         st.info("请先选择课程。")
     else:
         st.markdown("#### AI 智能出题与作答")
@@ -540,14 +653,126 @@ with tab_qa:
     if not course:
         st.info("请先选择课程。")
     else:
-        st.caption("课后答疑只检索当前课程资料，回答必须附带文件和章节证据。")
-        question = st.text_area("请输入课程问题", placeholder="例如：合同法的三项基本原则分别是什么？")
-        if st.button("向学生智能体提问", type="primary", disabled=not question.strip()):
-            answer = invoke("course_qa", selected_id, {"question": question})
-            if answer: st.session_state.qa_answer = {**answer, "course_id": selected_id}
-        answer = st.session_state.get("qa_answer")
-        if answer and answer.get("course_id") == selected_id:
-            (st.warning if answer["refused"] else st.success)(answer["answer"])
-            for index, source in enumerate(answer["sources"], 1):
-                with st.expander(f"证据 #{index} · {source['source_file']} · {source['section']}"):
-                    st.write(source["text"][:MAX_EVIDENCE_CHARS])
+        st.caption("引导式答疑只使用当前课程资料。AI 会逐步追问，只有你明确请求时才给出答案。")
+        session = guided_sessions.get(selected_id)
+
+        if session is None:
+            with st.form(f"guided_qa_start_{selected_id}"):
+                question = st.text_area(
+                    "请输入课程问题",
+                    placeholder="例如：为什么关系数据库需要规范化？",
+                    key=f"guided_qa_question_{selected_id}",
+                )
+                start_guidance = st.form_submit_button(
+                    "开始引导", type="primary",
+                )
+            if start_guidance and not question.strip():
+                st.warning("请先输入一个课程问题。")
+            elif start_guidance:
+                result = invoke("course_qa", selected_id, {
+                    "question": question.strip(),
+                    "student_message": "",
+                    "intent": "start",
+                    "phase": "initial",
+                    "history": [],
+                })
+                if result:
+                    guided_sessions[selected_id] = {
+                        "question": question.strip(),
+                        "phase": result["phase"],
+                        "completed": result["completed"],
+                        "refused": result["refused"],
+                        "question_id": result.get("question_id"),
+                        "sources": result.get("sources", []),
+                        "messages": [
+                            {"role": "user", "content": question.strip()},
+                            {"role": "assistant", "content": result["reply"]},
+                        ],
+                    }
+                    st.rerun()
+        else:
+            st.caption(f"当前问题：{session['question']}")
+            for message in session["messages"]:
+                with st.chat_message(message["role"]):
+                    st.write(message["content"])
+
+            if not session["completed"]:
+                with st.form(f"guided_qa_response_{selected_id}", clear_on_submit=True):
+                    student_response = st.text_area(
+                        "说说你的想法",
+                        placeholder="写下你目前想到的步骤或判断……",
+                        key=f"guided_qa_response_text_{selected_id}",
+                    )
+                    submit_response = st.form_submit_button(
+                        "提交想法", type="primary",
+                    )
+
+                with st.container(horizontal=True):
+                    ask_hint = st.button(
+                        "给我一点提示", icon=":material/lightbulb:",
+                        key=f"guided_qa_hint_{selected_id}",
+                    )
+                    reveal_answer = st.button(
+                        "给出答案", icon=":material/visibility:",
+                        key=f"guided_qa_reveal_{selected_id}",
+                    )
+                    end_question = st.button(
+                        "结束本题", icon=":material/stop_circle:",
+                        key=f"guided_qa_end_{selected_id}",
+                    )
+
+                intent = ""
+                current_message = ""
+                if submit_response and not student_response.strip():
+                    st.warning("请先写下你的想法，或者使用提示和答案按钮。")
+                elif submit_response:
+                    intent, current_message = "respond", student_response.strip()
+                elif ask_hint:
+                    intent, current_message = "hint", "我暂时没有思路，请给我一点提示。"
+                elif reveal_answer:
+                    intent, current_message = "reveal", "请基于课程资料给出答案。"
+                elif end_question:
+                    intent, current_message = "end", "结束本题。"
+
+                if intent:
+                    result = invoke("course_qa", selected_id, {
+                        "question": session["question"],
+                        "student_message": current_message,
+                        "intent": intent,
+                        "phase": session["phase"],
+                        "history": session["messages"][-8:],
+                        "evidence_refs": session["sources"],
+                    })
+                    if result:
+                        session["messages"].extend([
+                            {"role": "user", "content": current_message},
+                            {"role": "assistant", "content": result["reply"]},
+                        ])
+                        session.update({
+                            "phase": result["phase"],
+                            "completed": result["completed"],
+                            "refused": result["refused"],
+                            "question_id": result.get("question_id"),
+                            "sources": result.get("sources", []),
+                        })
+                        guided_sessions[selected_id] = session
+                        st.rerun()
+            else:
+                if session["phase"] == "revealed" and not session["refused"]:
+                    st.success("答案已根据当前课程证据生成，可继续到练习模块巩固。")
+                    for index, source in enumerate(session["sources"], 1):
+                        with st.expander(f"证据 #{index} · {source['source_file']} · {source['section']}"):
+                            st.write(source["text"][:MAX_EVIDENCE_CHARS])
+                elif session["refused"]:
+                    st.warning("当前课程资料不足，本次没有生成答案。")
+                else:
+                    st.info("本题已结束，中间引导内容未写入学习记录。")
+
+                if st.button(
+                    "开始新问题", icon=":material/restart_alt:",
+                    key=f"guided_qa_restart_{selected_id}",
+                ):
+                    guided_sessions.pop(selected_id, None)
+                    st.session_state.pop(f"guided_qa_question_{selected_id}", None)
+                    st.session_state.pop(f"guided_qa_response_text_{selected_id}", None)
+                    st.rerun()

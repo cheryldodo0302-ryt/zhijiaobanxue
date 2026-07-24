@@ -15,11 +15,11 @@ from typing import Any
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-from config import DATA_DIR, MAX_EVIDENCE_CHARS, MIN_EVIDENCE_SCORE, TOP_K
+from config import DATA_DIR, MAX_EVIDENCE_CHARS, MAX_UPLOAD_BYTES, MIN_EVIDENCE_SCORE, TOP_K
 from database import LearningDatabase
 from llm_provider import LLMProvider, build_backend_provider
 from skills.exercise import ExerciseItem, generate_exercises, grade_exercises
-from skills.qa import answer_question
+from skills.qa import answer_question, guide_question
 from skills.retrieval import Evidence
 
 
@@ -46,9 +46,6 @@ ALLOWED_FILES = {
     ".md": {"text/markdown", "text/plain", "application/octet-stream"},
     ".txt": {"text/plain", "application/octet-stream"},
 }
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-
-
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
@@ -67,6 +64,8 @@ def _safe_name(name: str) -> str:
 def _split_text(text: str, default_section: str = "正文", page_number: int | None = None) -> list[dict]:
     chunks: list[dict] = []
     section = default_section
+    heading_level = 0
+    heading_path: list[str] = []
     buffer: list[str] = []
 
     def flush() -> None:
@@ -76,13 +75,25 @@ def _split_text(text: str, default_section: str = "正文", page_number: int | N
         for start in range(0, len(content), 900):
             part = content[start:start + 1100].strip()
             if part:
-                chunks.append({"section": section, "page_number": page_number, "content": part})
+                chunks.append({
+                    "section": section,
+                    "page_number": page_number,
+                    "content": part,
+                    "heading_level": heading_level,
+                    "heading_path": list(heading_path),
+                })
 
     for line in text.splitlines():
-        if re.match(r"^#{1,6}\s+", line):
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if heading:
             flush()
             buffer.clear()
-            section = re.sub(r"^#{1,6}\s+", "", line).strip() or default_section
+            heading_level = len(heading.group(1))
+            section = heading.group(2).strip() or default_section
+            heading_path = heading_path[:heading_level - 1]
+            while len(heading_path) < heading_level - 1:
+                heading_path.append("")
+            heading_path.append(section)
         elif line.strip():
             buffer.append(line.strip())
     flush()
@@ -274,7 +285,7 @@ class CampusService:
         if not data:
             raise ValidationError("不能上传空文件")
         if len(data) > MAX_UPLOAD_BYTES:
-            raise ValidationError("文件不能超过 20MB")
+            raise ValidationError(f"文件不能超过 {MAX_UPLOAD_BYTES // 1024 // 1024}MB")
         digest = hashlib.sha256(data).hexdigest()
         if self.db.fetch_one("SELECT 1 ok FROM course_documents WHERE course_id=? AND sha256=?", (course_id, digest)):
             raise ValidationError("该课程中已存在内容相同的文件")
@@ -324,17 +335,81 @@ class CampusService:
         return {**(row or {}), "status": "ready" if row and row["chunk_count"] else "empty"}
 
     def _retriever(self, course_id: str) -> ChunkRetriever:
+        published = self.db.fetch_one(
+            "SELECT version_id FROM knowledge_versions WHERE course_id=? AND status='published' ORDER BY version_number DESC LIMIT 1",
+            (course_id,),
+        )
+        if published:
+            semantic_rows = self.db.fetch_all(
+                """SELECT n.markdown content,
+                          COALESCE(c.title,'') || CASE WHEN s.title IS NOT NULL THEN ' / ' || s.title ELSE '' END section,
+                          (SELECT MIN(ns.page_number) FROM knowledge_node_sources ns WHERE ns.node_id=n.node_id) page_number,
+                          COALESCE((SELECT GROUP_CONCAT(DISTINCT d.original_name) FROM knowledge_node_sources ns
+                                    JOIN course_documents d USING(document_id) WHERE ns.node_id=n.node_id),'课程知识库') original_name
+                   FROM knowledge_version_nodes vn JOIN knowledge_nodes n USING(node_id)
+                   LEFT JOIN knowledge_nodes s ON s.node_id=n.parent_id
+                   LEFT JOIN knowledge_nodes c ON c.node_id=s.parent_id
+                   WHERE vn.version_id=? AND n.status='approved' AND TRIM(n.markdown)<>''
+                   ORDER BY n.sort_order""", (published["version_id"],),
+            )
+            if semantic_rows:
+                return ChunkRetriever(semantic_rows)
+            rows = self.db.fetch_all(
+                """SELECT b.plain_text content,'第 ' || COALESCE(b.page_number,1) || ' 页' section,b.page_number,d.original_name
+                   FROM knowledge_version_blocks vb JOIN document_blocks b USING(block_id)
+                   JOIN course_documents d USING(document_id)
+                   WHERE vb.version_id=? AND b.visibility_level='PUBLIC'
+                     AND b.verification_status IN ('auto_verified','teacher_verified')""",
+                (published["version_id"],),
+            )
+            return ChunkRetriever(rows)
         rows = self.db.fetch_all("""SELECT c.content,c.section,c.page_number,d.original_name
                                   FROM document_chunks c JOIN course_documents d USING(document_id)
                                   WHERE c.course_id=? AND d.status='ready'""", (course_id,))
         return ChunkRetriever(rows)
 
     def ask(self, course_id: str, user_id: str, role: str, question: str,
-            provider: LLMProvider | None = None) -> dict:
+            provider: LLMProvider | None = None, *, intent: str | None = None,
+            student_message: str = "", phase: str = "initial",
+            history: list[dict[str, Any]] | None = None,
+            evidence_refs: list[dict[str, Any]] | None = None) -> dict:
         self.require_access(course_id, user_id, role)
         if not question.strip():
             raise ValidationError("问题不能为空")
-        result = answer_question(question.strip(), self._retriever(course_id), provider or self.provider_factory(),
+        active_provider = provider or self.provider_factory()
+        if intent is not None:
+            result = guide_question(
+                question.strip(), self._retriever(course_id), active_provider,
+                intent=intent, phase=phase, student_message=student_message,
+                history=history, evidence_refs=evidence_refs,
+                min_score=MIN_EVIDENCE_SCORE, top_k=TOP_K,
+            )
+            should_persist = result.refused or (intent == "reveal" and not result.refused)
+            question_id = None
+            if should_persist:
+                question_id = self.db.execute(
+                    """INSERT INTO course_questions(course_id,user_id,question,answer,sources_json,knowledge_points_json,refused)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        course_id, user_id, question.strip(), result.reply,
+                        _json([item.to_dict() for item in result.evidence]),
+                        _json(result.knowledge_points), int(result.refused),
+                    ),
+                )
+            return {
+                "question_id": question_id,
+                "reply": result.reply,
+                "answer": result.reply,
+                "phase": result.phase,
+                "expects_response": result.expects_response,
+                "can_reveal": result.can_reveal,
+                "completed": result.completed,
+                "sources": [item.to_dict() for item in result.evidence],
+                "knowledge_points": result.knowledge_points,
+                "refused": result.refused,
+                "persisted": should_persist,
+            }
+        result = answer_question(question.strip(), self._retriever(course_id), active_provider,
                                  MIN_EVIDENCE_SCORE, TOP_K)
         qid = self.db.execute("""INSERT INTO course_questions(course_id,user_id,question,answer,sources_json,knowledge_points_json,refused)
                                VALUES(?,?,?,?,?,?,?)""",

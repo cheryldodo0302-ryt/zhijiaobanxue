@@ -21,12 +21,18 @@ relay-deploy.zip
 relay-deploy-ready.zip
 relay-deploy-linux-x64.zip
 *.egg-info/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+vendor/
+docker/mineru.Dockerfile
 
 # Runtime data and local logs
 data/
 exports/
 tmp/
 temp/
+test_runtime/
 *.db
 *.sqlite
 *.sqlite3
@@ -42,7 +48,10 @@ server.env
 server.env.*
 !server.env.example
 user_ai.env
+relay_client.env
 .streamlit/secrets.toml
+*.pem
+*.key
 
 # Editors and operating-system files
 .idea/

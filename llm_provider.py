@@ -46,7 +46,9 @@ class OpenAICompatibleProvider(LLMProvider):
         self.last_endpoint = ""
         self.session = requests.Session()
         self.session.trust_env = True
-        retries = Retry(total=1, connect=1, read=1, backoff_factor=0.5,
+        # Semantic jobs own their checkpointed retry policy. Retrying a timed-out
+        # POST inside urllib would repeat the same expensive generation invisibly.
+        retries = Retry(total=1, connect=1, read=0, backoff_factor=0.5,
                         status_forcelist=(429, 500, 502, 503, 504),
                         allowed_methods=frozenset({"POST"}))
         self.session.mount("https://", TLS12Adapter(max_retries=retries))
@@ -106,10 +108,40 @@ class OpenAICompatibleProvider(LLMProvider):
         return content
 
     def generate_json(self, system_prompt: str, user_prompt: str) -> Any:
-        raw = self.generate(system_prompt, user_prompt)
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4000,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            data = self._post(payload)
+            raw = data["choices"][0]["message"]["content"].strip()
+        except RuntimeError as exc:
+            # A few OpenAI-compatible relays do not expose response_format.
+            # Fall back to ordinary generation only for that explicit API rejection.
+            if "HTTP 400" not in str(exc):
+                raise
+            fallback_payload = dict(payload)
+            fallback_payload.pop("response_format", None)
+            data = self._post(fallback_payload)
+            try:
+                raw = data["choices"][0]["message"]["content"].strip()
+            except (KeyError, IndexError, TypeError) as fallback_exc:
+                raise RuntimeError("智能服务 JSON 响应格式异常") from fallback_exc
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("智能服务 JSON 响应格式异常") from exc
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.S)
         try:
-            return json.loads(cleaned)
+            starts = [position for position in (cleaned.find("{"), cleaned.find("[")) if position >= 0]
+            if starts:
+                cleaned = cleaned[min(starts):]
+            value, _end = json.JSONDecoder(strict=False).raw_decode(cleaned)
+            return value
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"智能服务未返回有效 JSON：{raw[:300]}") from exc
 
@@ -203,6 +235,22 @@ class GeminiProvider(OpenAICompatibleProvider):
         })
         return self._content(data)
 
+    def generate_json(self, system_prompt: str, user_prompt: str) -> Any:
+        data = self._post_gemini({
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 6000,
+                "responseMimeType": "application/json",
+            },
+        })
+        raw = self._content(data)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Gemini 未返回有效 JSON：{raw[:300]}") from exc
+
     def extract_image_text(self, image_bytes: bytes, mime_type: str,
                            ocr_model: str = "") -> str:
         data = self._post_gemini({
@@ -221,18 +269,19 @@ def build_backend_provider() -> LLMProvider:
     api_key = str(settings["api_key"])
     base_url = str(settings["base_url"])
     model = str(settings["model"])
+    timeout = int(settings.get("read_timeout") or 115)
     if not settings["configured"]:
         if provider == "relay":
             raise RuntimeError("默认云端智能服务尚未部署或客户端中转配置缺失")
         raise RuntimeError("自定义智能服务配置不完整")
     if provider in {"relay", "qwen", "dashscope", "aliyun"}:
-        return QwenProvider(api_key, base_url, model)
+        return QwenProvider(api_key, base_url, model, timeout=timeout)
     if provider in {"openai", "openai_compatible"}:
         # Use QwenProvider here because it also implements the OpenAI-compatible
         # multimodal OCR request used by the student material workflow.
-        return QwenProvider(api_key, base_url, model)
+        return QwenProvider(api_key, base_url, model, timeout=timeout)
     if provider in {"gemini", "google", "google_gemini"}:
-        return GeminiProvider(api_key, base_url, model)
+        return GeminiProvider(api_key, base_url, model, timeout=timeout)
     raise RuntimeError(f"后端智能体类型不受支持：{provider}")
 
 

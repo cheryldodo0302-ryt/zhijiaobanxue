@@ -21,6 +21,24 @@ _AI_NAMES = {
     "ZHIJIAO_AI_PROVIDER",
     "ZHIJIAO_AI_BASE_URL",
     "ZHIJIAO_AI_MODEL",
+    "ZHIJIAO_AI_READ_TIMEOUT",
+    "ZHIJIAO_STUDENT_DEFAULT_PASSWORD",
+    "ZHIJIAO_MINERU_URL",
+    "ZHIJIAO_MINERU_TOKEN",
+    "ZHIJIAO_MINERU_VERIFY_TLS",
+    "ZHIJIAO_MINERU_TIMEOUT",
+    "ZHIJIAO_MINERU_BACKEND",
+    "ZHIJIAO_MINERU_LANG",
+    "ZHIJIAO_FORMULA_URL",
+    "ZHIJIAO_FORMULA_TOKEN",
+    "ZHIJIAO_FORMULA_VERIFY_TLS",
+    "ZHIJIAO_FORMULA_TIMEOUT",
+    "ZHIJIAO_KNOWLEDGE_EXTRACTOR",
+    "ZHIJIAO_DOCLING_GRAPH_CONTRACT",
+    "ZHIJIAO_DOCLING_GRAPH_CHUNK_TOKENS",
+    "ZHIJIAO_DOCLING_GRAPH_PARALLEL_WORKERS",
+    "ZHIJIAO_DOCLING_GRAPH_CONTEXT_LIMIT",
+    "ZHIJIAO_DOCLING_GRAPH_MAX_OUTPUT_TOKENS",
 }
 
 
@@ -40,6 +58,11 @@ def _read_env_file(path: Path) -> dict[str, str]:
         if name.strip() in _AI_NAMES:
             values[name.strip()] = value.strip()
     return values
+
+
+def get_runtime_setting(name: str, default: str = "") -> str:
+    """Resolve a deployment setting from the process or the uncommitted server.env."""
+    return os.environ.get(name, "").strip() or _read_env_file(SERVER_ENV).get(name, default).strip()
 
 
 def get_ai_settings() -> dict[str, str | bool]:
@@ -104,6 +127,60 @@ def get_ai_settings() -> dict[str, str | bool]:
         "api_key": api_key,
         "model": model,
         "configured": bool(base_url and api_key and model),
+        "read_timeout": _positive_int_setting("ZHIJIAO_AI_READ_TIMEOUT", 115),
+    }
+
+
+def get_student_default_password() -> str:
+    """Read the deployment-only initial password without persisting it in SQLite."""
+    return (
+        os.environ.get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
+        or _read_env_file(SERVER_ENV).get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
+    )
+
+
+def _positive_int_setting(name: str, default: int) -> int:
+    try:
+        return max(1, int(get_runtime_setting(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_knowledge_extractor_settings() -> dict[str, str | int | bool]:
+    """Resolve the teacher knowledge-tree backend without local ML runtimes."""
+    configured_backend = get_runtime_setting("ZHIJIAO_KNOWLEDGE_EXTRACTOR", "builtin").lower()
+    deprecated_backend = configured_backend == "docling_graph"
+    backend = "builtin"
+    contract = get_runtime_setting("ZHIJIAO_DOCLING_GRAPH_CONTRACT", "auto").lower()
+    if contract not in {"auto", "direct", "dense"}:
+        contract = "auto"
+    return {
+        "backend": backend,
+        "configured_backend": configured_backend,
+        "deprecated_backend": deprecated_backend,
+        "warning": (
+            "docling_graph 已弃用；系统已改用不依赖 Docling/Torch 的原生证据知识树后端"
+            if deprecated_backend else ""
+        ),
+        "contract": contract,
+        "chunk_max_tokens": _positive_int_setting("ZHIJIAO_DOCLING_GRAPH_CHUNK_TOKENS", 768),
+        "parallel_workers": _positive_int_setting("ZHIJIAO_DOCLING_GRAPH_PARALLEL_WORKERS", 1),
+        "context_limit": _positive_int_setting("ZHIJIAO_DOCLING_GRAPH_CONTEXT_LIMIT", 128000),
+        "max_output_tokens": _positive_int_setting("ZHIJIAO_DOCLING_GRAPH_MAX_OUTPUT_TOKENS", 8192),
+    }
+
+
+def student_import_config_status() -> dict[str, str | bool | int]:
+    environment_value = os.environ.get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
+    file_value = _read_env_file(SERVER_ENV).get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
+    value = environment_value or file_value
+    length = len(value)
+    return {
+        "configured": bool(value),
+        "source": "environment" if environment_value else ("server.env" if file_value else "not_configured"),
+        "password_length": length,
+        "security_level": "not_configured" if not value else ("weak" if length < 6 else ("medium" if length < 10 else "strong")),
+        "config_path": str(SERVER_ENV),
     }
 
 
@@ -147,6 +224,8 @@ def save_user_ai_settings(
 MATERIALS_DIR = BASE_DIR / "course_materials"
 DATA_DIR = Path(os.environ.get("ZHIJIAO_DATA_DIR", BASE_DIR / "data")).resolve()
 DB_PATH = DATA_DIR / "learning.db"
+MAX_UPLOAD_MB = max(1, int(os.environ.get("ZHIJIAO_MAX_UPLOAD_MB", "500")))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 TOP_K = 4
 MIN_EVIDENCE_SCORE = 0.12

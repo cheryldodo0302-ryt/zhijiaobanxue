@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from llm_provider import LLMProvider
 from skills.retrieval import CourseRetriever, Evidence
@@ -8,6 +9,18 @@ from skills.retrieval import CourseRetriever, Evidence
 @dataclass
 class QAResult:
     answer: str
+    evidence: list[Evidence]
+    knowledge_points: list[str]
+    refused: bool
+
+
+@dataclass
+class GuidedQAResult:
+    reply: str
+    phase: str
+    expects_response: bool
+    can_reveal: bool
+    completed: bool
     evidence: list[Evidence]
     knowledge_points: list[str]
     refused: bool
@@ -32,6 +45,159 @@ def _extract_points(evidence: list[Evidence]) -> list[str]:
         if title and title not in points:
             points.append(title)
     return points[:3]
+
+
+_GUIDED_INTENTS = {"start", "respond", "hint", "reveal", "end"}
+_GUIDED_PHASES = {"initial", "guiding", "revealed", "closed"}
+_DIRECT_ANSWER_MARKERS = ("最终答案", "答案是", "结论是", "直接答案", "完整答案")
+
+
+def _compact_history(history: list[dict[str, Any]] | None) -> str:
+    rows: list[str] = []
+    for item in (history or [])[-8:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        content = str(item.get("content", "")).strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        label = "学生" if role == "user" else "助教"
+        rows.append(f"{label}：{content[:800]}")
+    return "\n".join(rows) or "暂无历史对话"
+
+
+def _evidence_context(evidence: list[Evidence]) -> str:
+    return "\n\n".join(
+        f"[证据 #{index}] 文件：{item.source_file}；章节：{item.section}\n{item.text}"
+        for index, item in enumerate(evidence, 1)
+    )
+
+
+def _unsafe_guidance(reply: str) -> bool:
+    compact = reply.strip()
+    if not compact or not compact.endswith(("？", "?")):
+        return True
+    return any(marker in compact for marker in _DIRECT_ANSWER_MARKERS)
+
+
+def _safe_guidance_fallback(intent: str, evidence: list[Evidence]) -> str:
+    section = evidence[0].section or evidence[0].source_file
+    if intent == "hint":
+        return f"可以先把范围收窄到课程资料的“{section}”。你能先找出其中与原问题最直接相关的一句话吗？"
+    if intent == "respond":
+        return f"你的思路已经记录。请再对照“{section}”中的课程原文：哪一处证据可以直接支持你刚才的判断？"
+    return f"我们先从课程资料的“{section}”开始拆解。原问题中哪个关键词与这一部分联系最直接？"
+
+
+def _reveal_from_evidence(
+    question: str,
+    evidence: list[Evidence],
+    provider: LLMProvider,
+) -> str:
+    system = (
+        "你是课程伴学助教。现在学生已明确请求答案。"
+        "只能依据给定课程证据完整作答，不得使用外部知识或常识补充。"
+        "每项关键结论都要使用[证据 #N]标明依据；证据不能支持的内容不得回答。"
+    )
+    prompt = f"问题：{question}\n\n课程证据：\n{_evidence_context(evidence)}"
+    answer = provider.generate(system, prompt).strip()
+    if not answer:
+        raise ValueError("模型未返回答案")
+    return answer if "[证据 #" in answer else f"{answer} [证据 #1]"
+
+
+def guide_question(
+    question: str,
+    retriever: CourseRetriever,
+    provider: LLMProvider,
+    *,
+    intent: str = "start",
+    phase: str = "initial",
+    student_message: str = "",
+    history: list[dict[str, Any]] | None = None,
+    evidence_refs: list[dict[str, Any]] | None = None,
+    min_score: float = 0.12,
+    top_k: int = 4,
+) -> GuidedQAResult:
+    """Guide one evidence-grounded tutoring turn without persisting session state."""
+    original_question = question.strip()
+    intent = intent.strip().lower()
+    phase = phase.strip().lower()
+    if not original_question:
+        raise ValueError("原始问题不能为空")
+    if intent not in _GUIDED_INTENTS:
+        raise ValueError("不支持的引导意图")
+    if phase not in _GUIDED_PHASES:
+        raise ValueError("不支持的引导阶段")
+
+    candidates = retriever.search(original_question, top_k)
+    evidence = [item for item in candidates if item.score >= min_score]
+    if evidence_refs:
+        expected = {
+            (
+                str(item.get("source_file", "")),
+                str(item.get("section", "")),
+                str(item.get("text", "")),
+            )
+            for item in evidence_refs
+            if isinstance(item, dict)
+        }
+        evidence = [
+            item for item in evidence
+            if (item.source_file, item.section, item.text) in expected
+        ]
+    if not evidence:
+        return GuidedQAResult(
+            _format_refusal(original_question, candidates),
+            "closed", False, False, True, [], [], True,
+        )
+
+    points = _extract_points(evidence)
+    if intent == "reveal":
+        return GuidedQAResult(
+            _reveal_from_evidence(original_question, evidence, provider),
+            "revealed", False, False, True,
+            evidence, points, False,
+        )
+    if intent == "end":
+        return GuidedQAResult(
+            "本题引导已结束。你可以重新提出问题，再从课程证据出发梳理。",
+            "closed", False, False, True, evidence, points, False,
+        )
+
+    turn_rule = {
+        "start": "这是首轮。简要指出问题要解决什么，只提出第一个思考步骤。",
+        "respond": "先简短评价学生当前思路，再只推进一个步骤；不要把这条回复当成新问题。",
+        "hint": "学生表示卡住。给出一个收敛、具体但不包含完整答案的提示。",
+    }[intent]
+    system = (
+        "你是严格基于课程证据的苏格拉底式助教。不得使用外部知识，不得编造。"
+        "在引导阶段不得给出完整答案、最终结论或完整推导。"
+        "每轮只推进一个思考步骤，语言简洁，并且必须以一个等待学生作答的明确问题结束。"
+        "只有系统明确指定“揭示答案”时才可以完整作答。"
+    )
+    prompt = (
+        f"原始问题：{original_question}\n"
+        f"当前阶段：{phase}\n"
+        f"本轮要求：{turn_rule}\n"
+        f"学生本轮输入：{student_message.strip()[:2000] or '尚未作答'}\n\n"
+        f"对话历史：\n{_compact_history(history)}\n\n"
+        f"课程证据：\n{_evidence_context(evidence)}"
+    )
+    reply = provider.generate(system, prompt).strip()
+    if _unsafe_guidance(reply):
+        repair_prompt = (
+            f"{prompt}\n\n待修正草稿：\n{reply[:1200]}\n\n"
+            "请重写草稿：删除完整答案和最终结论，只保留一个提示步骤，并以一个问题结束。"
+        )
+        repaired = provider.generate(system, repair_prompt).strip()
+        reply = repaired if not _unsafe_guidance(repaired) else _safe_guidance_fallback(intent, evidence)
+
+    return GuidedQAResult(
+        reply,
+        "guiding", True, True, False,
+        evidence, points, False,
+    )
 
 
 def answer_question(question: str, retriever: CourseRetriever, provider: LLMProvider,

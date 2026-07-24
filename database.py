@@ -1,8 +1,11 @@
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+
+from migrations import apply_migrations
 
 
 class LearningDatabase:
@@ -183,6 +186,39 @@ class LearningDatabase:
                 CREATE INDEX IF NOT EXISTS idx_memory_course ON memory_attempts(course_id, user_id);
                 CREATE INDEX IF NOT EXISTS idx_ai_practice_course ON ai_practice_attempts(course_id, user_id);
             """)
+            apply_migrations(conn)
+            self._backfill_class_scope(conn)
+
+    @staticmethod
+    def _backfill_class_scope(conn: sqlite3.Connection) -> None:
+        """Give legacy shared courses a deterministic default term and class."""
+        courses = conn.execute(
+            "SELECT course_id,course_name,owner_id FROM courses WHERE course_type='shared_course'"
+        ).fetchall()
+        for course in courses:
+            owner_key = hashlib.sha256(str(course["owner_id"]).encode()).hexdigest()[:12]
+            course_key = hashlib.sha256(str(course["course_id"]).encode()).hexdigest()[:12]
+            term_id = f"term_legacy_{owner_key}"
+            class_id = f"class_legacy_{course_key}"
+            conn.execute(
+                "INSERT OR IGNORE INTO terms(term_id,term_name,owner_id) VALUES(?,?,?)",
+                (term_id, "默认学期", course["owner_id"]),
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO classes(class_id,course_id,term_id,class_name,teacher_id)
+                   VALUES(?,?,?,?,?)""",
+                (class_id, course["course_id"], term_id, f"{course['course_name']}默认班", course["owner_id"]),
+            )
+            enrollments = conn.execute(
+                "SELECT student_id FROM course_enrollments WHERE course_id=?", (course["course_id"],)
+            ).fetchall()
+            for enrollment in enrollments:
+                anon = hashlib.sha256(f"{class_id}:{enrollment['student_id']}".encode()).hexdigest()[:16]
+                conn.execute(
+                    """INSERT OR IGNORE INTO class_memberships(class_id,student_id,anonymous_id)
+                       VALUES(?,?,?)""",
+                    (class_id, enrollment["student_id"], anon),
+                )
 
     def execute(self, query: str, params: tuple = ()) -> int:
         with self.connect() as conn:

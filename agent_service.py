@@ -6,6 +6,7 @@ from typing import Any
 
 from campus_service import CampusError, CampusService, ValidationError
 from config import TEACHER_PORTAL_ENABLED
+from question_bank_service import QuestionBankService
 from skills.memory import MemoryLearningSkill
 
 
@@ -68,6 +69,7 @@ class CampusAgentService:
     def __init__(self, campus: CampusService):
         self.campus = campus
         self.memory = MemoryLearningSkill(campus)
+        self.question_banks = QuestionBankService(campus.db, campus)
 
     def invoke(self, request: AgentRequest | dict[str, Any]) -> AgentResponse:
         req = AgentRequest.from_dict(request) if isinstance(request, dict) else request
@@ -127,10 +129,38 @@ class CampusAgentService:
         if action == "course_knowledge_status":
             return self.campus.knowledge_status(scope["course_id"], user_id, role)
         if action == "course_qa":
+            if "intent" in inp:
+                return self.campus.ask(
+                    scope["course_id"], user_id, role, inp["question"],
+                    intent=inp["intent"],
+                    student_message=inp.get("student_message", ""),
+                    phase=inp.get("phase", "initial"),
+                    history=inp.get("history", []),
+                    evidence_refs=inp.get("evidence_refs", []),
+                )
             return self.campus.ask(scope["course_id"], user_id, role, inp["question"])
         if action == "quiz_generate":
+            if inp.get("source") == "published_question_folders":
+                return self.question_banks.student_publications(
+                    {"user_id": user_id, "role": role}, scope["course_id"]
+                )
+            if inp.get("source") == "published_question_bank":
+                return self.question_banks.student_questions(
+                    {"user_id": user_id, "role": role}, scope["course_id"],
+                    limit=int(inp.get("count", 30)), offset=int(inp.get("offset", 0)),
+                    folder_id=inp.get("folder_id"),
+                )
             return self.campus.generate_quiz(scope["course_id"], user_id, role, inp.get("question_id"))
         if action == "quiz_submit":
+            if inp.get("version_id"):
+                if len(inp["items"]) != len(inp["responses"]):
+                    raise ValidationError("题目数量与答案数量不一致")
+                return self.question_banks.submit(
+                    {"user_id": user_id, "role": role}, scope["course_id"],
+                    inp["version_id"],
+                    [{"item_id": item["item_id"], "response": response}
+                     for item, response in zip(inp["items"], inp["responses"])],
+                )
             return self.campus.submit_quiz(scope["course_id"], user_id, role, inp.get("question_id"), inp["items"], inp["responses"])
         if action in {"learning_profile", "wrong_question_list", "weak_point_analysis"}:
             profile = self.campus.profile(scope["course_id"], user_id, role)

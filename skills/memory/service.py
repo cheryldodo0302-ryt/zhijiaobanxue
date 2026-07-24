@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from campus_service import CampusService, NotFound, PermissionDenied, ValidationError
+from semantic_knowledge_service import SemanticKnowledgeService
 
 
 def _loads(value: str | None) -> Any:
@@ -165,35 +166,21 @@ class MemoryLearningSkill:
         rows = self.db.fetch_all(sql + " ORDER BY c.chunk_id", params)
         if not rows:
             raise ValidationError("当前资料没有可用于分块的后端文字")
-        provider = self.campus.provider_factory()
+        semantic = SemanticKnowledgeService(self.campus.provider_factory)
+        blocks = semantic.semantic_chunks(rows)
         created: list[dict] = []
-        for batch_start in range(0, len(rows), 8):
-            batch = rows[batch_start:batch_start + 8]
-            source_text = "\n\n".join(f"[{x['section']}]\n{x['content']}" for x in batch)[:14000]
-            raw = provider.generate(
-                "你是学习材料语义分块专家。只输出合法 JSON 数组，不要 Markdown。"
-                "每项必须包含 title、keywords、content；title 是便于记忆的线索标题，"
-                "keywords 是 3-8 个核心词，content 必须忠实保留原文信息，不得编造。",
-                "请按逻辑段落和关键词密度把以下材料划分为知识块。每块适合独立背诵，"
-                "标题尽量采用《主题的N个要点》这类记忆线索。\n\n" + source_text,
-            )
-            blocks = _json_from_model(raw)
-            if not isinstance(blocks, list) or not blocks:
-                raise ValidationError("大模型没有生成有效知识块")
-            with self.db.connect() as conn:
-                current = conn.execute("SELECT COALESCE(MAX(block_order),0) FROM knowledge_blocks WHERE course_id=?",
-                                       (course_id,)).fetchone()[0]
-                for offset, block in enumerate(blocks, 1):
-                    if not isinstance(block, dict) or not str(block.get("content", "")).strip():
-                        continue
-                    title = str(block.get("title", "知识块")).strip()[:120]
-                    keywords = [str(x).strip() for x in block.get("keywords", []) if str(x).strip()][:8]
-                    cur = conn.execute("""INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content)
-                                        VALUES(?,?,?,?,?,?,?)""",
-                                       (course_id, document_id or batch[0]["document_id"], user_id, current + offset,
-                                        title, json.dumps(keywords, ensure_ascii=False), str(block["content"]).strip()))
-                    created.append({"block_id": int(cur.lastrowid), "title": title, "keywords": keywords,
-                                    "content": str(block["content"]).strip()})
+        with self.db.connect() as conn:
+            current = conn.execute("SELECT COALESCE(MAX(block_order),0) FROM knowledge_blocks WHERE course_id=?",
+                                   (course_id,)).fetchone()[0]
+            for offset, block in enumerate(blocks, 1):
+                title = str(block["title"]).strip()[:120]
+                keywords = block["keywords"][:8]
+                cur = conn.execute("""INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content)
+                                    VALUES(?,?,?,?,?,?,?)""",
+                                   (course_id, document_id or rows[0]["document_id"], user_id, current + offset,
+                                    title, json.dumps(keywords, ensure_ascii=False), block["content"]))
+                created.append({"block_id": int(cur.lastrowid), "title": title, "keywords": keywords,
+                                "content": block["content"]})
         if not created:
             raise ValidationError("未能保存有效知识块")
         return created
