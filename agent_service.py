@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import base64
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from campus_service import CampusError, CampusService, ValidationError
 from config import TEACHER_PORTAL_ENABLED
 from question_bank_service import QuestionBankService
+from skills.class_analysis_skill import ClassAnalysisInput, ClassAnalysisSkill
+from skills.contracts import SkillContext
+from skills.course_qa_skill import CourseQAInput, CourseQASkill
+from skills.learning_profile_skill import LearningProfileInput, LearningProfileSkill
 from skills.memory import MemoryLearningSkill
+from skills.quiz_generation_skill import QuizGenerationInput, QuizGenerationSkill
+from skills.teaching_report_skill import TeachingReportInput, TeachingReportSkill
+
+logger = logging.getLogger(__name__)
 
 
 STUDENT_ACTIONS = {
@@ -70,6 +79,11 @@ class CampusAgentService:
         self.campus = campus
         self.memory = MemoryLearningSkill(campus)
         self.question_banks = QuestionBankService(campus.db, campus)
+        self.course_qa_skill = CourseQASkill(campus)
+        self.quiz_generation_skill = QuizGenerationSkill(campus)
+        self.learning_profile_skill = LearningProfileSkill(campus)
+        self.class_analysis_skill = ClassAnalysisSkill(campus)
+        self.teaching_report_skill = TeachingReportSkill(campus)
 
     def invoke(self, request: AgentRequest | dict[str, Any]) -> AgentResponse:
         req = AgentRequest.from_dict(request) if isinstance(request, dict) else request
@@ -90,10 +104,12 @@ class CampusAgentService:
             return AgentResponse(req.request_id, "success", data=data)
         except CampusError as exc:
             return AgentResponse(req.request_id, "error", message=str(exc))
-        except (KeyError, TypeError, ValueError) as exc:
-            return AgentResponse(req.request_id, "error", message=f"输入参数不完整或格式错误：{exc}")
-        except Exception as exc:
-            return AgentResponse(req.request_id, "error", message=f"智能体执行失败：{exc}")
+        except (KeyError, TypeError, ValueError):
+            logger.info("Invalid agent input: request_id=%s action=%s", req.request_id, req.action, exc_info=True)
+            return AgentResponse(req.request_id, "error", message="输入内容不完整或格式不正确，请检查后重试")
+        except Exception:
+            logger.exception("Unhandled agent failure: request_id=%s action=%s", req.request_id, req.action)
+            return AgentResponse(req.request_id, "error", message="操作暂时失败，请稍后重试；如持续出现请联系管理员")
 
     def _upload(self, req: AgentRequest, user_id: str, role: str) -> dict:
         encoded = req.input.get("content_base64")
@@ -108,6 +124,7 @@ class CampusAgentService:
 
     def _dispatch(self, req: AgentRequest, user_id: str, role: str) -> Any:
         action, inp, scope = req.action, req.input, req.scope
+        skill_context = SkillContext(user_id=user_id, role=role, course_id=scope.get("course_id") or "unscoped")
         if action == "personal_course_create":
             return self.campus.create_course(inp["course_name"], "personal_course", user_id, role, inp.get("description", ""))
         if action == "personal_course_delete":
@@ -130,15 +147,12 @@ class CampusAgentService:
             return self.campus.knowledge_status(scope["course_id"], user_id, role)
         if action == "course_qa":
             if "intent" in inp:
-                return self.campus.ask(
-                    scope["course_id"], user_id, role, inp["question"],
-                    intent=inp["intent"],
-                    student_message=inp.get("student_message", ""),
-                    phase=inp.get("phase", "initial"),
-                    history=inp.get("history", []),
-                    evidence_refs=inp.get("evidence_refs", []),
-                )
-            return self.campus.ask(scope["course_id"], user_id, role, inp["question"])
+                return self.course_qa_skill.run(skill_context, CourseQAInput(**inp)).data
+            return self.campus.ask(
+                scope["course_id"], user_id, role, inp["question"],
+                retrieval_scope=inp.get("retrieval_scope", "all"),
+                material_type=inp.get("material_type"),
+            )
         if action == "quiz_generate":
             if inp.get("source") == "published_question_folders":
                 return self.question_banks.student_publications(
@@ -150,7 +164,7 @@ class CampusAgentService:
                     limit=int(inp.get("count", 30)), offset=int(inp.get("offset", 0)),
                     folder_id=inp.get("folder_id"),
                 )
-            return self.campus.generate_quiz(scope["course_id"], user_id, role, inp.get("question_id"))
+            return self.quiz_generation_skill.run(skill_context, QuizGenerationInput(question_id=inp.get("question_id"))).data
         if action == "quiz_submit":
             if inp.get("version_id"):
                 if len(inp["items"]) != len(inp["responses"]):
@@ -163,7 +177,7 @@ class CampusAgentService:
                 )
             return self.campus.submit_quiz(scope["course_id"], user_id, role, inp.get("question_id"), inp["items"], inp["responses"])
         if action in {"learning_profile", "wrong_question_list", "weak_point_analysis"}:
-            profile = self.campus.profile(scope["course_id"], user_id, role)
+            profile = self.learning_profile_skill.run(skill_context, LearningProfileInput()).data
             return profile if action == "learning_profile" else profile["wrong_questions" if action == "wrong_question_list" else "weak_points"]
         if action == "personal_data_export":
             return {"file_name": "personal_learning.csv", "content_base64": base64.b64encode(
@@ -216,12 +230,12 @@ class CampusAgentService:
             content = self.memory.export_workbook(inp.get("course_name", "课程"), inp["questions"])
             return {"file_name": "memory_workbook.docx", "content_base64": base64.b64encode(content).decode("ascii")}
         if action in {"class_question_analysis", "class_weak_point_analysis", "uncovered_question_analysis", "class_quiz_analysis"}:
-            result = self.campus.class_analysis(scope["course_id"], user_id)
+            result = self.class_analysis_skill.run(skill_context, ClassAnalysisInput()).data
             keys = {"class_question_analysis":"frequent_questions", "class_weak_point_analysis":"weak_points",
                     "uncovered_question_analysis":"uncovered_questions"}
             return result if action == "class_quiz_analysis" else result[keys[action]]
         if action == "teaching_report":
-            return self.campus.teaching_report(scope["course_id"], user_id)
+            return self.teaching_report_skill.run(skill_context, TeachingReportInput()).data
         if action == "class_data_export":
             file_format = str(inp.get("format", "csv")).lower()
             exporters = {"csv": self.campus.export_class_csv, "xlsx": self.campus.export_class_excel,

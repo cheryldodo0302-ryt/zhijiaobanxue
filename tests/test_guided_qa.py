@@ -164,6 +164,7 @@ def test_agent_guided_intermediate_turns_do_not_pollute_question_history(tmp_pat
             "question": question,
             "student_message": "因为重复数据被拆分了",
             "intent": "respond",
+            "session_id": start.data["session_id"],
             "phase": "guiding",
             "history": [
                 {"role": "user", "content": question},
@@ -175,6 +176,19 @@ def test_agent_guided_intermediate_turns_do_not_pollute_question_history(tmp_pat
     assert respond.status == "success"
     assert service.db.fetch_all("SELECT * FROM course_questions") == []
 
+    second_respond = agent.invoke({
+        **base,
+        "request_id": "guide-respond-2",
+        "input": {
+            "question": question,
+            "student_message": "而且依赖关系被拆到合适的关系模式中",
+            "intent": "respond",
+            "session_id": start.data["session_id"],
+        },
+    })
+    assert second_respond.status == "success"
+    assert second_respond.data["can_reveal"]
+
     reveal = agent.invoke({
         **base,
         "request_id": "guide-reveal",
@@ -182,6 +196,7 @@ def test_agent_guided_intermediate_turns_do_not_pollute_question_history(tmp_pat
             "question": question,
             "student_message": "请给出答案",
             "intent": "reveal",
+            "session_id": start.data["session_id"],
             "phase": "guiding",
             "history": [],
             "evidence_refs": start.data["sources"],

@@ -12,6 +12,15 @@ def main() -> None:
     print(f"Mode: {status['mode']}")
     print(f"Provider: {status['provider']}")
     print(f"Model: {status['model']}")
+    if status["provider"] == "mock":
+        provider = build_backend_provider()
+        response = provider.generate(
+            "You are a connectivity checker.",
+            "只回复：确定性 Mock 运行成功",
+        )
+        print("Endpoint: offline://deterministic-mock")
+        print(f"SUCCESS: {response[:200]}")
+        return
     if status["provider"] == "gemini":
         endpoint = base_url if ":generateContent" in base_url else f"{base_url}/models/{status['model']}:generateContent"
     else:

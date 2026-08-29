@@ -90,6 +90,22 @@ def test_cancel_retry_and_health_report(setup):
     assert health["cloud_model_calls"] == health["cloud_tokens"] == 0
 
 
+def test_empty_review_document_can_be_reparsed(setup):
+    db, _, ingestion, teacher, course = setup
+    job = ingestion.queue_document(
+        teacher, course["course_id"], "scanned.pdf", "application/pdf", b"%PDF-1.4\npdf fixture"
+    )
+    db.execute(
+        "UPDATE ingestion_jobs SET status='review_required' WHERE job_id=?", (job["job_id"],)
+    )
+    db.execute(
+        "UPDATE course_documents SET status='review_required' WHERE document_id=?",
+        (job["document_id"],),
+    )
+    retried = ingestion.retry_job(teacher, job["job_id"])
+    assert retried["status"] == "queued"
+
+
 def test_teacher_can_choose_local_analysis_without_api_calls(setup):
     db, _, ingestion, teacher, course = setup
     job = ingestion.queue_document(

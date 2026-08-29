@@ -23,19 +23,43 @@ from campus_service import (
     parse_document,
 )
 from database import LearningDatabase
-from config import get_knowledge_extractor_settings
+from config import (
+    get_document_ingestion_settings,
+    get_knowledge_extractor_settings,
+    validate_ai_base_url,
+)
+from adaptive_ingestion import (
+    BatchParser,
+    DEFAULT_BATCH_SIZE,
+    DocumentInspect,
+    DocumentInspection,
+    PageInspection,
+)
 from document_ir import formula_anomalies, mineru_to_blocks, normalize_latex, search_aliases
 from formula_client import Pix2TextClient
 from job_secret_store import decrypt_job_secret, encrypt_job_secret
-from llm_provider import GeminiProvider, QwenProvider
+from knowledge_ingestion import (
+    KnowledgeBoundaryExtractor,
+    PptFastInspector,
+    RegionClassifier,
+    StructureBuilder,
+)
+from llm_provider import GeminiProvider, OllamaProvider, QwenProvider
 from mineru_client import MinerUClient
 from semantic_knowledge_service import SemanticKnowledgeService
+from security_utils import UnsafeUpload, validate_document_path
 
 
 MATERIAL_TYPES = {
     "syllabus", "lesson_plan", "slides", "textbook", "experiment",
     "question_bank", "knowledge_graph", "teaching_schedule", "other",
 }
+MATERIAL_LABELS = {
+    "slides": "课件", "textbook": "教材", "syllabus": "教学大纲",
+    "lesson_plan": "教案", "experiment": "实验资料", "question_bank": "题库",
+    "knowledge_graph": "知识图谱", "teaching_schedule": "教学进度", "other": "其他",
+}
+MATERIAL_ORDER = tuple(MATERIAL_LABELS)
 
 
 class IngestionService:
@@ -47,6 +71,448 @@ class IngestionService:
         self.mineru = MinerUClient()
         self.formula = Pix2TextClient()
         self.semantic = SemanticKnowledgeService(campus.provider_factory)
+        self.region_classifier = RegionClassifier()
+        self.structure_builder = StructureBuilder()
+        self.boundary_extractor = KnowledgeBoundaryExtractor()
+        self.ppt_inspector = PptFastInspector()
+
+    @staticmethod
+    def _require_teacher(actor: dict[str, Any]) -> str:
+        if actor.get("role") != "teacher":
+            raise PermissionDenied("仅教师可以管理自有智能服务配置")
+        return str(actor["user_id"])
+
+    def get_teacher_ai_settings(self, actor: dict[str, Any]) -> dict[str, Any]:
+        teacher_id = self._require_teacher(actor)
+        row = self.db.fetch_one(
+            "SELECT * FROM teacher_ai_settings WHERE teacher_id=?", (teacher_id,)
+        )
+        if not row:
+            return {
+                "provider": "openai_compatible", "base_url": "", "model": "",
+                "has_api_key": False, "verification_status": "untested",
+                "verification_message": "尚未保存教师自有 API 配置", "verified_at": None,
+            }
+        return {
+            "provider": row["provider"], "base_url": row["base_url"], "model": row["model"],
+            "has_api_key": bool(str(row.get("api_key_encrypted") or "")),
+            "verification_status": row["verification_status"],
+            "verification_message": row["verification_message"], "verified_at": row["verified_at"],
+        }
+
+    @staticmethod
+    def _validate_custom_ai_fields(provider: str, base_url: str, model: str) -> None:
+        if provider not in {"openai_compatible", "gemini", "ollama"}:
+            raise ValidationError("自有 AI 协议只支持 OpenAI 兼容接口、Google Gemini 或 Ollama")
+        try:
+            validate_ai_base_url(base_url, allow_private=provider == "ollama")
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        if not model:
+            raise ValidationError("必须填写模型名称")
+
+    def save_teacher_ai_settings(self, actor: dict[str, Any], *, provider: str,
+                                 base_url: str, model: str, api_key: str = "") -> dict[str, Any]:
+        teacher_id = self._require_teacher(actor)
+        provider = str(provider or "openai_compatible").strip()
+        base_url = str(base_url or "").strip().rstrip("/")
+        model = str(model or "").strip()
+        api_key = str(api_key or "").strip()
+        self._validate_custom_ai_fields(provider, base_url, model)
+        existing = self.db.fetch_one(
+            "SELECT * FROM teacher_ai_settings WHERE teacher_id=?", (teacher_id,)
+        )
+        encrypted = (
+            "" if provider == "ollama" else
+            encrypt_job_secret(api_key) if api_key else
+            str((existing or {}).get("api_key_encrypted") or "")
+        )
+        if provider != "ollama" and not encrypted:
+            raise ValidationError("首次保存时必须填写 API Key")
+        changed = not existing or any((
+            str((existing or {}).get("provider") or "") != provider,
+            str((existing or {}).get("base_url") or "") != base_url,
+            str((existing or {}).get("model") or "") != model,
+            bool(api_key),
+        ))
+        status = "untested" if changed else str(existing.get("verification_status") or "untested")
+        message = "配置已加密保存，尚未测试连接" if changed else str(existing.get("verification_message") or "")
+        self.db.execute(
+            """INSERT INTO teacher_ai_settings(
+                   teacher_id,provider,base_url,model,api_key_encrypted,verification_status,
+                   verification_message,verified_at
+               ) VALUES(?,?,?,?,?,?,?,NULL)
+               ON CONFLICT(teacher_id) DO UPDATE SET
+                   provider=excluded.provider,base_url=excluded.base_url,model=excluded.model,
+                   api_key_encrypted=excluded.api_key_encrypted,
+                   verification_status=excluded.verification_status,
+                   verification_message=excluded.verification_message,
+                   verified_at=CASE WHEN excluded.verification_status='untested' THEN NULL
+                                    ELSE teacher_ai_settings.verified_at END,
+                   updated_at=CURRENT_TIMESTAMP""",
+            (teacher_id, provider, base_url, model, encrypted, status, message),
+        )
+        return self.get_teacher_ai_settings(actor)
+
+    @staticmethod
+    def _custom_ai_provider(provider: str, api_key: str, base_url: str, model: str,
+                            timeout: int = 20) -> Any:
+        if provider == "ollama":
+            return OllamaProvider(base_url, model, timeout=timeout)
+        provider_class = GeminiProvider if provider == "gemini" else QwenProvider
+        return provider_class(api_key, base_url, model, timeout=timeout)
+
+    def test_teacher_ai_settings(self, actor: dict[str, Any]) -> dict[str, Any]:
+        teacher_id = self._require_teacher(actor)
+        row = self.db.fetch_one(
+            "SELECT * FROM teacher_ai_settings WHERE teacher_id=?", (teacher_id,)
+        )
+        if not row:
+            raise ValidationError("请先保存教师自有 API 配置")
+        api_key = decrypt_job_secret(str(row.get("api_key_encrypted") or ""))
+        if row["provider"] != "ollama" and not api_key:
+            raise ValidationError("已保存配置中没有可用 API Key，请重新保存")
+        try:
+            provider = self._custom_ai_provider(
+                str(row["provider"]), api_key, str(row["base_url"]), str(row["model"])
+            )
+            result = provider.generate_json(
+                "你正在执行连接测试。只返回 JSON，不要解释。",
+                '{"task":"connection_test","required_output":{"ok":true}}',
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("接口已响应，但未返回 JSON 对象")
+            status, message = "connected", "连接成功，模型已返回有效 JSON"
+        except Exception as exc:
+            status, message = "failed", str(exc)[:800]
+        self.db.execute(
+            """UPDATE teacher_ai_settings SET verification_status=?,verification_message=?,
+               verified_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE teacher_id=?""",
+            (status, message, teacher_id),
+        )
+        result = self.get_teacher_ai_settings(actor)
+        if status == "failed":
+            raise ValidationError(f"连接测试失败：{message}")
+        return result
+
+    def _resolve_ai_settings(self, actor: dict[str, Any],
+                             ai_settings: dict[str, Any] | None) -> dict[str, str]:
+        settings = ai_settings or {}
+        use_saved = bool(settings.get("use_saved"))
+        saved = None
+        if use_saved:
+            teacher_id = self._require_teacher(actor)
+            saved = self.db.fetch_one(
+                "SELECT * FROM teacher_ai_settings WHERE teacher_id=?", (teacher_id,)
+            )
+            if not saved:
+                raise ValidationError("尚未保存教师自有 API 配置")
+        custom_key = str(settings.get("api_key") or "").strip()
+        if not custom_key and saved:
+            custom_key = decrypt_job_secret(str(saved.get("api_key_encrypted") or ""))
+        custom_base = str(settings.get("base_url") or (saved or {}).get("base_url") or "").strip().rstrip("/")
+        custom_model = str(settings.get("model") or (saved or {}).get("model") or "").strip()
+        custom_provider = str(
+            settings.get("provider") or (saved or {}).get("provider") or "openai_compatible"
+        ).strip()
+        if custom_key or custom_base or custom_model or use_saved:
+            self._validate_custom_ai_fields(custom_provider, custom_base, custom_model)
+            if custom_provider != "ollama" and not custom_key:
+                raise ValidationError("非 Ollama 自有接口必须填写 API Key")
+        return {
+            "api_key": custom_key, "base_url": custom_base,
+            "model": custom_model, "provider": custom_provider,
+        }
+
+    def _adaptive_output_root(self, job: dict[str, Any]) -> Path:
+        return Path(job["stored_path"]).parent / f"{job['document_id']}_ingestion"
+
+    @staticmethod
+    def _fallback_pdf_inspection() -> DocumentInspection:
+        """Keep old parser test doubles and damaged upload diagnostics usable."""
+        page = PageInspection(
+            page_index=0, native_text="", native_text_chars=0, page_type="CONTENT",
+            parse_level="NORMAL", include_as_knowledge=True,
+        )
+        return DocumentInspection(total_pages=1, document_kind="unknown", pages=[page])
+
+    def _process_pdf_adaptive(self, job: dict[str, Any], path: Path) -> Any:
+        try:
+            inspection = DocumentInspect().inspect_pdf(path)
+        except Exception as exc:
+            # A malformed PDF still gets a manifest and a per-batch error. This
+            # also preserves the existing adapter contract for parser doubles.
+            inspection = self._fallback_pdf_inspection()
+            inspection.pages[0].extraction_error = str(exc)[:500]
+        batch_size = int(job.get("batch_size") or get_document_ingestion_settings().get("batch_size") or DEFAULT_BATCH_SIZE)
+        output_root = self._adaptive_output_root(job)
+        self.db.execute(
+            """UPDATE ingestion_jobs SET pipeline_stage='INSPECTING',total_pages=?,batch_size=?,
+               manifest_path=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?""",
+            (inspection.total_pages, batch_size, str(output_root / "manifest.json"), job["job_id"]),
+        )
+
+        def report_progress(summary: dict[str, Any], _batch_number: int) -> None:
+            total = max(1, int(summary.get("total_pages") or inspection.total_pages))
+            parsed = int(summary.get("parsed_pages") or 0)
+            self.db.execute(
+                """UPDATE ingestion_jobs SET status='running',pipeline_stage='PARSING',progress=?,
+                   total_pages=?,completed_pages=?,failed_pages=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?""",
+                (min(99.0, parsed * 100.0 / total), total, parsed,
+                 int(summary.get("failed_pages") or 0), job["job_id"]),
+            )
+
+        parser = BatchParser(
+            self.mineru, self.formula, batch_size=batch_size, progress_callback=report_progress,
+        )
+        return parser.run(path, job["document_id"], inspection, output_root)
+
+    def _annotate_source_blocks(
+        self, blocks: list[dict[str, Any]], pages: list[dict[str, Any]] | None = None,
+        document_id: str = "",
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Add deterministic region/outline metadata without changing source text."""
+        page_rows = {int(row.get("page_number") or 0): row for row in (pages or [])}
+        for index, block in enumerate(blocks, 1):
+            block.setdefault("block_id", f"{document_id or 'source'}_b{index:06d}")
+            page_number = int(block.get("page_number") or 1)
+            page = page_rows.get(page_number, {})
+            block.setdefault("page_index", page_number - 1)
+            block.setdefault("page_type", page.get("page_type", "CONTENT"))
+            block.setdefault("parse_level", page.get("parse_level", "NORMAL"))
+            block.setdefault("include_as_navigation", bool(page.get("include_as_navigation", False)))
+            block.setdefault("include_as_knowledge", bool(page.get("include_as_knowledge", True)))
+            block.setdefault("chapter_path", [])
+        annotated = self.region_classifier.classify(blocks)
+        structure = self.structure_builder.build(annotated, pages or [])
+        chapter_paths = structure.get("block_chapter_paths") or {}
+        for block in annotated:
+            block["chapter_path"] = chapter_paths.get(str(block.get("block_id") or ""), [])
+        return annotated, structure
+
+    @staticmethod
+    def _write_normalized_structure(output_root: Path, blocks: list[dict[str, Any]], structure: dict[str, Any]) -> None:
+        normalized = output_root / "normalized"
+        normalized.mkdir(parents=True, exist_ok=True)
+        with (normalized / "blocks.jsonl").open("w", encoding="utf-8") as stream:
+            for block in blocks:
+                stream.write(json.dumps(block, ensure_ascii=False) + "\n")
+        (normalized / "document.md").write_text(
+            "\n\n".join(str(block.get("markdown") or block.get("latex") or block.get("plain_text") or "").strip()
+                         for block in blocks if str(block.get("markdown") or block.get("latex") or block.get("plain_text") or "").strip())
+            + "\n",
+            encoding="utf-8",
+        )
+        (normalized / "chapters.json").write_text(
+            json.dumps(structure, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+    def _persist_document_structure(self, document_id: str, structure: dict[str, Any]) -> None:
+        self.db.execute(
+            """INSERT INTO document_structures(document_id,outline_json,toc_entries_json,warnings_json,status,updated_at)
+               VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+               ON CONFLICT(document_id) DO UPDATE SET outline_json=excluded.outline_json,
+                   toc_entries_json=excluded.toc_entries_json,warnings_json=excluded.warnings_json,
+                   status=excluded.status,updated_at=CURRENT_TIMESTAMP""",
+            (document_id, json.dumps(structure.get("outline") or [], ensure_ascii=False),
+             json.dumps(structure.get("toc_entries") or [], ensure_ascii=False),
+             json.dumps(structure.get("warnings") or [], ensure_ascii=False),
+             str(structure.get("status") or "ok")),
+        )
+
+    def _rebuild_knowledge_candidates(self, document_id: str, course_id: str) -> None:
+        rows = self.db.fetch_all(
+            "SELECT * FROM document_blocks WHERE document_id=? ORDER BY page_index,block_order",
+            (document_id,),
+        )
+        blocks: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["bbox"] = json.loads(item.pop("bbox_json") or "[]")
+            except json.JSONDecodeError:
+                item["bbox"] = []
+            try:
+                item["chapter_path"] = json.loads(item.get("chapter_path_json") or "[]")
+            except json.JSONDecodeError:
+                item["chapter_path"] = []
+            blocks.append(item)
+        candidates = self.boundary_extractor.extract(blocks, document_id)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE document_blocks SET knowledge_candidate=0 WHERE document_id=?", (document_id,))
+            candidate_ids = [str(candidate["candidate_id"]) for candidate in candidates]
+            stale_params: tuple[Any, ...] = (document_id,)
+            stale_sql = (
+                "DELETE FROM knowledge_candidates WHERE document_id=? "
+                "AND review_status IN ('PENDING','NEEDS_REVIEW')"
+            )
+            if candidate_ids:
+                stale_sql += " AND candidate_id NOT IN ({})".format(
+                    ",".join("?" for _ in candidate_ids)
+                )
+                stale_params += tuple(candidate_ids)
+            conn.execute(stale_sql, stale_params)
+            for candidate in candidates:
+                existing = conn.execute(
+                    "SELECT review_status FROM knowledge_candidates WHERE candidate_id=?", (candidate["candidate_id"],)
+                ).fetchone()
+                conn.execute("DELETE FROM knowledge_candidate_blocks WHERE candidate_id=?", (candidate["candidate_id"],))
+                for block_id in candidate["source_block_ids"]:
+                    conn.execute("UPDATE document_blocks SET knowledge_candidate=1 WHERE block_id=?", (block_id,))
+                if existing and str(existing[0]) in {"APPROVED", "MODIFIED", "REJECTED"}:
+                    if str(existing[0]) in {"APPROVED", "MODIFIED"}:
+                        conn.execute(
+                            """UPDATE document_blocks SET content_destination='knowledge',
+                               verification_status='teacher_verified',include_as_knowledge=1,
+                               updated_at=CURRENT_TIMESTAMP WHERE block_id IN ({})""".format(
+                                ",".join("?" for _ in candidate["source_block_ids"]) or "NULL"
+                            ), tuple(candidate["source_block_ids"]),
+                        )
+                    conn.executemany(
+                        "INSERT INTO knowledge_candidate_blocks(candidate_id,block_id,sort_order) VALUES(?,?,?)",
+                        [(candidate["candidate_id"], block_id, order)
+                         for order, block_id in enumerate(candidate["source_block_ids"])],
+                    )
+                    continue
+                conn.execute("DELETE FROM knowledge_candidates WHERE candidate_id=?", (candidate["candidate_id"],))
+                conn.execute(
+                    """INSERT INTO knowledge_candidates(
+                           candidate_id,course_id,document_id,title,knowledge_type,source_block_ids_json,
+                           page_start,page_end,bbox_json,markdown_content,confidence,region_type,chapter_path_json,review_status)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'PENDING')""",
+                    (candidate["candidate_id"], course_id, document_id, candidate["title"],
+                     candidate["knowledge_type"], json.dumps(candidate["source_block_ids"], ensure_ascii=False),
+                     candidate["page_start"], candidate["page_end"], json.dumps(candidate["bbox"], ensure_ascii=False),
+                     candidate["markdown_content"], candidate["confidence"], candidate["region_type"],
+                     json.dumps(candidate.get("chapter_path") or [], ensure_ascii=False)),
+                )
+                conn.executemany(
+                    "INSERT INTO knowledge_candidate_blocks(candidate_id,block_id,sort_order) VALUES(?,?,?)",
+                    [(candidate["candidate_id"], block_id, order)
+                     for order, block_id in enumerate(candidate["source_block_ids"])],
+                )
+
+    def _inspect_ppt_fast(self, job: dict[str, Any], path: Path) -> list[dict[str, Any]]:
+        root = self._adaptive_output_root(job)
+        raw = root / "raw"
+        raw.mkdir(parents=True, exist_ok=True)
+        try:
+            slides = self.ppt_inspector.inspect(path)
+        except Exception as exc:
+            (raw / "ppt_inspection.json").write_text(
+                json.dumps({"status": "failed", "error": str(exc)[:1000], "slides": []}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return []
+        (raw / "ppt_inspection.json").write_text(
+            json.dumps({"status": "ok", "slide_count": len(slides), "slides": slides}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (root / "normalized").mkdir(parents=True, exist_ok=True)
+        (root / "normalized" / "slides.json").write_text(
+            json.dumps({"status": "ok", "slide_count": len(slides), "slides": slides}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM presentation_slides WHERE document_id=?", (job["document_id"],))
+            conn.executemany(
+                """INSERT INTO presentation_slides(
+                       document_id,slide_index,slide_type,parse_level,title,shape_count,text_count,
+                       picture_count,reading_order_json,shapes_json,layout_kind,regions_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [(job["document_id"], int(slide["slide_index"]), slide["slide_type"], slide["parse_level"],
+                  slide.get("title", ""), int(slide.get("shape_count") or 0), int(slide.get("text_count") or 0),
+                  int(slide.get("picture_count") or 0), json.dumps(slide.get("reading_order") or []),
+                  json.dumps(slide.get("shapes") or [], ensure_ascii=False), slide.get("layout_kind", "single_column"),
+                  json.dumps(slide.get("regions") or [], ensure_ascii=False)) for slide in slides],
+            )
+        return slides
+
+    @staticmethod
+    def _ppt_title_hint(title: str) -> dict[str, Any]:
+        """Return a conservative local level hint; AI resolves ambiguous cases."""
+        cleaned = re.sub(r"^\s*#{1,6}\s*", "", str(title or "")).strip()
+        chapter = re.match(r"^第\s*[一二三四五六七八九十百0-9]+\s*[章篇部]", cleaned)
+        if chapter:
+            return {"number": chapter.group(0), "level": 1, "ambiguous": False}
+        section = re.match(r"^第\s*[一二三四五六七八九十百0-9]+\s*节", cleaned)
+        if section:
+            return {"number": section.group(0), "level": 2, "ambiguous": False}
+        dotted = re.match(r"^(\d+(?:\.\d+)+)(?!\d)", cleaned)
+        if dotted:
+            number = dotted.group(1)
+            return {"number": number, "level": min(3, number.count(".") + 1), "ambiguous": False}
+        single = re.match(r"^(\d+)[.)、]?(?:\s+|$)", cleaned)
+        if single:
+            # "3" may mean chapter 3, a third bullet, or a descendant of 1.3.
+            return {"number": single.group(1), "level": 3, "ambiguous": True}
+        return {"number": "", "level": 2, "ambiguous": False}
+
+    def _ppt_chunks_from_slides(self, slides: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        chunks: list[dict[str, Any]] = []
+        active_title = ""
+        for slide in slides:
+            slide_number = int(slide.get("slide_number") or int(slide.get("slide_index") or 0) + 1)
+            slide_type = str(slide.get("slide_type") or "SIMPLE_CONTENT")
+            detected_title = re.sub(r"\s+", " ", str(slide.get("title") or "")).strip()
+            inherited = False
+            if slide_type in {"COVER", "ENDING"}:
+                active_title = ""
+            elif detected_title:
+                active_title = detected_title
+            elif active_title:
+                detected_title = active_title
+                inherited = True
+            title = detected_title or f"第 {slide_number} 页"
+            hint = self._ppt_title_hint(title)
+            shape_map = {
+                int(shape.get("shape_id") or 0): shape
+                for shape in slide.get("shapes") or [] if isinstance(shape, dict)
+            }
+            body_parts = [
+                str(shape_map[shape_id].get("text") or "").strip()
+                for shape_id in slide.get("reading_order") or []
+                if shape_id in shape_map and not bool(shape_map[shape_id].get("is_title"))
+                and not bool(shape_map[shape_id].get("is_boilerplate"))
+                and str(shape_map[shape_id].get("text") or "").strip()
+            ]
+            body = "\n".join(body_parts).strip()
+            content_parts = [body[start:start + 1100].strip() for start in range(0, len(body), 900)] if body else [""]
+            for part_index, content in enumerate(content_parts):
+                chunks.append({
+                    "section": title, "page_number": slide_number, "content": content,
+                    "heading_level": 0 if inherited else int(hint["level"]), "heading_path": [title],
+                    "source_kind": "pptx", "ppt_slide_index": int(slide.get("slide_index") or slide_number - 1),
+                    "ppt_slide_number": slide_number, "ppt_slide_title": title,
+                    "ppt_detected_title": detected_title, "ppt_title_number": hint["number"],
+                    "ppt_title_level_hint": int(hint["level"]),
+                    "ppt_title_number_ambiguous": bool(hint["ambiguous"]),
+                    "ppt_title_inherited": inherited, "ppt_part_index": part_index,
+                    "ppt_layout_kind": str(slide.get("layout_kind") or "single_column"),
+                    "ppt_slide_type": slide_type,
+                })
+        return chunks
+
+    @staticmethod
+    def _ppt_page_rows(slides: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for slide in slides:
+            slide_type = str(slide.get("slide_type") or "SIMPLE_CONTENT")
+            page_type = slide_type if slide_type in {"COVER", "ENDING"} else "CONTENT"
+            include = page_type not in {"COVER", "ENDING"}
+            text_chars = sum(len(str(shape.get("text") or "")) for shape in slide.get("shapes") or [])
+            rows.append({
+                "page_index": int(slide.get("slide_index") or 0),
+                "page_number": int(slide.get("slide_number") or int(slide.get("slide_index") or 0) + 1),
+                "status": "PARSED_OK", "parse_method": "native", "page_type": page_type,
+                "parse_level": str(slide.get("parse_level") or "FAST"),
+                "native_text_chars": text_chars, "text_chars": text_chars, "parsed_text_chars": text_chars,
+                "block_count": 0, "equation_count": 0, "table_count": 0,
+                "image_count": int(slide.get("picture_count") or 0), "image_area_ratio": 0,
+                "include_as_navigation": not include, "include_as_knowledge": include,
+                "validation_issues": [], "error_message": "",
+            })
+        return rows
 
     @staticmethod
     def _suggest_material_type(name: str, markdown: str) -> tuple[str, str]:
@@ -206,7 +672,7 @@ class IngestionService:
 
     def queue_document(self, actor: dict[str, Any], course_id: str, name: str,
                        mime_type: str, data: bytes, *, analysis_mode: str = "api",
-                       ai_settings: dict[str, str] | None = None) -> dict[str, Any]:
+                       ai_settings: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.queue_document_stream(
             actor, course_id, name, mime_type, io.BytesIO(data),
             analysis_mode=analysis_mode, ai_settings=ai_settings,
@@ -215,7 +681,7 @@ class IngestionService:
     def queue_document_stream(self, actor: dict[str, Any], course_id: str, name: str,
                               mime_type: str, stream: BinaryIO, *,
                               analysis_mode: str = "api",
-                              ai_settings: dict[str, str] | None = None) -> dict[str, Any]:
+                              ai_settings: dict[str, Any] | None = None) -> dict[str, Any]:
         if actor.get("role") != "teacher":
             raise PermissionDenied("仅教师可以建设共享知识库")
         teacher_id = str(actor["user_id"])
@@ -224,19 +690,21 @@ class IngestionService:
             raise PermissionDenied("只能向自己的共享课程上传资料")
         if analysis_mode not in {"api", "local"}:
             raise ValidationError("资料分析方式必须是 api 或 local")
-        settings = ai_settings or {}
-        custom_key = str(settings.get("api_key") or "").strip()
-        custom_base = str(settings.get("base_url") or "").strip()
-        custom_model = str(settings.get("model") or "").strip()
-        custom_provider = str(settings.get("provider") or "openai_compatible").strip()
-        if custom_key and (not custom_base or not custom_model):
-            raise ValidationError("使用教师自有 API 时必须填写 Base URL 和模型名称")
+        settings = self._resolve_ai_settings(actor, ai_settings)
+        custom_key = settings["api_key"]
+        custom_base = settings["base_url"]
+        custom_model = settings["model"]
+        custom_provider = settings["provider"]
+        custom_enabled = bool(
+            custom_base and custom_model and (custom_key or custom_provider == "ollama")
+        )
         safe_name = _safe_name(name)
         suffix = Path(safe_name).suffix.lower()
         if suffix not in ALLOWED_FILES or mime_type not in ALLOWED_FILES[suffix]:
             raise ValidationError("扩展名与 MIME 类型不匹配或不受支持")
         document_id = f"doc_{uuid.uuid4().hex}"
         job_id = f"job_{uuid.uuid4().hex}"
+        batch_size = int(get_document_ingestion_settings().get("batch_size") or DEFAULT_BATCH_SIZE)
         root = (self.campus.storage_dir / course_id).resolve()
         destination = (root / f"{document_id}_{safe_name}").resolve()
         if root not in destination.parents:
@@ -258,6 +726,10 @@ class IngestionService:
                     output.write(chunk)
             if not size_bytes:
                 raise ValidationError("不能上传空文件")
+            try:
+                validate_document_path(safe_name, staging, max_bytes=MAX_UPLOAD_BYTES)
+            except UnsafeUpload as exc:
+                raise ValidationError(str(exc)) from exc
             digest = digest_builder.hexdigest()
             if self.db.fetch_one(
                 "SELECT 1 ok FROM course_documents WHERE course_id=? AND sha256=?", (course_id, digest)
@@ -272,14 +744,14 @@ class IngestionService:
                 )
                 conn.execute(
                     """INSERT INTO ingestion_jobs(job_id,document_id,course_id,requested_by,status,
-                           parser_config_hash,analysis_mode,ai_provider,ai_base_url,ai_model,ai_key_encrypted)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                           parser_config_hash,analysis_mode,ai_provider,ai_base_url,ai_model,ai_key_encrypted,batch_size)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (job_id, document_id, course_id, teacher_id, "queued",
                      hashlib.sha256(
-                         b"teacher-pdf-mineru-auto+native-office+canonical-markdown+pix2text-v3"
-                     ).hexdigest(), analysis_mode, custom_provider if custom_key else "",
-                     custom_base if custom_key else "", custom_model if custom_key else "",
-                     encrypt_job_secret(custom_key)),
+                         f"teacher-adaptive-pdf-v1-batch-{batch_size}".encode("utf-8")
+                     ).hexdigest(), analysis_mode, custom_provider if custom_enabled else "",
+                     custom_base if custom_enabled else "", custom_model if custom_enabled else "",
+                     encrypt_job_secret(custom_key), batch_size),
                 )
         except Exception:
             staging.unlink(missing_ok=True)
@@ -300,38 +772,33 @@ class IngestionService:
         try:
             path = Path(job["stored_path"])
             suffix = path.suffix.lower()
+            title_rebuild_only = str(job.get("pipeline_stage") or "") == "PPT_TITLE_REBUILD"
             chunks: list[dict[str, Any]] = []
             blocks: list[dict[str, Any]] = []
             parser_name = "zhijiao-native"
             parser_version = "1"
             canonical_markdown = ""
+            adaptive_result = None
+            structure: dict[str, Any] = {"status": "ok", "outline": [], "toc_entries": [], "warnings": []}
+            ppt_slides: list[dict[str, Any]] = []
+            native_page_rows: list[dict[str, Any]] = []
             if suffix == ".pdf":
                 if not self.mineru.enabled:
                     raise ValidationError(
                         "PDF 必须通过 MinerU 解析；请配置远程 ZHIJIAO_MINERU_URL 后重试"
                     )
-                middle = self.mineru.parse(
-                    path, method="auto", asset_dir=path.parent / f"{job['document_id']}_assets"
-                )
-                blocks = mineru_to_blocks(middle)
+                adaptive_result = self._process_pdf_adaptive(job, path)
+                blocks = adaptive_result.blocks
                 parser_name = "MinerU"
-                parser_version = str(middle.get("_version_name") or "unknown")
-                canonical_markdown = str(middle.get("_markdown") or "").strip()
-                if self.formula.enabled:
-                    for block in blocks:
-                        source_image = block.get("source_image_path")
-                        if block["block_type"] != "formula" or not source_image:
-                            continue
-                        secondary = self.formula.recognize(Path(source_image))
-                        secondary_latex = str(secondary.get("latex") or "")
-                        consistent = normalize_latex(block["latex"]) == normalize_latex(secondary_latex)
-                        block["raw"]["formula_secondary_latex"] = secondary_latex
-                        block["raw"]["formula_consistent"] = consistent
-                        block["raw"]["formula_secondary_engine"] = secondary.get("engine", "pix2text")
-                        if consistent and not formula_anomalies(block["latex"]):
-                            block["verification_status"] = "auto_verified"
+                parser_version = adaptive_result.parser_version
+                canonical_markdown = adaptive_result.canonical_markdown.strip()
             else:
-                chunks = parse_document(path.read_bytes(), suffix)
+                if suffix == ".pptx":
+                    ppt_slides = self._inspect_ppt_fast(job, path)
+                    chunks = self._ppt_chunks_from_slides(ppt_slides)
+                    native_page_rows = self._ppt_page_rows(ppt_slides)
+                else:
+                    chunks = parse_document(path.read_bytes(), suffix)
             if chunks:
                 previous_heading = ""
                 for chunk in chunks:
@@ -339,20 +806,25 @@ class IngestionService:
                     heading = str(chunk.get("section") or "").strip()
                     heading_level = int(chunk.get("heading_level") or 0)
                     if heading_level and heading and heading != previous_heading:
+                        title_raw = dict(chunk)
+                        title_raw["is_slide_title_block"] = suffix == ".pptx"
                         blocks.append({
                             "block_type": "title", "markdown": f"{'#' * min(heading_level, 3)} {heading}",
                             "plain_text": heading, "latex": "",
                             "page_number": int(chunk.get("page_number") or 1), "bbox": [],
                             "confidence": None, "source_method": "native", "verification_status": "auto_verified",
-                            "search_aliases": search_aliases(heading), "source_image_path": "", "raw": chunk,
+                            "search_aliases": search_aliases(heading), "source_image_path": "", "raw": title_raw,
                         })
                         previous_heading = heading
-                    blocks.append({
-                        "block_type": "paragraph", "markdown": content, "plain_text": content,
-                        "latex": "", "page_number": int(chunk.get("page_number") or 1), "bbox": [],
-                        "confidence": None, "source_method": "native", "verification_status": "review_required",
-                        "search_aliases": search_aliases(content), "source_image_path": "", "raw": chunk,
-                    })
+                    if str(content).strip():
+                        content_raw = dict(chunk)
+                        content_raw["is_slide_title_block"] = False
+                        blocks.append({
+                            "block_type": "paragraph", "markdown": content, "plain_text": content,
+                            "latex": "", "page_number": int(chunk.get("page_number") or 1), "bbox": [],
+                            "confidence": None, "source_method": "native", "verification_status": "review_required",
+                            "search_aliases": search_aliases(content), "source_image_path": "", "raw": content_raw,
+                        })
                 canonical_markdown = self._native_markdown(path, chunks)
             elif suffix != ".pdf" and self.mineru.enabled:
                 middle = self.mineru.parse(
@@ -377,13 +849,21 @@ class IngestionService:
                             block["verification_status"] = "auto_verified"
             if not blocks:
                 hint = "；请配置远程 MinerU 后重试" if not self.mineru.enabled else ""
-                raise ValidationError(f"文件未解析出有效文字，已标记为需要 OCR{hint}")
+                raise ValidationError(
+                    f"文件未生成 DocumentIR 块，解析任务未进入 AI 分析{hint}"
+                )
             if not canonical_markdown:
                 canonical_markdown = "\n\n".join(
                     str(block.get("markdown") or block.get("latex") or block.get("plain_text") or "").strip()
                     for block in blocks
                     if str(block.get("markdown") or block.get("latex") or block.get("plain_text") or "").strip()
                 )
+            blocks, structure = self._annotate_source_blocks(
+                blocks, adaptive_result.pages if adaptive_result is not None else native_page_rows,
+                job["document_id"],
+            )
+            if adaptive_result is not None:
+                self._write_normalized_structure(adaptive_result.output_root, blocks, structure)
             self._write_canonical_markdown(job, canonical_markdown, parser_name, parser_version)
             self._ensure_material_metadata(
                 job["document_id"], job["original_name"], canonical_markdown
@@ -391,8 +871,9 @@ class IngestionService:
             self._create_office_preview(job)
             by_page: dict[int, list[dict[str, Any]]] = defaultdict(list)
             for block in blocks:
-                block["block_id"] = f"block_{uuid.uuid4().hex}"
-                by_page[int(block["page_number"])].append(block)
+                block.setdefault("block_id", f"block_{uuid.uuid4().hex}")
+                page_number = int(block["page_number"])
+                by_page[page_number].append(block)
             with self.db.connect() as conn:
                 conn.execute("DELETE FROM document_chunks WHERE document_id=?", (job["document_id"],))
                 conn.execute("DELETE FROM document_pages WHERE document_id=?", (job["document_id"],))
@@ -404,39 +885,147 @@ class IngestionService:
                 )
                 order = 0
                 pending_count = 0
-                for page_number, page_blocks in sorted(by_page.items()):
+                if adaptive_result is not None:
+                    page_rows = adaptive_result.pages
+                elif native_page_rows:
+                    page_rows = native_page_rows
+                else:
+                    page_rows = [
+                        {
+                            "page_index": page_number - 1, "page_number": page_number,
+                            "status": "PARSED_OK", "parse_method": page_blocks[0]["source_method"],
+                            "page_type": "CONTENT", "parse_level": "NORMAL",
+                            "native_text_chars": sum(len(x.get("plain_text", "")) for x in page_blocks),
+                            "text_chars": sum(len(x.get("plain_text", "")) for x in page_blocks),
+                            "parsed_text_chars": sum(len(x.get("plain_text", "")) for x in page_blocks),
+                            "block_count": len(page_blocks), "equation_count": sum(x["block_type"] == "formula" for x in page_blocks),
+                            "table_count": sum(x["block_type"] == "table" for x in page_blocks), "image_count": sum(x["block_type"] == "image" for x in page_blocks),
+                            "image_area_ratio": 0, "include_as_navigation": False, "include_as_knowledge": True,
+                            "validation_issues": [], "error_message": "",
+                        }
+                        for page_number, page_blocks in sorted(by_page.items())
+                    ]
+                page_ids: dict[int, str] = {}
+                for page_row in sorted(page_rows, key=lambda row: int(row["page_index"])):
+                    page_index = int(page_row["page_index"])
+                    page_number = int(page_row["page_number"])
+                    page_blocks = by_page.get(page_number, [])
                     page_id = f"page_{uuid.uuid4().hex}"
-                    page_pending = any(x["verification_status"] == "review_required" for x in page_blocks)
-                    page_status = "review_required" if page_pending else "ready"
+                    page_ids[page_index] = page_id
+                    page_pending = any(
+                        x["verification_status"] == "review_required"
+                        and page_row.get("include_as_knowledge", True)
+                        for x in page_blocks
+                    )
+                    adaptive_status = str(page_row.get("status") or "PARSED_OK")
+                    page_status = {
+                        "PARSED_OK": "ready", "PARSED_PARTIAL": "review_required",
+                        "TEXT_ONLY": "review_required", "SUSPECT": "review_required",
+                        "FAILED": "failed", "PENDING": "queued", "PROCESSING": "queued",
+                    }.get(adaptive_status, "review_required")
+                    if page_pending and page_status == "ready":
+                        page_status = "review_required"
                     conn.execute(
-                        """INSERT INTO document_pages(page_id,document_id,page_number,status,parse_method)
-                           VALUES(?,?,?,?,?)""",
-                        (page_id, job["document_id"], page_number, page_status, page_blocks[0]["source_method"]),
+                        """INSERT INTO document_pages(
+                               page_id,document_id,page_number,page_index,batch_number,status,parse_method,
+                               page_type,parse_level,native_text_chars,text_chars,parsed_text_chars,block_count,
+                               equation_count,table_count,image_count,image_area_ratio,include_as_navigation,
+                               include_as_knowledge,validation_issues_json,error_message)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (page_id, job["document_id"], page_number, page_index,
+                         (page_index // int(job.get("batch_size") or 40)) + 1, page_status,
+                         page_row.get("parse_method") or (page_blocks[0]["source_method"] if page_blocks else "skip"),
+                         page_row.get("page_type", "CONTENT"), page_row.get("parse_level", "NORMAL"),
+                         int(page_row.get("native_text_chars") or 0), int(page_row.get("text_chars") or 0),
+                         int(page_row.get("parsed_text_chars") or 0), int(page_row.get("block_count") or len(page_blocks)),
+                         int(page_row.get("equation_count") or 0), int(page_row.get("table_count") or 0),
+                         int(page_row.get("image_count") or 0), float(page_row.get("image_area_ratio") or 0),
+                         int(bool(page_row.get("include_as_navigation"))), int(bool(page_row.get("include_as_knowledge", True))),
+                         json.dumps(page_row.get("validation_issues") or [], ensure_ascii=False),
+                         str(page_row.get("error_message") or "")[:1000]),
                     )
                     for block in page_blocks:
                         order += 1
                         if block["verification_status"] == "review_required":
                             pending_count += 1
+                        block_page_index = int(block.get("page_index", page_number - 1))
+                        include_as_knowledge = bool(block.get("include_as_knowledge", page_row.get("include_as_knowledge", True)))
                         conn.execute(
                             """INSERT INTO document_blocks(block_id,document_id,page_id,block_order,block_type,markdown,plain_text,
                                latex,source_image_path,page_number,bbox_json,confidence,source_method,verification_status,parser_name,parser_version,
-                               search_aliases_json,raw_payload_json)
-                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                               search_aliases_json,raw_payload_json,page_index,page_type,parse_level,chapter_path_json,
+                               include_as_navigation,include_as_knowledge,content_destination,semantic_role,
+                               region_type,region_confidence,region_reason,parent_region_block_id,knowledge_candidate)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (block["block_id"], job["document_id"], page_id, order, block["block_type"],
                              block["markdown"], block["plain_text"], block["latex"], block.get("source_image_path", ""), page_number,
                              json.dumps(block["bbox"], ensure_ascii=False), block["confidence"], block["source_method"],
                              block["verification_status"], parser_name, parser_version,
                              json.dumps(block["search_aliases"], ensure_ascii=False),
-                             json.dumps(block["raw"], ensure_ascii=False)),
+                             json.dumps(block["raw"], ensure_ascii=False), block_page_index,
+                             block.get("page_type", page_row.get("page_type", "CONTENT")),
+                             block.get("parse_level", page_row.get("parse_level", "NORMAL")),
+                             json.dumps(block.get("chapter_path") or [], ensure_ascii=False),
+                             int(bool(block.get("include_as_navigation", page_row.get("include_as_navigation", False)))),
+                             int(include_as_knowledge),
+                             str(block.get("content_destination") or ("unclassified" if include_as_knowledge else "excluded")),
+                             str(block.get("semantic_role") or ("" if include_as_knowledge else "navigation")),
+                             str(block.get("region_type") or "knowledge"), float(block.get("region_confidence") or 0.45),
+                             str(block.get("region_reason") or ""), str(block.get("parent_region_block_id") or ""),
+                             int(bool(block.get("knowledge_candidate", False)))),
                         )
-                final_status = "review_required" if pending_count else "ready"
+                final_status = (
+                    adaptive_result.job_status if adaptive_result is not None
+                    else ("review_required" if pending_count else "ready")
+                )
                 conn.execute(
                     """UPDATE ingestion_jobs SET status=?,progress=100,total_pages=?,completed_pages=?,
-                       updated_at=CURRENT_TIMESTAMP WHERE job_id=?""",
-                    (final_status, len(by_page), len(by_page), job_id),
+                       failed_pages=?,pipeline_stage=?,manifest_path=?,batch_size=?,updated_at=CURRENT_TIMESTAMP WHERE job_id=?""",
+                    (final_status,
+                     len(page_rows),
+                     sum(str(row.get("status")) != "FAILED" for row in page_rows),
+                     sum(str(row.get("status")) == "FAILED" for row in page_rows),
+                     "WAITING_REVIEW" if final_status == "review_required" else ("FAILED" if final_status == "failed" else "COMPLETED"),
+                     str(adaptive_result.manifest_path) if adaptive_result is not None else "",
+                     int(job.get("batch_size") or DEFAULT_BATCH_SIZE), job_id),
                 )
                 conn.execute("UPDATE course_documents SET status=?,error_message='' WHERE document_id=?",
                              (final_status, job["document_id"]))
+                if adaptive_result is not None:
+                    for key, batch in adaptive_result.manifest.payload.get("batches", {}).items():
+                        conn.execute(
+                            """INSERT INTO document_batches(
+                                   batch_id,document_id,batch_number,original_page_start,original_page_end,status,
+                                   retry_count,completed_pages,error_message,artifact_path)
+                               VALUES(?,?,?,?,?,?,?,?,?,?)
+                               ON CONFLICT(document_id,batch_number) DO UPDATE SET
+                                   status=excluded.status,retry_count=excluded.retry_count,
+                                   completed_pages=excluded.completed_pages,error_message=excluded.error_message,
+                                   artifact_path=excluded.artifact_path,updated_at=CURRENT_TIMESTAMP""",
+                            (f"{job['document_id']}_batch_{int(key):03d}", job["document_id"], int(key),
+                             int(batch["original_page_start"]), int(batch["original_page_end"]), batch["status"],
+                             int(batch.get("retry_count") or 0), int(batch.get("completed_pages") or 0),
+                             str(batch.get("error_message") or "")[:1000],
+                             str(adaptive_result.output_root / "normalized" / f"batch_{int(key):03d}.jsonl")),
+                        )
+            self._persist_document_structure(job["document_id"], structure)
+            self._rebuild_knowledge_candidates(job["document_id"], job["course_id"])
+            if title_rebuild_only:
+                latest_analysis = self.db.fetch_one(
+                    """SELECT analysis_job_id FROM semantic_analysis_jobs
+                       WHERE document_id=? AND status IN ('review_required','completed')
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (job["document_id"],),
+                ) or {}
+                analysis_job_id = latest_analysis.get("analysis_job_id")
+                created = self._rebuild_document_outline_from_candidates(
+                    job, analysis_job_id, replace_existing=True
+                )
+                if created:
+                    self._rebuild_course_outline(
+                        job["course_id"], analysis_job_id, use_api=False,
+                        material_type=self._document_material_type(job["document_id"]),
+                    )
             self.db.execute(
                 """INSERT INTO semantic_analysis_jobs(
                        analysis_job_id,document_id,course_id,requested_by,status,current_stage,analysis_mode,
@@ -446,7 +1035,10 @@ class IngestionService:
                  job["requested_by"], job.get("analysis_mode") or "api",
                  job.get("ai_provider") or "", job.get("ai_base_url") or "",
                  job.get("ai_model") or "", job.get("ai_key_encrypted") or ""),
-            )
+            ) if (
+                blocks and not title_rebuild_only
+                and (adaptive_result is None or adaptive_result.job_status != "failed")
+            ) else None
         except Exception as exc:
             message = str(exc)[:1000]
             self.db.execute(
@@ -628,26 +1220,31 @@ class IngestionService:
 
     def queue_semantic_analysis(self, actor: dict[str, Any], document_id: str, *,
                                 analysis_mode: str = "api",
-                                ai_settings: dict[str, str] | None = None) -> dict[str, Any]:
+                                ai_settings: dict[str, Any] | None = None) -> dict[str, Any]:
         document = self.require_document_access(actor, document_id)
         if actor.get("role") != "teacher":
             raise PermissionDenied("仅教师可以启动共享资料语义分析")
         if analysis_mode not in {"api", "local"}:
             raise ValidationError("资料分析方式必须是 api 或 local")
-        settings = ai_settings or {}
-        custom_key = str(settings.get("api_key") or "").strip()
-        custom_base = str(settings.get("base_url") or "").strip()
-        custom_model = str(settings.get("model") or "").strip()
-        custom_provider = str(settings.get("provider") or "openai_compatible").strip()
-        if custom_key and (not custom_base or not custom_model):
-            raise ValidationError("使用教师自有 API 时必须填写 Base URL 和模型名称")
+        settings = self._resolve_ai_settings(actor, ai_settings)
+        custom_key = settings["api_key"]
+        custom_base = settings["base_url"]
+        custom_model = settings["model"]
+        custom_provider = settings["provider"]
+        custom_enabled = bool(
+            custom_base and custom_model and (custom_key or custom_provider == "ollama")
+        )
         active = self.db.fetch_one(
             """SELECT * FROM semantic_analysis_jobs WHERE document_id=?
                AND status IN ('queued','running','retry_wait') ORDER BY created_at DESC LIMIT 1""", (document_id,),
         )
         if active:
-            active_uses_custom_api = bool(str(active.get("ai_key_encrypted") or ""))
-            requested_uses_custom_api = bool(custom_key)
+            active_uses_custom_api = bool(
+                str(active.get("ai_provider") or "")
+                and str(active.get("ai_base_url") or "")
+                and str(active.get("ai_model") or "")
+            )
+            requested_uses_custom_api = custom_enabled
             same_configuration = (
                 str(active.get("analysis_mode") or "api") == analysis_mode
                 and active_uses_custom_api == requested_uses_custom_api
@@ -682,8 +1279,8 @@ class IngestionService:
                    ai_provider,ai_base_url,ai_model,ai_key_encrypted
                ) VALUES(?,?,?,?, 'queued','queued',?,?,?,?,?)""",
             (analysis_job_id, document_id, document["course_id"], actor["user_id"], analysis_mode,
-             custom_provider if custom_key else "", custom_base if custom_key else "",
-             custom_model if custom_key else "", encrypt_job_secret(custom_key)),
+             custom_provider if custom_enabled else "", custom_base if custom_enabled else "",
+             custom_model if custom_enabled else "", encrypt_job_secret(custom_key)),
         )
         return self.get_analysis_job(actor, analysis_job_id)
 
@@ -784,11 +1381,28 @@ class IngestionService:
         )
         if not blocks:
             self.db.execute(
-                "UPDATE semantic_analysis_jobs SET status='failed',error_message='资料没有 DocumentIR 块' WHERE analysis_job_id=?",
+                """UPDATE semantic_analysis_jobs SET status='failed',current_stage='failed',
+                   error_message='资料没有 DocumentIR 块；请先完成文档解析后再分析',
+                   updated_at=CURRENT_TIMESTAMP WHERE analysis_job_id=?""",
                 (analysis_job_id,),
             )
             return
+        self._enforce_navigation_exclusion(job["document_id"])
         self._ensure_canonical_artifact(job["document_id"], blocks)
+        blocks, ppt_metadata_source = self._ensure_ppt_semantic_metadata(
+            job["document_id"], blocks
+        )
+        if ppt_metadata_source:
+            job["ppt_metadata_source"] = ppt_metadata_source
+        blocks = [block for block in blocks if bool(block.get("include_as_knowledge", 1))]
+        if not blocks:
+            self.db.execute(
+                """UPDATE semantic_analysis_jobs SET status='review_required',current_stage='teacher_review',
+                   error_message='文档只有导航或非知识页，无可供知识分析的正文',updated_at=CURRENT_TIMESTAMP
+                   WHERE analysis_job_id=?""",
+                (analysis_job_id,),
+            )
+            return
         course = self.db.fetch_one(
             "SELECT course_type FROM courses WHERE course_id=?", (job["course_id"],)
         ) or {}
@@ -798,6 +1412,9 @@ class IngestionService:
                 ("教师语义分析只允许 shared_course", analysis_job_id),
             )
             return
+        # Rebuild pending review boundaries with the current deterministic policy.
+        # Approved/rejected candidates remain untouched by the rebuild.
+        self._rebuild_knowledge_candidates(job["document_id"], job["course_id"])
         if str(job.get("analysis_mode") or "api") == "local":
             try:
                 self._process_local_semantic_analysis(job, blocks)
@@ -813,15 +1430,13 @@ class IngestionService:
         # Torch, MinerU or an OCR runtime.
         default_semantic = self.semantic
         encrypted_key = str(job.get("ai_key_encrypted") or "")
-        if encrypted_key:
+        provider_name = str(job.get("ai_provider") or "").lower()
+        base_url = str(job.get("ai_base_url") or "")
+        model = str(job.get("ai_model") or "")
+        if provider_name and base_url and model:
             api_key = decrypt_job_secret(encrypted_key)
-            provider_name = str(job.get("ai_provider") or "openai_compatible").lower()
-            base_url = str(job.get("ai_base_url") or "")
-            model = str(job.get("ai_model") or "")
-            provider = (
-                GeminiProvider(api_key, base_url, model, timeout=115)
-                if provider_name in {"gemini", "google", "google_gemini"}
-                else QwenProvider(api_key, base_url, model, timeout=115)
+            provider = self._custom_ai_provider(
+                provider_name, api_key, base_url, model, timeout=115,
             )
             self.semantic = SemanticKnowledgeService(lambda: provider)
         try:
@@ -1068,7 +1683,7 @@ class IngestionService:
             return False
         return any(marker in message for marker in (
             "json", "格式不符合", "响应缺少", "未返回有效", "必须返回",
-            "遗漏候选", "证据不能",
+            "遗漏候选", "遗漏来源", "证据不能", "标题层级分析", "标题分组",
         ))
 
     @staticmethod
@@ -1099,6 +1714,234 @@ class IngestionService:
             else:
                 semantic_blocks.append(block)
         return semantic_blocks, skipped
+
+    def _ensure_ppt_semantic_metadata(
+        self, document_id: str, blocks: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Backfill old PPT DocumentIR with local title metadata.
+
+        Older imports stored one text block per slide before Fast Inspect title
+        metadata was copied into ``raw_payload_json``.  Semantic re-analysis
+        must not reconnect to MinerU or another document parsing service, so a
+        legacy record is upgraded from the locally stored PPTX once and the
+        metadata is persisted back into DocumentIR.
+        """
+        document = self.db.fetch_one(
+            "SELECT stored_path,original_name FROM course_documents WHERE document_id=?",
+            (document_id,),
+        ) or {}
+        source_path = Path(str(document.get("stored_path") or ""))
+        if source_path.suffix.lower() != ".pptx" and not str(
+            document.get("original_name") or ""
+        ).lower().endswith(".pptx"):
+            return blocks, ""
+
+        def raw_payload(block: dict[str, Any]) -> dict[str, Any]:
+            value = block.get("raw")
+            if isinstance(value, dict):
+                return dict(value)
+            try:
+                value = json.loads(block.get("raw_payload_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                value = {}
+            return dict(value) if isinstance(value, dict) else {}
+
+        already_current = any(
+            str(raw_payload(block).get("source_kind") or "").lower() == "pptx"
+            and "is_slide_title_block" in raw_payload(block)
+            for block in blocks
+        )
+        if already_current:
+            for block in blocks:
+                block["raw"] = raw_payload(block)
+            return blocks, "document_ir"
+
+        slides: list[dict[str, Any]] = []
+        metadata_source = ""
+        if source_path.is_file():
+            try:
+                # This is a local OOXML title/layout read.  It never invokes
+                # MinerU, OCR, or any remote document parsing endpoint.
+                slides = self.ppt_inspector.inspect(source_path)
+                metadata_source = "local_ppt_title_refresh"
+            except Exception:
+                slides = []
+        if not slides:
+            persisted = self.db.fetch_all(
+                """SELECT slide_index,slide_type,title,layout_kind FROM presentation_slides
+                   WHERE document_id=? ORDER BY slide_index""",
+                (document_id,),
+            )
+            slides = [{
+                "slide_index": int(row.get("slide_index") or 0),
+                "slide_number": int(row.get("slide_index") or 0) + 1,
+                "slide_type": str(row.get("slide_type") or "SIMPLE_CONTENT"),
+                "title": str(row.get("title") or ""),
+                "layout_kind": str(row.get("layout_kind") or "single_column"),
+            } for row in persisted]
+            metadata_source = "persisted_ppt_inspection" if slides else ""
+        if not slides:
+            return blocks, ""
+
+        slide_meta: dict[int, dict[str, Any]] = {}
+        active_title = ""
+        for slide in slides:
+            page_number = int(
+                slide.get("slide_number") or int(slide.get("slide_index") or 0) + 1
+            )
+            slide_type = str(slide.get("slide_type") or "SIMPLE_CONTENT")
+            detected_title = re.sub(r"\s+", " ", str(slide.get("title") or "")).strip()
+            inherited = False
+            if slide_type in {"COVER", "ENDING"}:
+                active_title = ""
+            elif detected_title:
+                active_title = detected_title
+            elif active_title:
+                inherited = True
+            title = detected_title or (active_title if inherited else "")
+            hint = self._ppt_title_hint(title)
+            slide_meta[page_number] = {
+                "source_kind": "pptx",
+                "ppt_slide_index": int(slide.get("slide_index") or page_number - 1),
+                "ppt_slide_number": page_number,
+                "ppt_slide_title": title,
+                "ppt_detected_title": detected_title,
+                "ppt_title_number": hint["number"],
+                "ppt_title_level_hint": int(hint["level"]),
+                "ppt_title_number_ambiguous": bool(hint["ambiguous"]),
+                "ppt_title_inherited": inherited,
+                "ppt_layout_kind": str(slide.get("layout_kind") or "single_column"),
+                "ppt_slide_type": slide_type,
+                "semantic_ppt_metadata_version": 1,
+            }
+
+        first_by_page: dict[int, str] = {}
+        for block in blocks:
+            page_number = int(block.get("page_number") or 1)
+            first_by_page.setdefault(page_number, str(block.get("block_id") or ""))
+
+        updates: list[tuple[str, str]] = []
+        navigation_block_ids: list[str] = []
+        for block in blocks:
+            page_number = int(block.get("page_number") or 1)
+            meta = slide_meta.get(page_number)
+            if not meta:
+                continue
+            raw = raw_payload(block)
+            raw.update(meta)
+            raw["is_slide_title_block"] = bool(
+                meta["ppt_detected_title"]
+                and str(block.get("block_id") or "") == first_by_page.get(page_number)
+            )
+            block["raw"] = raw
+            block["raw_payload_json"] = json.dumps(raw, ensure_ascii=False)
+            updates.append((block["raw_payload_json"], str(block["block_id"])))
+            if str(meta["ppt_slide_type"]) in {"COVER", "ENDING"}:
+                block["include_as_navigation"] = 1
+                block["include_as_knowledge"] = 0
+                navigation_block_ids.append(str(block["block_id"]))
+        if updates:
+            with self.db.connect() as conn:
+                conn.executemany(
+                    """UPDATE document_blocks SET raw_payload_json=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE block_id=?""",
+                    updates,
+                )
+                if navigation_block_ids:
+                    conn.executemany(
+                        """UPDATE document_blocks SET include_as_navigation=1,
+                           include_as_knowledge=0,content_destination='excluded',
+                           semantic_role='navigation',analysis_reason='PPT 封面、目录或结束页不进入知识点',
+                           updated_at=CURRENT_TIMESTAMP WHERE block_id=?""",
+                        [(block_id,) for block_id in navigation_block_ids],
+                    )
+        return blocks, metadata_source
+
+    def _repair_map_checkpoint(
+        self,
+        map_results: list[dict[str, Any]],
+        batches: list[list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Normalize incomplete map checkpoints created by an older runtime."""
+        repaired_results: list[dict[str, Any]] = []
+        repairs: list[dict[str, Any]] = []
+        valid_destinations = {"knowledge", "question_bank", "excluded", "unclassified"}
+        for result_index, raw_result in enumerate(map_results[:len(batches)]):
+            result = dict(raw_result) if isinstance(raw_result, dict) else {}
+            batch = batches[result_index]
+            known = {str(block["block_id"]): block for block in batch}
+            supplied = {
+                str(item.get("block_id") or ""): item
+                for item in result.get("classifications") or []
+                if isinstance(item, dict) and str(item.get("block_id") or "") in known
+            }
+            classifications: list[dict[str, Any]] = []
+            changed = False
+            for block_id in known:
+                item = dict(supplied.get(block_id) or {})
+                destination = str(item.get("destination") or "unclassified")
+                if destination not in valid_destinations:
+                    destination = "unclassified"
+                    changed = True
+                normalized = {
+                    **item,
+                    "block_id": block_id,
+                    "destination": destination,
+                    "semantic_role": str(
+                        item.get("semantic_role")
+                        or ("ai_omitted_teacher_review" if not item else "teacher_review")
+                    ),
+                    "question_group_key": str(item.get("question_group_key") or ""),
+                    "confidence": item.get("confidence", 0.0),
+                    "reason": str(
+                        item.get("reason")
+                        or ("旧断点缺少该块分类，已保留给教师复核" if not item else "旧断点字段不完整，已保留给教师复核")
+                    ),
+                }
+                if normalized != item:
+                    changed = True
+                classifications.append(normalized)
+
+            candidates = [
+                dict(candidate) for candidate in result.get("candidates") or []
+                if isinstance(candidate, dict) and candidate.get("block_ids")
+            ]
+            if not candidates:
+                knowledge_blocks = [
+                    known[item["block_id"]]
+                    for item in classifications if item["destination"] == "knowledge"
+                ]
+                safe_points = self._safe_batch_result(knowledge_blocks)["knowledge_points"]
+                for point_index, point in enumerate(safe_points):
+                    source_ids = [
+                        str(value) for value in point.get("block_ids") or []
+                        if str(value) in known
+                    ]
+                    if not source_ids:
+                        continue
+                    candidates.append({
+                        **point,
+                        "candidate_id": f"checkpoint-{result_index + 1}-point-{point_index + 1}",
+                        "block_ids": source_ids,
+                        "pages": sorted({
+                            int(known[value].get("page_number") or 1) for value in source_ids
+                        }),
+                    })
+                if candidates:
+                    changed = True
+
+            result.update({
+                "batch": int(result.get("batch") or result_index + 1),
+                "classifications": classifications,
+                "candidates": candidates,
+            })
+            repaired_results.append(result)
+            if changed:
+                repairs.append({
+                    "batch": result_index + 1,
+                    "reason": "旧断点缺少语义字段或知识点数组，已从落库原文安全修复",
+                })
+        return repaired_results, repairs
 
     def _safe_batch_result(self, blocks: list[dict[str, Any]]) -> dict[str, Any]:
         """Conservative original-text fallback when the model returns truncated JSON."""
@@ -1160,6 +2003,126 @@ class IngestionService:
             "evidence_quotes": list(candidate.get("evidence_quotes") or []),
         } for candidate in candidates if candidate.get("block_ids")]
 
+    def _sync_semantic_points_to_candidates(
+        self,
+        document_id: str,
+        course_id: str,
+        points: list[dict[str, Any]],
+        known_blocks: dict[str, dict[str, Any]],
+    ) -> None:
+        """Mirror the latest semantic points into the pending review queue.
+
+        Teacher decisions are durable: approved, modified, and rejected rows
+        are retained. Only pending rows are replaced by the newest
+        evidence-backed semantic boundaries.
+        """
+        protected = self.db.fetch_all(
+            """SELECT * FROM knowledge_candidates WHERE document_id=?
+               AND review_status IN ('APPROVED','MODIFIED','REJECTED')""",
+            (document_id,),
+        )
+        protected_source_ids = {
+            block_id
+            for candidate in protected
+            for block_id in self._candidate_source_ids(candidate)
+        }
+        prepared: list[dict[str, Any]] = []
+        for point in points:
+            source_ids = list(dict.fromkeys(
+                str(value) for value in point.get("block_ids") or []
+                if str(value) in known_blocks and str(value) not in protected_source_ids
+            ))
+            if not source_ids:
+                continue
+            seed = f"{document_id}|{'|'.join(source_ids)}"
+            pages = sorted({
+                int(known_blocks[value].get("page_number") or 1) for value in source_ids
+            })
+            bboxes: list[Any] = []
+            for value in source_ids:
+                bbox = known_blocks[value].get("bbox_json") or "[]"
+                if isinstance(bbox, str):
+                    try:
+                        bbox = json.loads(bbox)
+                    except json.JSONDecodeError:
+                        bbox = []
+                if bbox:
+                    bboxes.append(bbox)
+            chapter_path = list(dict.fromkeys(
+                str(value).strip()
+                for value in (point.get("chapter"), point.get("section"))
+                if str(value or "").strip()
+            ))
+            markdown = "\n\n".join(
+                self._block_content(known_blocks[value])
+                for value in source_ids
+                if self._block_content(known_blocks[value])
+            )
+            prepared.append({
+                "candidate_id": f"kc_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:24]}",
+                "title": self._clean_title(point.get("title"), "待命名知识点"),
+                "source_ids": source_ids,
+                "pages": pages,
+                "bboxes": bboxes,
+                "chapter_path": chapter_path,
+                "markdown": markdown,
+            })
+
+        with self.db.connect() as conn:
+            pending_ids = [
+                row["candidate_id"] for row in conn.execute(
+                    """SELECT candidate_id FROM knowledge_candidates WHERE document_id=?
+                       AND review_status IN ('PENDING','NEEDS_REVIEW')""",
+                    (document_id,),
+                ).fetchall()
+            ]
+            if pending_ids:
+                placeholders = ",".join("?" for _ in pending_ids)
+                conn.execute(
+                    f"DELETE FROM knowledge_candidate_blocks WHERE candidate_id IN ({placeholders})",
+                    tuple(pending_ids),
+                )
+                conn.execute(
+                    f"DELETE FROM knowledge_candidates WHERE candidate_id IN ({placeholders})",
+                    tuple(pending_ids),
+                )
+            for candidate in prepared:
+                conn.execute(
+                    """INSERT INTO knowledge_candidates(
+                           candidate_id,course_id,document_id,title,knowledge_type,
+                           source_block_ids_json,page_start,page_end,bbox_json,
+                           markdown_content,confidence,region_type,chapter_path_json,review_status)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING')""",
+                    (
+                        candidate["candidate_id"], course_id, document_id,
+                        candidate["title"], "concept",
+                        json.dumps(candidate["source_ids"], ensure_ascii=False),
+                        candidate["pages"][0], candidate["pages"][-1],
+                        json.dumps(candidate["bboxes"], ensure_ascii=False),
+                        candidate["markdown"], 0.9, "knowledge",
+                        json.dumps(candidate["chapter_path"], ensure_ascii=False),
+                    ),
+                )
+                conn.executemany(
+                    """INSERT INTO knowledge_candidate_blocks(candidate_id,block_id,sort_order)
+                       VALUES(?,?,?)""",
+                    [
+                        (candidate["candidate_id"], block_id, order)
+                        for order, block_id in enumerate(candidate["source_ids"])
+                    ],
+                )
+            conn.execute(
+                "UPDATE document_blocks SET knowledge_candidate=0 WHERE document_id=?",
+                (document_id,),
+            )
+            conn.execute(
+                """UPDATE document_blocks SET knowledge_candidate=1 WHERE block_id IN (
+                       SELECT cb.block_id FROM knowledge_candidate_blocks cb
+                       JOIN knowledge_candidates k USING(candidate_id) WHERE k.document_id=?
+                   )""",
+                (document_id,),
+            )
+
     @staticmethod
     def _evidence_batches(blocks: list[dict[str, Any]], *, max_tokens: int = 3200,
                           max_blocks: int = 36) -> list[list[dict[str, Any]]]:
@@ -1178,30 +2141,191 @@ class IngestionService:
             batches.append(current)
         return batches
 
+    def _numbered_secondary_points(
+        self, document_id: str, blocks: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        """Build one deterministic knowledge point for every ``x.x`` section."""
+        candidates = self.boundary_extractor.extract_numbered_sections(blocks, document_id)
+        points: list[dict[str, Any]] = []
+        covered: set[str] = set()
+        for index, candidate in enumerate(candidates, 1):
+            source_ids = [str(value) for value in candidate.get("source_block_ids") or []]
+            if not source_ids:
+                continue
+            covered.update(source_ids)
+            path = [str(value).strip() for value in candidate.get("chapter_path") or [] if str(value).strip()]
+            title = self._clean_title(candidate.get("title"), f"第 {index} 节")
+            number = re.match(r"^(\d+)\.(\d+)(?!\.\d)", title)
+            chapter = path[-2] if len(path) >= 2 else (f"第 {number.group(1)} 章" if number else "未分章")
+            keyword = re.sub(r"^\d+\.\d+(?!\.\d)[.)、：:\s]*", "", title).strip()
+            points.append({
+                "point_key": str(candidate.get("candidate_id") or f"section-{index}"),
+                "chapter": chapter, "section": title, "title": title,
+                "keywords": [keyword] if keyword else [], "block_ids": source_ids,
+                "evidence_quotes": [title[:80]],
+            })
+        return points, covered
+
+    def _presentation_title_points(
+        self, document_id: str, blocks: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        """Lock PPT knowledge boundaries to consecutive title-bar groups."""
+        candidates = self.boundary_extractor.extract_presentation_title_groups(blocks, document_id)
+        if not candidates:
+            return [], set()
+        block_map = {str(block["block_id"]): block for block in blocks}
+        points: list[dict[str, Any]] = []
+        covered: set[str] = set()
+        current_chapter = "PPT 课程结构"
+        current_section = "PPT 标题序列"
+        for index, candidate in enumerate(candidates, 1):
+            source_ids = [
+                str(value) for value in candidate.get("source_block_ids") or []
+                if str(value) in block_map
+            ]
+            if not source_ids:
+                continue
+            covered.update(source_ids)
+            title = self._clean_title(candidate.get("title"), f"第 {index} 个标题")
+            hint = self._ppt_title_hint(title)
+            number = str(hint.get("number") or "")
+            if not bool(hint.get("ambiguous")) and re.fullmatch(r"\d+(?:\.\d+)+", number):
+                parts = number.split(".")
+                current_chapter = f"第 {parts[0]} 章"
+                current_section = title if len(parts) == 2 else ".".join(parts[:2])
+            elif int(hint.get("level") or 2) == 1:
+                current_chapter = title
+                current_section = "PPT 标题序列"
+            excerpt = "\n".join(
+                self._block_content(block_map[block_id])
+                for block_id in source_ids
+            )[:1000]
+            points.append({
+                "point_key": str(candidate.get("candidate_id") or f"ppt-title-{index}"),
+                "chapter": current_chapter, "section": current_section,
+                "title": title, "keywords": [], "block_ids": source_ids,
+                "evidence_quotes": [title[:80]],
+                "pages": sorted({int(block_map[value].get("page_number") or 1) for value in source_ids}),
+                "title_number": number,
+                "title_level_hint": int(hint.get("level") or 2),
+                "ambiguous_numbering": bool(hint.get("ambiguous")),
+                "evidence_excerpt": excerpt,
+            })
+        return points, covered
+
     def _process_evidence_tree_analysis(self, job: dict[str, Any],
                                         blocks: list[dict[str, Any]]) -> None:
         analysis_job_id = str(job["analysis_job_id"])
         semantic_blocks, skipped_classifications = self._prepare_semantic_blocks(blocks)
-        batches = self._evidence_batches(semantic_blocks)
-        planned_total = len(batches) + 2  # document reduce + course reduce
         try:
             checkpoint = json.loads(job.get("result_json") or "{}")
         except json.JSONDecodeError:
             checkpoint = {}
-        if checkpoint.get("schema_version") != 4 or checkpoint.get("map_batch_count") != len(batches):
+        presentation_points, presentation_covered = self._presentation_title_points(
+            job["document_id"], semantic_blocks
+        )
+        if presentation_points:
+            self.db.execute(
+                """UPDATE semantic_analysis_jobs SET status='running',current_stage='ppt_title_hierarchy',
+                   current_batch=0,total_batches=2,error_message='',analyzer_version='ppt-title-outline-v1',
+                   prompt_version='teacher-ppt-title-v1',updated_at=CURRENT_TIMESTAMP
+                   WHERE analysis_job_id=?""",
+                (analysis_job_id,),
+            )
+            try:
+                presentation_points = self.semantic.resolve_presentation_outline(
+                    presentation_points, on_call=lambda: self._analysis_call(analysis_job_id)
+                )
+            except Exception as exc:
+                if not self._is_structured_output_error(exc):
+                    raise
+                checkpoint["presentation_outline_fallback"] = (
+                    "PPT 标题层级 JSON 被截断；标题分组与页序已保留，歧义层级待教师审核"
+                )
+        numbered_points: list[dict[str, Any]] = []
+        numbered_covered: set[str] = set()
+        if not presentation_points:
+            numbered_points, numbered_covered = self._numbered_secondary_points(
+                job["document_id"], semantic_blocks
+            )
+        fixed_points = presentation_points or numbered_points
+        fixed_covered = presentation_covered if presentation_points else numbered_covered
+        batches = [] if fixed_points else self._evidence_batches(semantic_blocks)
+        planned_total = 2 if presentation_points else 1 if numbered_points else len(batches) + 2
+        if fixed_points:
+            fixed_classifications = [{
+                "block_id": str(block["block_id"]),
+                "destination": "knowledge"
+                if str(block["block_id"]) in fixed_covered
+                else ("unclassified" if presentation_points else "excluded"),
+                "semantic_role": (
+                    "ppt_title_group" if presentation_points else "numbered_secondary_section"
+                ) if str(block["block_id"]) in fixed_covered else "outline_container",
+                "question_group_key": "",
+                "confidence": 1.0 if str(block["block_id"]) in fixed_covered or not presentation_points else 0.4,
+                "reason": (
+                    "按连续 PPT 标题栏合并为一个待审核知识点"
+                    if presentation_points else "按 x.x 二级标题合并为一个待审核知识块"
+                ) if str(block["block_id"]) in fixed_covered else (
+                    "未进入标题知识组，保留给教师复核"
+                    if presentation_points else "x.x 范围外的章标题或前言不单独生成知识块"
+                ),
+            } for block in semantic_blocks]
+            checkpoint.update({
+                "schema_version": 6 if presentation_points else 5,
+                "extractor": "ppt-title-groups" if presentation_points else "numbered-secondary-heading",
+                "grouping_policy": "consecutive-same-title" if presentation_points else "one-knowledge-point-per-x.x-heading",
+                "map_batch_count": 0,
+                "map_results": [{
+                    "batch": 0,
+                    "classifications": fixed_classifications,
+                    "candidates": [{
+                        **point,
+                        "candidate_id": str(point["point_key"]),
+                        "pages": sorted({
+                            int(block.get("page_number") or 1)
+                            for block in semantic_blocks
+                            if str(block["block_id"]) in set(point["block_ids"])
+                        }),
+                    } for point in fixed_points],
+                    "fallback": False,
+                }],
+                "presentation_group_count": len(presentation_points),
+                "numbered_section_count": len(numbered_points),
+                "skipped_blocks": len(skipped_classifications),
+                "fallback_batches": [],
+            })
+        elif checkpoint.get("schema_version") != 5 or checkpoint.get("map_batch_count") != len(batches):
             checkpoint = {
-                "schema_version": 4, "extractor": "evidence-map-reduce",
+                "schema_version": 5, "extractor": "evidence-map-reduce",
                 "map_batch_count": len(batches), "map_results": [],
                 "skipped_blocks": len(skipped_classifications), "fallback_batches": [],
             }
         map_results = list(checkpoint.get("map_results") or [])
-        completed_maps = min(len(map_results), len(batches))
+        if not fixed_points and map_results:
+            map_results, checkpoint_repairs = self._repair_map_checkpoint(map_results, batches)
+            checkpoint["map_results"] = map_results
+            if checkpoint_repairs:
+                checkpoint["checkpoint_repairs"] = checkpoint_repairs
+        if job.get("ppt_metadata_source"):
+            checkpoint["ppt_metadata_source"] = str(job["ppt_metadata_source"])
+        completed_maps = 0 if fixed_points else min(len(map_results), len(batches))
+        analyzer_version = (
+            "ppt-title-outline-v1" if presentation_points else
+            "numbered-secondary-outline-v1" if numbered_points else "evidence-map-reduce-v5"
+        )
+        initial_stage = (
+            "ppt_title_grouping" if presentation_points else
+            "numbered_secondary_grouping" if numbered_points else "provider_preflight"
+        )
+        prompt_version = "teacher-ppt-title-v1" if presentation_points else "teacher-knowledge-v5"
         self.db.execute(
-            """UPDATE semantic_analysis_jobs SET status='running',current_stage='provider_preflight',
-               current_batch=?,total_batches=?,error_message='',analyzer_version='evidence-map-reduce-v4',
-               prompt_version='teacher-knowledge-v4',result_json=?,updated_at=CURRENT_TIMESTAMP
+            """UPDATE semantic_analysis_jobs SET status='running',current_stage=?,
+               current_batch=?,total_batches=?,error_message='',analyzer_version=?,
+               prompt_version=?,result_json=?,updated_at=CURRENT_TIMESTAMP
                WHERE analysis_job_id=?""",
-            (completed_maps, planned_total, json.dumps(checkpoint, ensure_ascii=False), analysis_job_id),
+            (initial_stage, completed_maps, planned_total, analyzer_version,
+             prompt_version, json.dumps(checkpoint, ensure_ascii=False), analysis_job_id),
         )
         previous: list[dict[str, Any]] = batches[completed_maps - 1][-3:] if completed_maps else []
         for batch_index in range(completed_maps, len(batches)):
@@ -1260,12 +2384,23 @@ class IngestionService:
         if not candidates:
             with self.db.connect() as conn:
                 for item in classifications:
+                    if not isinstance(item, dict) or not str(item.get("block_id") or ""):
+                        continue
+                    destination = str(item.get("destination") or "unclassified")
+                    if destination not in {"knowledge", "question_bank", "excluded", "unclassified"}:
+                        destination = "unclassified"
+                    try:
+                        confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
+                    except (TypeError, ValueError):
+                        confidence = 0.0
                     conn.execute(
                         """UPDATE document_blocks SET content_destination=?,semantic_role=?,
-                           analysis_confidence=?,analysis_reason=?,verification_status='rejected',
+                           analysis_confidence=?,analysis_reason=?,verification_status=?,
                            updated_at=CURRENT_TIMESTAMP WHERE block_id=?""",
-                        (item["destination"], item["semantic_role"], item["confidence"],
-                         item["reason"], item["block_id"]),
+                        (destination, str(item.get("semantic_role") or "teacher_review")[:64], confidence,
+                         str(item.get("reason") or "AI 未提供分类理由")[:500],
+                         "rejected" if destination == "excluded" else "review_required",
+                         str(item["block_id"])),
                     )
             checkpoint.update({
                 "document_nodes": 0, "completed": True,
@@ -1280,27 +2415,31 @@ class IngestionService:
                  "未提取到可生成知识点的正文；图片和空白块已跳过", analysis_job_id),
             )
             return
-        self.db.execute(
-            "UPDATE semantic_analysis_jobs SET current_stage='document_reduce' WHERE analysis_job_id=?",
-            (analysis_job_id,),
-        )
-        try:
-            reduced = self.semantic.reduce_document_outline(
-                candidates, on_call=lambda: self._analysis_call(analysis_job_id)
+        if fixed_points:
+            points = fixed_points
+        else:
+            self.db.execute(
+                "UPDATE semantic_analysis_jobs SET current_stage='document_reduce' WHERE analysis_job_id=?",
+                (analysis_job_id,),
             )
-            points = reduced["knowledge_points"]
-        except Exception as exc:
-            if not self._is_structured_output_error(exc):
-                raise
-            points = self._fallback_reduced_points(candidates)
-            checkpoint["document_reduce_fallback"] = (
-                "文档归并 JSON 被截断，保留分批原文结构供教师审核"
-            )
+            try:
+                reduced = self.semantic.reduce_document_outline(
+                    candidates, on_call=lambda: self._analysis_call(analysis_job_id)
+                )
+                points = reduced["knowledge_points"]
+            except Exception as exc:
+                if not self._is_structured_output_error(exc):
+                    raise
+                points = self._fallback_reduced_points(candidates)
+                checkpoint["document_reduce_fallback"] = (
+                    "文档归并 JSON 被截断，保留分批原文结构供教师审核"
+                )
         checkpoint["document_points"] = points
         self.db.execute(
             """UPDATE semantic_analysis_jobs SET current_batch=?,result_json=?,updated_at=CURRENT_TIMESTAMP
                WHERE analysis_job_id=?""",
-            (len(batches) + 1, json.dumps(checkpoint, ensure_ascii=False), analysis_job_id),
+            (planned_total - 1 if fixed_points else len(batches) + 1,
+             json.dumps(checkpoint, ensure_ascii=False), analysis_job_id),
         )
 
         known = {str(row["block_id"]): row for row in blocks}
@@ -1312,8 +2451,9 @@ class IngestionService:
             )
             conn.execute(
                 """UPDATE document_blocks SET content_destination='unclassified',semantic_role='teacher_review',
-                   analysis_confidence=NULL,analysis_reason='AI 未可靠归类',question_group_key='',
-                   verification_status='review_required' WHERE document_id=?""",
+                    analysis_confidence=NULL,analysis_reason='AI 未可靠归类',question_group_key='',
+                    verification_status='review_required'
+                    WHERE document_id=? AND include_as_knowledge=1""",
                 (job["document_id"],),
             )
             for item in classifications:
@@ -1392,6 +2532,9 @@ class IngestionService:
                         (node_id, block_id, job["document_id"], row["page_number"], row["bbox_json"]),
                     )
 
+        self._sync_semantic_points_to_candidates(
+            job["document_id"], job["course_id"], points, known
+        )
         self._rebuild_question_drafts(job["document_id"], job["course_id"])
         self.db.execute(
             "UPDATE semantic_analysis_jobs SET current_stage='course_reduce' WHERE analysis_job_id=?",
@@ -1399,9 +2542,7 @@ class IngestionService:
         )
         course_fallback = self._rebuild_course_outline(job["course_id"], analysis_job_id)
         if course_fallback:
-            checkpoint["course_reduce_fallback"] = (
-                "课程归并 JSON 被截断，保留文档知识点供教师审核"
-            )
+            checkpoint["course_reduce_fallback"] = course_fallback
         with self.db.connect() as conn:
             conn.execute(
                 """DELETE FROM knowledge_nodes WHERE document_id=? AND node_scope='document'
@@ -1616,13 +2757,306 @@ class IngestionService:
             return min(token.count(".") + 1, 3), stripped
         return None
 
-    def _build_faithful_document_outline(self, job: dict[str, Any], analysis_job_id: str) -> None:
+    @staticmethod
+    def _normalized_outline_title(value: Any) -> str:
+        return re.sub(
+            r"[\s·、，。,:：;；/\\_—\-（）()\[\]【】]+", "",
+            str(value or "").strip().lower(),
+        )
+
+    @staticmethod
+    def _chinese_outline_number(value: str) -> int | None:
+        value = value.strip()
+        if value.isdigit():
+            return int(value)
+        digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "三": 3, "四": 4,
+                  "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        units = {"十": 10, "百": 100, "千": 1000}
+        if not value or any(char not in digits and char not in units for char in value):
+            return None
+        total = 0
+        current = 0
+        for char in value:
+            if char in digits:
+                current = digits[char]
+            else:
+                total += (current or 1) * units[char]
+                current = 0
+        return total + current
+
+    @classmethod
+    def _outline_number_parts(cls, value: Any) -> tuple[int, ...]:
+        title = str(value or "").strip().replace("．", ".")
+        chapter = re.match(r"^第\s*([零〇一二三四五六七八九十百千0-9]+)\s*章", title)
+        if chapter:
+            number = cls._chinese_outline_number(chapter.group(1))
+            return (number,) if number is not None else ()
+        numbered = re.match(r"^(\d+(?:\.\d+)*)\s*(?=$|[.)、:：\s])", title)
+        if not numbered:
+            return ()
+        return tuple(int(value) for value in numbered.group(1).split("."))
+
+    @classmethod
+    def _document_primary_chapter(
+        cls, job: dict[str, Any], candidates: list[dict[str, Any]]
+    ) -> tuple[int, str] | None:
+        """Return an explicit document-level chapter anchor, never a guessed one."""
+        stem = Path(str(job.get("original_name") or "")).stem
+        match = re.search(
+            r"第\s*([零〇一二三四五六七八九十百千0-9]+)\s*章",
+            stem,
+        )
+        if match:
+            number = cls._chinese_outline_number(match.group(1))
+            if number is not None:
+                label = re.sub(r"[_\-]+", " ", stem[match.start():]).strip()
+                return number, label[:180]
+
+        explicit: dict[int, str] = {}
+        for candidate in candidates:
+            title = str(candidate.get("title") or "").strip()
+            title_match = re.match(
+                r"^第\s*([零〇一二三四五六七八九十百千0-9]+)\s*章",
+                title,
+            )
+            if not title_match:
+                continue
+            number = cls._chinese_outline_number(title_match.group(1))
+            if number is not None:
+                explicit.setdefault(number, title)
+        if len(explicit) == 1:
+            number, label = next(iter(explicit.items()))
+            return number, label[:180]
+        return None
+
+    def _rebuild_document_outline_from_candidates(
+        self,
+        job: dict[str, Any],
+        analysis_job_id: str | None,
+        *,
+        replace_existing: bool = False,
+    ) -> int:
+        """Build one real document knowledge point per normalized candidate title."""
+        candidates = self.db.fetch_all(
+            """SELECT * FROM knowledge_candidates WHERE document_id=?
+               AND review_status!='REJECTED' ORDER BY page_start,page_end,candidate_id""",
+            (job["document_id"],),
+        )
+        if not candidates:
+            return 0
+
+        grouped: list[dict[str, Any]] = []
+        by_title: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            title = self._clean_title(candidate.get("title"), "待命名知识点")
+            title_key = self._normalized_outline_title(title)
+            entry = by_title.get(title_key)
+            if entry is None:
+                entry = {
+                    "title": title,
+                    "rows": [],
+                    "page_start": int(candidate.get("page_start") or 1),
+                    "page_end": int(candidate.get("page_end") or candidate.get("page_start") or 1),
+                }
+                by_title[title_key] = entry
+                grouped.append(entry)
+            entry["rows"].append(candidate)
+            entry["page_start"] = min(entry["page_start"], int(candidate.get("page_start") or 1))
+            entry["page_end"] = max(
+                entry["page_end"],
+                int(candidate.get("page_end") or candidate.get("page_start") or 1),
+            )
+
+        grouped.sort(key=lambda row: (row["page_start"], row["page_end"], row["title"]))
+        primary_chapter = self._document_primary_chapter(job, candidates)
+        chapter_titles: dict[int, str] = {}
+        section_titles: dict[tuple[int, int], str] = {}
+        for entry in grouped:
+            parts = self._outline_number_parts(entry["title"])
+            if len(parts) == 1:
+                chapter_titles.setdefault(parts[0], entry["title"])
+            elif len(parts) == 2:
+                section_titles.setdefault((parts[0], parts[1]), entry["title"])
+
+        previous_points = {
+            self._normalized_outline_title(row["title"]): row
+            for row in self.db.fetch_all(
+                """SELECT * FROM knowledge_nodes WHERE document_id=? AND node_scope='document'
+                   AND node_type='knowledge_point' AND status!='rejected'""",
+                (job["document_id"],),
+            )
+        }
+        if replace_existing:
+            with self.db.connect() as conn:
+                conn.execute(
+                    """DELETE FROM knowledge_nodes WHERE document_id=? AND node_scope='document'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM knowledge_version_nodes vn
+                           WHERE vn.node_id=knowledge_nodes.node_id
+                       )""",
+                    (job["document_id"],),
+                )
+
+        material_type = self._document_material_type(str(job["document_id"]))
+        chapter_ids: dict[str, str] = {}
+        section_ids: dict[tuple[str, str], str] = {}
+        current_chapter = "导学"
+        order = 0
+        created = 0
+        with self.db.connect() as conn:
+            for entry in grouped:
+                title = str(entry["title"])
+                number_parts = self._outline_number_parts(title)
+                if number_parts:
+                    if primary_chapter:
+                        current_chapter = primary_chapter[1]
+                    else:
+                        chapter_number = number_parts[0]
+                        current_chapter = chapter_titles.get(chapter_number) or f"第{chapter_number}章"
+                chapter = current_chapter
+                if len(number_parts) == 2:
+                    section = title
+                elif len(number_parts) >= 3:
+                    section = section_titles.get(
+                        (number_parts[0], number_parts[1]),
+                        ".".join(str(value) for value in number_parts[:2]),
+                    )
+                else:
+                    section = title
+
+                if chapter not in chapter_ids:
+                    order += 1
+                    chapter_id = f"kn_{uuid.uuid4().hex}"
+                    chapter_ids[chapter] = chapter_id
+                    conn.execute(
+                        """INSERT INTO knowledge_nodes(
+                               node_id,course_id,document_id,node_scope,node_type,title,sort_order,
+                               status,analysis_job_id,material_type,source_fingerprint
+                           ) VALUES(?,?,?,'document','chapter',?,?,'draft',?,?,?)""",
+                        (
+                            chapter_id, job["course_id"], job["document_id"], chapter, order,
+                            analysis_job_id, material_type,
+                            self._outline_fingerprint(material_type, "document_chapter", [chapter]),
+                        ),
+                    )
+                section_key = (chapter, section)
+                if section_key not in section_ids:
+                    order += 1
+                    section_id = f"kn_{uuid.uuid4().hex}"
+                    section_ids[section_key] = section_id
+                    conn.execute(
+                        """INSERT INTO knowledge_nodes(
+                               node_id,course_id,document_id,node_scope,parent_id,node_type,title,
+                               sort_order,status,analysis_job_id,material_type,source_fingerprint
+                           ) VALUES(?,?,?,'document',?,'section',?,?,'draft',?,?,?)""",
+                        (
+                            section_id, job["course_id"], job["document_id"], chapter_ids[chapter],
+                            section, order, analysis_job_id, material_type,
+                            self._outline_fingerprint(
+                                material_type, "document_section", [chapter, section]
+                            ),
+                        ),
+                    )
+
+                candidate_ids = [str(row["candidate_id"]) for row in entry["rows"]]
+                placeholders = ",".join("?" for _ in candidate_ids)
+                source_rows = [
+                    dict(row) for row in conn.execute(
+                        f"""SELECT b.* FROM knowledge_candidate_blocks cb
+                            JOIN document_blocks b ON b.block_id=cb.block_id
+                            WHERE cb.candidate_id IN ({placeholders})
+                            ORDER BY b.page_number,b.block_order,b.block_id""",
+                        candidate_ids,
+                    ).fetchall()
+                ]
+                unique_sources = {
+                    str(row["block_id"]): row for row in source_rows
+                }
+                source_rows = list(unique_sources.values())
+                pages = sorted({
+                    int(row.get("page_number") or 1) for row in source_rows
+                } or set(range(int(entry["page_start"]), int(entry["page_end"]) + 1)))
+                markdown_parts: list[str] = []
+                for candidate in entry["rows"]:
+                    content = str(
+                        candidate.get("teacher_revision")
+                        if candidate.get("review_status") == "MODIFIED"
+                        and str(candidate.get("teacher_revision") or "").strip()
+                        else candidate.get("markdown_content") or ""
+                    ).strip()
+                    if content and content not in markdown_parts:
+                        markdown_parts.append(content)
+                markdown = "\n\n".join(markdown_parts)
+                approved = all(
+                    row.get("review_status") in {"APPROVED", "MODIFIED"}
+                    for row in entry["rows"]
+                )
+                prior = previous_points.get(self._normalized_outline_title(title))
+                same_pages = bool(prior) and sorted(
+                    json.loads(prior.get("source_pages_json") or "[]")
+                ) == pages
+                preserve_prior = bool(
+                    prior and same_pages
+                    and (prior.get("reviewed_by") or prior.get("status") == "approved")
+                )
+                point_title = str(prior["title"]) if preserve_prior else title
+                point_markdown = str(prior["markdown"]) if preserve_prior else markdown
+                point_status = str(prior["status"]) if preserve_prior else (
+                    "approved" if approved else "draft"
+                )
+                reviewed_by = (
+                    prior.get("reviewed_by") if preserve_prior else
+                    next((row.get("reviewed_by") for row in entry["rows"] if row.get("reviewed_by")), None)
+                )
+                reviewed_at = (
+                    prior.get("reviewed_at") if preserve_prior else
+                    next((row.get("reviewed_at") for row in entry["rows"] if row.get("reviewed_at")), None)
+                )
+                order += 1
+                node_id = f"kn_{uuid.uuid4().hex}"
+                source_ids = [str(row["block_id"]) for row in source_rows]
+                fingerprint = self._outline_fingerprint(
+                    material_type, "document_knowledge_point",
+                    [self._normalized_outline_title(title), *source_ids],
+                )
+                conn.execute(
+                    """INSERT INTO knowledge_nodes(
+                           node_id,course_id,document_id,node_scope,parent_id,node_type,title,
+                           markdown,keywords_json,source_pages_json,sort_order,status,analysis_job_id,
+                           reviewed_by,reviewed_at,material_type,source_fingerprint
+                       ) VALUES(?,?,?,'document',?,'knowledge_point',?,?,'[]',?,?,?,?,?,?,?,?)""",
+                    (
+                        node_id, job["course_id"], job["document_id"], section_ids[section_key],
+                        point_title, point_markdown, json.dumps(pages), order, point_status,
+                        analysis_job_id, reviewed_by, reviewed_at, material_type, fingerprint,
+                    ),
+                )
+                for source in source_rows:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO knowledge_node_sources(
+                               node_id,block_id,document_id,page_number,bbox_json
+                           ) VALUES(?,?,?,?,?)""",
+                        (
+                            node_id, source["block_id"], job["document_id"],
+                            source.get("page_number"), source.get("bbox_json") or "[]",
+                        ),
+                    )
+                created += 1
+        return created
+
+    def _build_faithful_document_outline(self, job: dict[str, Any], analysis_job_id: str, *,
+                                         include_unclassified: bool = False) -> None:
+        if self._rebuild_document_outline_from_candidates(job, analysis_job_id):
+            return
         document = self.db.fetch_one(
             "SELECT original_name FROM course_documents WHERE document_id=?", (job["document_id"],)
         ) or {"original_name": "正文"}
         blocks = self.db.fetch_all(
-            """SELECT * FROM document_blocks WHERE document_id=? AND content_destination='knowledge'
-               ORDER BY page_number,block_order""", (job["document_id"],),
+            """SELECT * FROM document_blocks WHERE document_id=?
+                 AND (content_destination='knowledge'
+                      OR (?=1 AND content_destination='unclassified'))
+               ORDER BY page_number,block_order""",
+            (job["document_id"], 1 if include_unclassified else 0),
         )
         units: list[dict[str, Any]] = []
         stack: dict[int, int] = {}
@@ -1749,21 +3183,186 @@ class IngestionService:
                         (node_id, source["block_id"], job["document_id"], source["page_number"], source["bbox_json"]),
                     )
 
-    def _rebuild_course_outline(self, course_id: str, analysis_job_id: str, *,
-                                use_api: bool = True) -> bool:
+    @staticmethod
+    def _outline_fingerprint(material_type: str, kind: str, values: list[str]) -> str:
+        payload = json.dumps(
+            [material_type, kind, *sorted(str(value) for value in values)],
+            ensure_ascii=False, separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _document_material_type(self, document_id: str) -> str:
+        row = self.db.fetch_one(
+            "SELECT material_type FROM document_material_metadata WHERE document_id=?",
+            (document_id,),
+        ) or {}
+        value = str(row.get("material_type") or "other")
+        return value if value in MATERIAL_TYPES else "other"
+
+    def _ensure_partitioned_course_outline(self, course_id: str) -> None:
+        """Locally backfill material partitions without touching published versions."""
+        # Early semantic-analysis builds could leave a PPT with chapters and sections
+        # only.  Reconstruct those unreviewed outlines from persisted blocks before
+        # creating course partitions.  The new outline is committed first; the old
+        # nodes are removed only after at least one traceable leaf was produced.
+        leafless_documents = self.db.fetch_all(
+            """SELECT d.document_id
+               FROM course_documents d
+               WHERE d.course_id=?
+                 AND EXISTS (
+                     SELECT 1 FROM knowledge_nodes n
+                     WHERE n.document_id=d.document_id AND n.node_scope='document'
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM knowledge_nodes n
+                     WHERE n.document_id=d.document_id AND n.node_scope='document'
+                       AND n.node_type='knowledge_point'
+                 )
+                 AND EXISTS (
+                     SELECT 1 FROM document_blocks b
+                     WHERE b.document_id=d.document_id
+                       AND b.content_destination IN ('knowledge','unclassified')
+                       AND LENGTH(TRIM(COALESCE(NULLIF(b.markdown,''),b.plain_text,'')))>0
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM knowledge_nodes n
+                     WHERE n.document_id=d.document_id AND n.node_scope='document'
+                       AND (n.reviewed_by IS NOT NULL OR n.status!='draft')
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM knowledge_nodes n
+                     JOIN knowledge_version_nodes vn ON vn.node_id=n.node_id
+                     WHERE n.document_id=d.document_id AND n.node_scope='document'
+                 )""",
+            (course_id,),
+        )
+        for document in leafless_documents:
+            document_id = str(document["document_id"])
+            job = self.db.fetch_one(
+                """SELECT * FROM semantic_analysis_jobs
+                   WHERE document_id=? AND status IN ('review_required','completed')
+                   ORDER BY created_at DESC LIMIT 1""",
+                (document_id,),
+            )
+            if not job:
+                continue
+            old_ids = [
+                str(row["node_id"])
+                for row in self.db.fetch_all(
+                    """SELECT node_id FROM knowledge_nodes
+                       WHERE document_id=? AND node_scope='document'""",
+                    (document_id,),
+                )
+            ]
+            try:
+                self._build_faithful_document_outline(
+                    job, str(job["analysis_job_id"]), include_unclassified=True
+                )
+            except Exception:
+                # The legacy outline remains the visible source of truth.
+                continue
+            new_leaf = self.db.fetch_one(
+                f"""SELECT COUNT(*) n FROM knowledge_nodes
+                    WHERE document_id=? AND node_scope='document'
+                      AND node_type='knowledge_point'
+                      AND node_id NOT IN ({','.join('?' for _ in old_ids)})""",
+                (document_id, *old_ids),
+            ) if old_ids else None
+            if not new_leaf or int(new_leaf["n"]) == 0:
+                with self.db.connect() as conn:
+                    conn.execute(
+                        f"""DELETE FROM knowledge_nodes WHERE document_id=? AND node_scope='document'
+                            AND node_id NOT IN ({','.join('?' for _ in old_ids)})""",
+                        (document_id, *old_ids),
+                    )
+                continue
+            with self.db.connect() as conn:
+                conn.execute(
+                    f"DELETE FROM knowledge_nodes WHERE node_id IN ({','.join('?' for _ in old_ids)})",
+                    old_ids,
+                )
+
+        source_types = {
+            str(row["material_type"] or "other")
+            for row in self.db.fetch_all(
+                """SELECT DISTINCT COALESCE(m.material_type,'other') material_type
+                   FROM knowledge_nodes n JOIN course_documents d ON d.document_id=n.document_id
+                   LEFT JOIN document_material_metadata m ON m.document_id=d.document_id
+                   WHERE n.course_id=? AND n.node_scope='document'
+                     AND n.node_type='knowledge_point' AND n.status!='rejected'""",
+                (course_id,),
+            )
+        }
+        current_types = {
+            str(row["material_type"])
+            for row in self.db.fetch_all(
+                """SELECT material_type FROM course_outline_generations
+                   WHERE course_id=? AND status='current'""", (course_id,)
+            )
+        }
+        for material_type in sorted(source_types - current_types):
+            latest = self.db.fetch_one(
+                """SELECT s.analysis_job_id FROM semantic_analysis_jobs s
+                   JOIN course_documents d ON d.document_id=s.document_id
+                   LEFT JOIN document_material_metadata m ON m.document_id=d.document_id
+                   WHERE s.course_id=? AND COALESCE(m.material_type,'other')=?
+                     AND s.status IN ('review_required','completed')
+                   ORDER BY s.created_at DESC LIMIT 1""",
+                (course_id, material_type),
+            ) or {}
+            self._rebuild_course_outline(
+                course_id, latest.get("analysis_job_id"), use_api=False,
+                material_type=material_type,
+            )
+
+    def _rebuild_course_outline(self, course_id: str, analysis_job_id: str | None, *,
+                                use_api: bool = True,
+                                material_type: str | None = None) -> str:
+        if material_type is None and analysis_job_id:
+            analysis = self.db.fetch_one(
+                "SELECT document_id FROM semantic_analysis_jobs WHERE analysis_job_id=?",
+                (analysis_job_id,),
+            ) or {}
+            material_type = self._document_material_type(str(analysis.get("document_id") or ""))
+        material_type = material_type if material_type in MATERIAL_TYPES else "other"
+        if analysis_job_id:
+            analysis = self.db.fetch_one(
+                "SELECT document_id FROM semantic_analysis_jobs WHERE analysis_job_id=?",
+                (analysis_job_id,),
+            ) or {}
+            if analysis.get("document_id"):
+                self.db.execute(
+                    "UPDATE knowledge_nodes SET material_type=? WHERE document_id=? AND node_scope='document'",
+                    (material_type, analysis["document_id"]),
+                )
         source_nodes = self.db.fetch_all(
-            """SELECT n.*,s.title section_title,c.title chapter_title
+            """SELECT n.*,s.title section_title,c.title chapter_title,
+                      COALESCE(m.material_type,'other') material_type,
+                      COALESCE(m.classification_status,'suggested') classification_status
                FROM knowledge_nodes n
                LEFT JOIN knowledge_nodes s ON s.node_id=n.parent_id
                LEFT JOIN knowledge_nodes c ON c.node_id=s.parent_id
                JOIN course_documents d ON d.document_id=n.document_id
+               LEFT JOIN document_material_metadata m ON m.document_id=d.document_id
                WHERE n.course_id=? AND n.node_scope='document' AND n.node_type='knowledge_point'
-                 AND n.status!='rejected'
-               ORDER BY d.created_at,n.sort_order""", (course_id,),
+                 AND n.status!='rejected' AND COALESCE(m.material_type,'other')=?
+                 AND (n.analysis_job_id IS NULL OR n.analysis_job_id=(
+                     SELECT sj.analysis_job_id FROM semantic_analysis_jobs sj
+                     WHERE sj.document_id=n.document_id
+                       AND sj.status IN ('running','review_required','completed')
+                     ORDER BY sj.created_at DESC LIMIT 1
+                 ))
+               ORDER BY d.created_at,n.sort_order""", (course_id, material_type),
         )
         if not source_nodes:
-            raise ValidationError("原文没有生成可审核的知识点")
-        used_fallback = False
+            with self.db.connect() as conn:
+                conn.execute(
+                    """UPDATE course_outline_generations SET status='superseded',completed_at=CURRENT_TIMESTAMP
+                       WHERE course_id=? AND material_type=? AND status='current'""",
+                    (course_id, material_type),
+                )
+            return ""
+        fallback_reason = ""
         if not use_api:
             unified = {
                 "points": [{
@@ -1780,23 +3379,35 @@ class IngestionService:
         else:
             try:
                 unified = self.semantic.unify_course_outline(
-                    source_nodes, on_call=lambda: self._analysis_call(analysis_job_id)
+                    source_nodes,
+                    on_call=(lambda: self._analysis_call(analysis_job_id)) if analysis_job_id else None,
                 )
             except Exception as exc:
-                if not self._is_structured_output_error(exc):
+                message = str(exc).lower()
+                transient = any(marker in message for marker in (
+                    "timeout", "timed out", "readtimeout", "connectionerror",
+                    "无法连接智能服务", "智能服务暂时超时", "自动续跑",
+                    "qwen_connection_failed",
+                ))
+                structured = self._is_structured_output_error(exc)
+                if not structured and not transient:
                     raise
-                used_fallback = True
+                fallback_reason = (
+                    "课程归并 API 暂不可用，已按教材原始章节顺序生成可审核课程树"
+                    if transient else
+                    "课程归并 JSON 被截断，保留文档知识点供教师审核"
+                )
                 unified = {
                     "points": [{
                         "course_key": f"safe-course-{index + 1}",
                         "chapter": row.get("chapter_title") or "待教师整理",
-                        "section": row.get("section_title") or "原文安全降级",
+                        "section": row.get("section_title") or "教材原始顺序",
                         "title": row["title"],
                         "keywords": json.loads(row.get("keywords_json") or "[]"),
                         "source_node_ids": [row["node_id"]],
                     } for index, row in enumerate(source_nodes)],
                     "relations": [],
-                    "fallback_reason": "课程归并 JSON 被截断，保留原文知识点供教师审核",
+                    "fallback_reason": fallback_reason,
                 }
         suggestions = unified.get("points") if isinstance(unified, dict) else None
         relations = unified.get("relations") if isinstance(unified, dict) else None
@@ -1805,21 +3416,102 @@ class IngestionService:
         if not isinstance(relations, list):
             relations = []
         source_map = {row["node_id"]: row for row in source_nodes}
+        source_position = {row["node_id"]: index for index, row in enumerate(source_nodes)}
+
+        def suggestion_order(item: dict[str, Any]) -> tuple[Any, ...]:
+            position = min(
+                (source_position.get(str(value), len(source_position))
+                 for value in item.get("source_node_ids", [])),
+                default=len(source_position),
+            )
+            chapter = str(item.get("chapter") or "")
+            section = str(item.get("section") or "")
+            title = str(item.get("title") or "")
+            chapter_parts = self._outline_number_parts(chapter)
+            section_parts = self._outline_number_parts(section)
+            title_parts = self._outline_number_parts(title)
+            normalized_chapter = self._normalized_outline_title(chapter)
+            if any(marker in normalized_chapter for marker in ("导学", "前言", "引言", "课程简介")):
+                group = 0
+                effective_parts: tuple[int, ...] = ()
+            elif chapter_parts or section_parts or title_parts:
+                group = 1
+                effective_parts = chapter_parts or section_parts or title_parts
+            else:
+                group = 2
+                effective_parts = ()
+            return (
+                group, effective_parts,
+                position,
+                0 if section_parts else 1, section_parts,
+                0 if title_parts else 1, title_parts,
+            )
+
+        suggestions = sorted(
+            (item for item in suggestions if isinstance(item, dict)),
+            key=suggestion_order,
+        )
+        previous_generation = self.db.fetch_one(
+            """SELECT generation_id FROM course_outline_generations
+               WHERE course_id=? AND material_type=? AND status='current'""",
+            (course_id, material_type),
+        ) or {}
+        previous_nodes = self.db.fetch_all(
+            """SELECT * FROM knowledge_nodes WHERE course_id=? AND node_scope='course'
+               AND material_type=? AND generation_id=? AND status!='rejected'""",
+            (course_id, material_type, previous_generation.get("generation_id")),
+        ) if previous_generation else []
+        previous_by_fingerprint = {
+            str(row.get("source_fingerprint") or ""): row
+            for row in previous_nodes if str(row.get("source_fingerprint") or "")
+        }
+        previous_relations: dict[tuple[str, str, str], dict[str, Any]] = {}
+        if previous_generation:
+            for row in self.db.fetch_all(
+                """SELECT r.*,s.source_fingerprint source_fingerprint,
+                          t.source_fingerprint target_fingerprint
+                   FROM knowledge_relations r
+                   JOIN knowledge_nodes s ON s.node_id=r.source_node_id
+                   JOIN knowledge_nodes t ON t.node_id=r.target_node_id
+                   WHERE r.generation_id=? AND r.status!='rejected'""",
+                (previous_generation["generation_id"],),
+            ):
+                previous_relations[(
+                    str(row["source_fingerprint"]), str(row["target_fingerprint"]),
+                    str(row["relation_type"]),
+                )] = row
+
+        def preserved_values(prior: dict[str, Any] | None, *, title: str,
+                             markdown: str = "", keywords_json: str = "[]") -> tuple[Any, ...]:
+            preserve = bool(prior and (prior.get("reviewed_by") or prior.get("status") == "approved"))
+            if preserve:
+                return (
+                    prior["title"], prior["markdown"], prior["keywords_json"],
+                    prior["status"], prior.get("reviewed_by"), prior.get("reviewed_at"),
+                )
+            return title, markdown, keywords_json, "draft", None, None
+
+        generation_id = f"kog_{uuid.uuid4().hex}"
         with self.db.connect() as conn:
-            conn.execute("DELETE FROM knowledge_relations WHERE course_id=? AND status!='approved'", (course_id,))
             conn.execute(
-                """DELETE FROM knowledge_nodes WHERE course_id=? AND node_scope='course'
-                   AND NOT EXISTS (SELECT 1 FROM knowledge_version_nodes vn WHERE vn.node_id=knowledge_nodes.node_id)""",
-                (course_id,),
+                """INSERT INTO course_outline_generations(
+                       generation_id,course_id,material_type,analysis_job_id,status,fallback_reason
+                   ) VALUES(?,?,?,?,'building',?)""",
+                (generation_id, course_id, material_type, analysis_job_id, fallback_reason),
             )
             chapter_ids: dict[str, str] = {}
             section_ids: dict[tuple[str, str], str] = {}
             point_ids: dict[str, str] = {}
+            point_fingerprints: dict[str, str] = {}
             order = 0
             for index, suggestion in enumerate(suggestions):
-                if not isinstance(suggestion, dict):
-                    continue
-                source_ids = [str(value) for value in suggestion.get("source_node_ids", []) if str(value) in source_map]
+                source_ids = sorted(
+                    dict.fromkeys(
+                        str(value) for value in suggestion.get("source_node_ids", [])
+                        if str(value) in source_map
+                    ),
+                    key=lambda value: source_position[value],
+                )
                 if not source_ids:
                     continue
                 chapter = self._clean_title(suggestion.get("chapter"), "未分章")
@@ -1827,24 +3519,60 @@ class IngestionService:
                 if chapter not in chapter_ids:
                     order += 1
                     chapter_ids[chapter] = f"kn_{uuid.uuid4().hex}"
+                    chapter_fingerprint = self._outline_fingerprint(
+                        material_type, "chapter", [chapter]
+                    )
+                    chapter_values = preserved_values(
+                        previous_by_fingerprint.get(chapter_fingerprint), title=chapter
+                    )
                     conn.execute(
-                        """INSERT INTO knowledge_nodes(node_id,course_id,node_scope,node_type,title,sort_order,analysis_job_id)
-                           VALUES(?,?,'course','chapter',?,?,?)""",
-                        (chapter_ids[chapter], course_id, chapter, order, analysis_job_id),
+                        """INSERT INTO knowledge_nodes(
+                               node_id,course_id,node_scope,node_type,title,markdown,keywords_json,
+                               sort_order,status,analysis_job_id,reviewed_by,reviewed_at,
+                               material_type,generation_id,source_fingerprint
+                           ) VALUES(?,?,'course','chapter',?,?,?,?,?,?,?,?,?,?,?)""",
+                        (chapter_ids[chapter], course_id, chapter, chapter_values[1], chapter_values[2],
+                         order, chapter_values[3], analysis_job_id, chapter_values[4], chapter_values[5],
+                         material_type, generation_id, chapter_fingerprint),
                     )
                 section_key = (chapter, section)
                 if section_key not in section_ids:
                     order += 1
                     section_ids[section_key] = f"kn_{uuid.uuid4().hex}"
+                    section_fingerprint = self._outline_fingerprint(
+                        material_type, "section", [chapter, section]
+                    )
+                    section_values = preserved_values(
+                        previous_by_fingerprint.get(section_fingerprint), title=section
+                    )
                     conn.execute(
-                        """INSERT INTO knowledge_nodes(node_id,course_id,node_scope,parent_id,node_type,title,sort_order,analysis_job_id)
-                           VALUES(?,?,'course',?,'section',?,?,?)""",
-                        (section_ids[section_key], course_id, chapter_ids[chapter], section, order, analysis_job_id),
+                        """INSERT INTO knowledge_nodes(
+                               node_id,course_id,node_scope,parent_id,node_type,title,markdown,keywords_json,
+                               sort_order,status,analysis_job_id,reviewed_by,reviewed_at,
+                               material_type,generation_id,source_fingerprint
+                           ) VALUES(?,?,'course',?,'section',?,?,?,?,?,?,?,?,?,?,?)""",
+                        (section_ids[section_key], course_id, chapter_ids[chapter], section_values[0],
+                         section_values[1], section_values[2], order, section_values[3], analysis_job_id,
+                         section_values[4], section_values[5], material_type, generation_id,
+                         section_fingerprint),
                     )
                 node_id = f"kn_{uuid.uuid4().hex}"
                 course_key = str(suggestion.get("course_key") or f"course-point-{index + 1}")
                 point_ids[course_key] = node_id
                 source_rows = [source_map[source_id] for source_id in source_ids]
+                source_signatures = [
+                    self._outline_fingerprint(
+                        material_type, "source", [
+                            str(row.get("document_id") or ""), str(row.get("title") or ""),
+                            hashlib.sha256(str(row.get("markdown") or "").encode("utf-8")).hexdigest(),
+                        ],
+                    )
+                    for row in source_rows
+                ]
+                point_fingerprint = self._outline_fingerprint(
+                    material_type, "knowledge_point", source_signatures
+                )
+                point_fingerprints[course_key] = point_fingerprint
                 markdown_parts: list[str] = []
                 for row in source_rows:
                     lineage = []
@@ -1858,16 +3586,23 @@ class IngestionService:
                         markdown_parts.append("\n".join(lineage))
                 markdown = "\n\n".join(markdown_parts)
                 pages = sorted({page for row in source_rows for page in json.loads(row["source_pages_json"] or "[]")})
+                keywords_json = json.dumps(suggestion.get("keywords") or [], ensure_ascii=False)
+                point_values = preserved_values(
+                    previous_by_fingerprint.get(point_fingerprint),
+                    title=self._clean_title(suggestion.get("title"), "知识点"),
+                    markdown=markdown, keywords_json=keywords_json,
+                )
                 order += 1
                 conn.execute(
                     """INSERT INTO knowledge_nodes(node_id,course_id,node_scope,parent_id,node_type,title,summary,markdown,
-                       keywords_json,source_pages_json,sort_order,analysis_job_id)
-                       VALUES(?,?,'course',?,'knowledge_point',?,?,?,?,?,?,?)""",
+                       keywords_json,source_pages_json,sort_order,status,analysis_job_id,reviewed_by,reviewed_at,
+                       material_type,generation_id,source_fingerprint)
+                       VALUES(?,?,'course',?,'knowledge_point',?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (node_id, course_id, section_ids[section_key],
-                     self._clean_title(suggestion.get("title"), "知识点"),
-                     "", markdown,
-                     json.dumps(suggestion.get("keywords") or [], ensure_ascii=False),
-                     json.dumps(pages), order, analysis_job_id),
+                     point_values[0], "", point_values[1], point_values[2],
+                     json.dumps(pages), order, point_values[3], analysis_job_id,
+                     point_values[4], point_values[5], material_type, generation_id,
+                     point_fingerprint),
                 )
                 for source_id in source_ids:
                     for source in conn.execute(
@@ -1894,13 +3629,40 @@ class IngestionService:
                     confidence = max(0.0, min(1.0, float(relation.get("confidence", 0))))
                 except (TypeError, ValueError):
                     confidence = None
+                source_key = str(relation.get("source_course_key") or "")
+                target_key = str(relation.get("target_course_key") or "")
+                source_fingerprint = point_fingerprints.get(source_key, "")
+                target_fingerprint = point_fingerprints.get(target_key, "")
+                if relation_type in symmetric and source_fingerprint > target_fingerprint:
+                    source_fingerprint, target_fingerprint = target_fingerprint, source_fingerprint
+                prior_relation = previous_relations.get(
+                    (source_fingerprint, target_fingerprint, relation_type)
+                )
+                relation_status = (
+                    str(prior_relation["status"])
+                    if prior_relation and (prior_relation.get("reviewed_by") or prior_relation.get("status") == "approved")
+                    else "draft"
+                )
                 conn.execute(
                     """INSERT OR IGNORE INTO knowledge_relations(relation_id,course_id,source_node_id,target_node_id,
-                       relation_type,confidence,reason) VALUES(?,?,?,?,?,?,?)""",
+                       relation_type,confidence,reason,status,reviewed_by,reviewed_at,material_type,generation_id)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (f"kr_{uuid.uuid4().hex}", course_id, source, target, relation_type, confidence,
-                     str(relation.get("reason") or "")[:500]),
+                     str(relation.get("reason") or "")[:500], relation_status,
+                     prior_relation.get("reviewed_by") if prior_relation else None,
+                     prior_relation.get("reviewed_at") if prior_relation else None,
+                     material_type, generation_id),
                 )
-        return used_fallback
+            conn.execute(
+                """UPDATE course_outline_generations SET status='superseded',completed_at=CURRENT_TIMESTAMP
+                   WHERE course_id=? AND material_type=? AND status='current'""",
+                (course_id, material_type),
+            )
+            conn.execute(
+                """UPDATE course_outline_generations SET status='current',completed_at=CURRENT_TIMESTAMP
+                   WHERE generation_id=?""", (generation_id,),
+            )
+        return fallback_reason
 
     @staticmethod
     def _analysis_response(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1920,9 +3682,17 @@ class IngestionService:
             warnings.append(
                 f"{len(fallback_batches)} 个批次的模型 JSON 被截断，已按原文安全降级"
             )
-        for key in ("document_reduce_fallback", "course_reduce_fallback", "notice"):
+        for key in (
+            "presentation_outline_fallback", "document_reduce_fallback",
+            "course_reduce_fallback", "notice",
+        ):
             if result.get(key):
                 warnings.append(str(result[key]))
+        checkpoint_repairs = result.get("checkpoint_repairs") or []
+        if checkpoint_repairs:
+            warnings.append(
+                f"{len(checkpoint_repairs)} 个旧分析断点字段不完整，已从落库原文安全修复"
+            )
         row["warnings"] = warnings
         row["analysis_summary"] = {
             "skipped_blocks": skipped,
@@ -1930,6 +3700,13 @@ class IngestionService:
             "used_document_fallback": bool(result.get("document_reduce_fallback")),
             "used_course_fallback": bool(result.get("course_reduce_fallback")),
         }
+        error = str(row.get("error_message") or "").lower()
+        non_retryable = any(marker in error for marker in (
+            "http 401", "http 403", "quota exhausted", "insufficient_quota",
+            "invalid api key", "unauthorized", "forbidden", "权限或额度问题",
+        ))
+        row["retryable"] = row.get("status") == "failed" and not non_retryable
+        row["input_source"] = "persisted_document_ir"
         total = int(row.get("total_batches") or 0)
         current = int(row.get("current_batch") or 0)
         row["progress"] = (
@@ -1962,7 +3739,7 @@ class IngestionService:
             checkpoint = json.loads(job.get("result_json") or "{}")
         except json.JSONDecodeError:
             checkpoint = {}
-        reset_batch = checkpoint.get("schema_version") != 4 or not isinstance(
+        reset_batch = checkpoint.get("schema_version") != 5 or not isinstance(
             checkpoint.get("map_results"), list
         )
         self.db.execute(
@@ -2013,7 +3790,8 @@ class IngestionService:
                        (SELECT s.error_message FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_error,
                        (SELECT s.current_batch FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_current_batch,
                        (SELECT s.total_batches FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_total_batches,
-                       (SELECT s.api_calls FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_api_calls
+                       (SELECT s.api_calls FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_api_calls,
+                       (SELECT COUNT(*) FROM document_blocks b WHERE b.document_id=j.document_id) document_block_count
                FROM ingestion_jobs j JOIN course_documents d USING(document_id)
                LEFT JOIN document_material_metadata m USING(document_id)
                WHERE j.course_id=? ORDER BY j.created_at DESC""", (course_id,),
@@ -2022,6 +3800,255 @@ class IngestionService:
             row["tags"] = json.loads(row.pop("tags_json") or "[]")
             row.pop("ai_key_encrypted", None)
         return rows
+
+    def get_manifest(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
+        """Return the persisted page/batch checkpoint without exposing raw files."""
+        document = self.require_document_access(actor, document_id)
+        if actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("无权查看该资料的解析清单")
+        job = self.db.fetch_one(
+            "SELECT manifest_path FROM ingestion_jobs WHERE document_id=? ORDER BY created_at DESC LIMIT 1",
+            (document_id,),
+        )
+        manifest_path = Path(str((job or {}).get("manifest_path") or ""))
+        if not manifest_path.is_file():
+            return {
+                "document_id": document_id, "status": "not_started", "total_pages": 0,
+                "pages": {}, "batches": {}, "errors": [],
+            }
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValidationError(f"解析清单不可读：{str(exc)[:300]}") from exc
+        payload.pop("native_text", None)
+        return payload
+
+    def list_document_pages(self, actor: dict[str, Any], document_id: str) -> list[dict[str, Any]]:
+        document = self.require_document_access(actor, document_id)
+        if actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("无权查看该资料页面")
+        return self.db.fetch_all(
+            "SELECT * FROM document_pages WHERE document_id=? ORDER BY page_index",
+            (document_id,),
+        )
+
+    def get_document_page(self, actor: dict[str, Any], document_id: str, page_number: int) -> dict[str, Any]:
+        if page_number < 1:
+            raise ValidationError("页码必须从 1 开始")
+        pages = self.list_document_pages(actor, document_id)
+        page = next((row for row in pages if int(row["page_number"]) == page_number), None)
+        if not page:
+            raise NotFound("页面不存在")
+        blocks = self.db.fetch_all(
+            "SELECT * FROM document_blocks WHERE document_id=? AND page_number=? ORDER BY block_order",
+            (document_id, page_number),
+        )
+        page["blocks"] = blocks
+        return page
+
+    def get_document_structure(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
+        document = self.require_document_access(actor, document_id)
+        if actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("无权查看该资料结构")
+        row = self.db.fetch_one("SELECT * FROM document_structures WHERE document_id=?", (document_id,))
+        if not row:
+            return {"document_id": document_id, "status": "not_started", "outline": [], "toc_entries": [], "warnings": []}
+        for field in ("outline_json", "toc_entries_json", "warnings_json"):
+            value = row.pop(field)
+            try:
+                row[field[:-5]] = json.loads(value or "[]")
+            except json.JSONDecodeError:
+                row[field[:-5]] = []
+        row["document_id"] = document_id
+        return row
+
+    def list_presentation_slides(self, actor: dict[str, Any], document_id: str) -> list[dict[str, Any]]:
+        document = self.require_document_access(actor, document_id)
+        if actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("无权查看该演示文稿结构")
+        rows = self.db.fetch_all(
+            "SELECT * FROM presentation_slides WHERE document_id=? ORDER BY slide_index", (document_id,)
+        )
+        for row in rows:
+            row["slide_number"] = int(row.get("slide_index") or 0) + 1
+            for field in ("reading_order_json", "shapes_json", "regions_json"):
+                try:
+                    row[field[:-5]] = json.loads(row.pop(field) or "[]")
+                except json.JSONDecodeError:
+                    row[field[:-5]] = []
+        return rows
+
+    def _candidate_access(self, actor: dict[str, Any], candidate_id: str) -> dict[str, Any]:
+        candidate = self.db.fetch_one(
+            """SELECT k.*,c.owner_id,d.course_id AS document_course_id
+               FROM knowledge_candidates k JOIN course_documents d USING(document_id)
+               JOIN courses c ON c.course_id=d.course_id
+               WHERE k.candidate_id=?""", (candidate_id,),
+        )
+        if not candidate:
+            raise NotFound("知识候选不存在")
+        document = self.require_document_access(actor, candidate["document_id"])
+        if actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("无权审核该知识候选")
+        return candidate
+
+    def _candidate_response(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        row = dict(candidate)
+        for field in ("source_block_ids_json", "bbox_json", "chapter_path_json"):
+            target = field[:-5]
+            try:
+                row[target] = json.loads(row.pop(field) or "[]")
+            except json.JSONDecodeError:
+                row[target] = []
+        source_ids = self._candidate_source_ids(row)
+        row["source_block_ids"] = source_ids
+        row["source_blocks"] = self.db.fetch_all(
+            """SELECT b.block_id,b.page_index,b.block_order,b.block_type,b.page_number,b.bbox_json,
+                      b.markdown,b.plain_text,b.latex,b.source_image_path,b.confidence,
+                      b.verification_status,b.content_destination,b.include_as_knowledge,
+                      b.region_type,b.region_confidence,b.region_reason,b.chapter_path_json
+               FROM knowledge_candidate_blocks cb
+               JOIN document_blocks b ON b.block_id=cb.block_id
+               WHERE cb.candidate_id=? ORDER BY cb.sort_order""",
+            (row["candidate_id"],),
+        ) if source_ids else []
+        if not row["source_blocks"] and source_ids:
+            # Keep older candidate rows readable if their link rows were created
+            # before knowledge_candidate_blocks was introduced.
+            row["source_blocks"] = self.db.fetch_all(
+                """SELECT block_id,page_index,block_order,block_type,page_number,bbox_json,
+                          markdown,plain_text,latex,source_image_path,confidence,
+                          verification_status,content_destination,include_as_knowledge,
+                          region_type,region_confidence,region_reason,chapter_path_json
+                   FROM document_blocks WHERE block_id IN ({})
+                   ORDER BY page_index,block_order""".format(
+                    ",".join("?" for _ in source_ids) or "NULL"
+                ),
+                tuple(source_ids),
+            )
+        for block in row["source_blocks"]:
+            for field in ("bbox_json", "chapter_path_json"):
+                try:
+                    block[field[:-5]] = json.loads(block.pop(field) or "[]")
+                except json.JSONDecodeError:
+                    block[field[:-5]] = []
+        row["source_markdown"] = "\n\n".join(
+            str(block.get("markdown") or block.get("latex") or block.get("plain_text") or "").strip()
+            for block in row["source_blocks"]
+            if str(block.get("markdown") or block.get("latex") or block.get("plain_text") or "").strip()
+        )
+        row["source_pages"] = sorted({
+            int(block["page_number"]) for block in row["source_blocks"]
+            if block.get("page_number") is not None
+        })
+        row["source_locations"] = [
+            {"block_id": block["block_id"], "page_number": block.get("page_number"), "bbox": block.get("bbox", [])}
+            for block in row["source_blocks"]
+        ]
+        return row
+
+    def _candidate_source_ids(self, candidate: dict[str, Any]) -> list[str]:
+        linked = self.db.fetch_all(
+            """SELECT block_id FROM knowledge_candidate_blocks
+               WHERE candidate_id=? ORDER BY sort_order""",
+            (candidate["candidate_id"],),
+        )
+        if linked:
+            return [str(row["block_id"]) for row in linked]
+        if "source_block_ids" in candidate:
+            value = candidate.get("source_block_ids") or []
+        else:
+            try:
+                value = json.loads(candidate.get("source_block_ids_json") or "[]")
+            except json.JSONDecodeError:
+                value = []
+        return list(dict.fromkeys(str(item) for item in value if str(item).strip()))
+
+    def list_knowledge_candidates(self, actor: dict[str, Any], document_id: str) -> list[dict[str, Any]]:
+        self.require_document_access(actor, document_id)
+        rows = self.db.fetch_all(
+            "SELECT * FROM knowledge_candidates WHERE document_id=? ORDER BY page_start,candidate_id",
+            (document_id,),
+        )
+        return [self._candidate_response(row) for row in rows]
+
+    def update_knowledge_candidate(self, actor: dict[str, Any], candidate_id: str,
+                                   updates: dict[str, Any]) -> dict[str, Any]:
+        candidate = self._candidate_access(actor, candidate_id)
+        if candidate["review_status"] == "REJECTED":
+            raise ValidationError("已驳回的候选不能直接修改")
+        title = str(updates.get("title", candidate["title"])).strip()[:160]
+        knowledge_type = str(updates.get("knowledge_type", candidate["knowledge_type"])).strip()[:64]
+        teacher_revision = str(updates.get("teacher_revision", candidate.get("teacher_revision") or ""))[:50000]
+        if not title:
+            raise ValidationError("知识点标题不能为空")
+        status = "MODIFIED" if teacher_revision else candidate["review_status"]
+        self.db.execute(
+            """UPDATE knowledge_candidates SET title=?,knowledge_type=?,teacher_revision=?,review_status=?,
+               reviewed_by=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?""",
+            (title, knowledge_type, teacher_revision, status, actor["user_id"], candidate_id),
+        )
+        return self._candidate_response(self.db.fetch_one(
+            "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
+        ) or candidate)
+
+    def approve_knowledge_candidate(self, actor: dict[str, Any], candidate_id: str) -> dict[str, Any]:
+        candidate = self._candidate_access(actor, candidate_id)
+        if candidate["review_status"] == "REJECTED":
+            raise ValidationError("已驳回的候选不能批准")
+        source_ids = self._candidate_source_ids(candidate)
+        if not source_ids:
+            raise ValidationError("候选没有可追溯的原始 block")
+        source_rows = self.db.fetch_all(
+            """SELECT block_id,document_id,include_as_knowledge,region_type
+               FROM document_blocks WHERE document_id=? AND block_id IN ({})""".format(
+                ",".join("?" for _ in source_ids)
+            ),
+            (candidate["document_id"], *source_ids),
+        )
+        if {str(row["block_id"]) for row in source_rows} != set(source_ids):
+            raise ValidationError("候选包含无法追溯到当前资料的原始 block")
+        if any(not row["include_as_knowledge"] or row["region_type"] != "knowledge" for row in source_rows):
+            raise ValidationError("候选包含已被排除的非知识区域，不能批准")
+        with self.db.connect() as conn:
+            placeholders = ",".join("?" for _ in source_ids)
+            conn.execute(
+                f"""UPDATE document_blocks SET content_destination='knowledge',semantic_role='source_markdown',
+                    verification_status='teacher_verified',reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP,
+                    include_as_knowledge=1,updated_at=CURRENT_TIMESTAMP WHERE block_id IN ({placeholders})""",
+                (actor["user_id"], *source_ids),
+            )
+            conn.execute(
+                """UPDATE knowledge_candidates SET review_status='APPROVED',reviewed_by=?,
+                   reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?""",
+                (actor["user_id"], candidate_id),
+            )
+        self._sync_approved_source_blocks(candidate["document_id"])
+        return self._candidate_response(self.db.fetch_one(
+            "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
+        ) or candidate)
+
+    def reject_knowledge_candidate(self, actor: dict[str, Any], candidate_id: str) -> dict[str, Any]:
+        candidate = self._candidate_access(actor, candidate_id)
+        source_ids = self._candidate_source_ids(candidate)
+        with self.db.connect() as conn:
+            if source_ids:
+                placeholders = ",".join("?" for _ in source_ids)
+                conn.execute(
+                    f"""UPDATE document_blocks SET content_destination='excluded',semantic_role='teacher_rejected',
+                        verification_status='rejected',reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP,
+                        updated_at=CURRENT_TIMESTAMP WHERE block_id IN ({placeholders})""",
+                    (actor["user_id"], *source_ids),
+                )
+            conn.execute(
+                """UPDATE knowledge_candidates SET review_status='REJECTED',reviewed_by=?,
+                   reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?""",
+                (actor["user_id"], candidate_id),
+            )
+        self._sync_approved_source_blocks(candidate["document_id"])
+        return self._candidate_response(self.db.fetch_one(
+            "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
+        ) or candidate)
 
     def require_document_access(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
         document = self.db.fetch_one(
@@ -2068,6 +4095,7 @@ class IngestionService:
             raise PermissionDenied("仅课程教师可以整理资料用途")
         if material_type not in MATERIAL_TYPES:
             raise ValidationError("资料用途类型无效")
+        old_material_type = self._document_material_type(document_id)
         clean_tags = list(dict.fromkeys(
             str(tag).strip()[:40] for tag in tags if str(tag).strip()
         ))[:20]
@@ -2088,7 +4116,45 @@ class IngestionService:
             "SELECT * FROM document_material_metadata WHERE document_id=?", (document_id,)
         ) or {}
         row["tags"] = json.loads(row.pop("tags_json") or "[]")
+        affected = (
+            list(dict.fromkeys([old_material_type, material_type]))
+            if old_material_type != material_type else []
+        )
+        row["course_id"] = document["course_id"]
+        row["affected_material_types"] = affected
+        row["rebuild_status"] = "queued" if affected else "not_needed"
         return row
+
+    def rebuild_material_partitions(self, course_id: str,
+                                    material_types: list[str]) -> dict[str, Any]:
+        """Rebuild only affected partitions from persisted document knowledge nodes."""
+        results: dict[str, Any] = {}
+        for material_type in dict.fromkeys(material_types):
+            if material_type not in MATERIAL_TYPES:
+                continue
+            latest = self.db.fetch_one(
+                """SELECT s.analysis_job_id FROM semantic_analysis_jobs s
+                   JOIN course_documents d ON d.document_id=s.document_id
+                   LEFT JOIN document_material_metadata m ON m.document_id=d.document_id
+                   WHERE s.course_id=? AND COALESCE(m.material_type,'other')=?
+                     AND s.status IN ('review_required','completed')
+                   ORDER BY s.created_at DESC LIMIT 1""",
+                (course_id, material_type),
+            ) or {}
+            try:
+                fallback = self._rebuild_course_outline(
+                    course_id, latest.get("analysis_job_id"), use_api=False,
+                    material_type=material_type,
+                )
+                results[material_type] = {
+                    "status": "safe_fallback" if fallback else "completed",
+                    "message": fallback,
+                }
+            except Exception as exc:
+                results[material_type] = {
+                    "status": "failed_keep_previous", "message": str(exc)[:500]
+                }
+        return {"course_id": course_id, "partitions": results}
 
     def delete_document(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
         """Delete an erroneous, unpublished upload and every derived draft safely."""
@@ -2174,6 +4240,12 @@ class IngestionService:
                 shutil.rmtree(assets)
         except OSError as exc:
             warnings.append(f"{assets.name}: {exc}")
+        ingestion_root = (Path(document["stored_path"]).parent / f"{document_id}_ingestion").resolve()
+        try:
+            if storage_root in ingestion_root.parents and ingestion_root.is_dir():
+                shutil.rmtree(ingestion_root)
+        except OSError as exc:
+            warnings.append(f"{ingestion_root.name}: {exc}")
         return {"document_id": document_id, "deleted": True, "cleanup_warnings": warnings}
 
     def delete_documents(self, actor: dict[str, Any], document_ids: list[str]) -> dict[str, Any]:
@@ -2207,10 +4279,20 @@ class IngestionService:
                 "conversion_status": "ready", "preview_error": "",
             }
         if suffix == ".pptx":
+            slide_count = int((self.db.fetch_one(
+                "SELECT COUNT(*) n FROM presentation_slides WHERE document_id=?",
+                (document_id,),
+            ) or {}).get("n") or 0)
+            if not slide_count:
+                slide_count = int((self.db.fetch_one(
+                    "SELECT MAX(page_number) n FROM document_blocks WHERE document_id=?",
+                    (document_id,),
+                ) or {}).get("n") or 1)
             return {
                 "preview_kind": "pptx",
                 "conversion_status": "ready",
                 "preview_error": "",
+                "total_pages": slide_count,
             }
         artifact = self.db.fetch_one(
             "SELECT * FROM document_artifacts WHERE document_id=? AND artifact_type='preview_pdf'",
@@ -2304,14 +4386,83 @@ class IngestionService:
 
     def retry_job(self, actor: dict[str, Any], job_id: str) -> dict[str, Any]:
         job = self.get_job(actor, job_id)
-        if job["status"] not in {"failed", "cancelled"}:
+        block_count = self.db.fetch_one(
+            "SELECT COUNT(*) n FROM document_blocks WHERE document_id=?", (job["document_id"],)
+        )
+        can_retry_empty_review = (
+            job["status"] == "review_required" and int((block_count or {}).get("n") or 0) == 0
+        )
+        if job["status"] not in {"failed", "cancelled"} and not can_retry_empty_review:
             raise ValidationError("只有失败或已取消的任务可以重试")
+        if can_retry_empty_review:
+            self.db.execute(
+                """UPDATE semantic_analysis_jobs SET status='cancelled',current_stage='cancelled',
+                   next_retry_at=NULL,error_message='文档正在重新解析',updated_at=CURRENT_TIMESTAMP
+                   WHERE document_id=? AND status IN ('queued','running','retry_wait')""",
+                (job["document_id"],),
+            )
         self.db.execute(
             """UPDATE ingestion_jobs SET status='queued',progress=0,error_message='',failed_pages=0,
-               updated_at=CURRENT_TIMESTAMP WHERE job_id=?""", (job_id,)
+               pipeline_stage='queued',retry_count=retry_count+1,updated_at=CURRENT_TIMESTAMP WHERE job_id=?""", (job_id,)
         )
         self.db.execute("UPDATE course_documents SET status='queued',error_message='' WHERE document_id=?",
                         (job["document_id"],))
+        return self.get_job(actor, job_id)
+
+    def reparse_presentation(self, actor: dict[str, Any], job_id: str) -> dict[str, Any]:
+        """Rebuild PPT DocumentIR/title candidates without starting semantic AI."""
+        job = self.get_job(actor, job_id)
+        document = self.db.fetch_one(
+            "SELECT stored_path FROM course_documents WHERE document_id=?", (job["document_id"],)
+        ) or {}
+        if Path(str(document.get("stored_path") or "")).suffix.lower() != ".pptx":
+            raise ValidationError("只有 PPTX 资料可以重建标题")
+        if job["status"] in {"queued", "running"}:
+            raise ValidationError("文档解析仍在进行，暂不能重建 PPT 标题")
+        protected = self.db.fetch_one(
+            """SELECT 1 ok FROM knowledge_version_blocks vb
+               JOIN document_blocks b ON b.block_id=vb.block_id
+               WHERE b.document_id=? LIMIT 1""",
+            (job["document_id"],),
+        ) or self.db.fetch_one(
+            """SELECT 1 ok FROM knowledge_version_nodes vn
+               JOIN knowledge_node_sources s ON s.node_id=vn.node_id
+               WHERE s.document_id=? LIMIT 1""",
+            (job["document_id"],),
+        )
+        if protected:
+            raise ValidationError("该 PPT 已进入知识版本，不能直接重建标题；请先创建新资料版本")
+        approved = self.db.fetch_one(
+            """SELECT COUNT(*) n FROM knowledge_candidates WHERE document_id=?
+               AND review_status IN ('APPROVED','MODIFIED')""", (job["document_id"],)
+        )
+        if int((approved or {}).get("n") or 0):
+            raise ValidationError("该 PPT 已有教师批准或修改的候选，为避免覆盖审核结果，不能直接重建")
+        self.db.execute(
+            """UPDATE semantic_analysis_jobs SET status='cancelled',current_stage='cancelled',
+               next_retry_at=NULL,error_message='PPT 标题正在从原文件重新提取',updated_at=CURRENT_TIMESTAMP
+               WHERE document_id=? AND status IN ('queued','running','retry_wait')""",
+            (job["document_id"],),
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                """DELETE FROM knowledge_nodes WHERE document_id=? AND node_scope='document'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM knowledge_version_nodes vn
+                       WHERE vn.node_id=knowledge_nodes.node_id
+                   )""",
+                (job["document_id"],),
+            )
+            conn.execute("DELETE FROM knowledge_candidates WHERE document_id=?", (job["document_id"],))
+            conn.execute(
+                """UPDATE ingestion_jobs SET status='queued',progress=0,error_message='',failed_pages=0,
+                   pipeline_stage='PPT_TITLE_REBUILD',retry_count=retry_count+1,
+                   updated_at=CURRENT_TIMESTAMP WHERE job_id=?""", (job_id,),
+            )
+            conn.execute(
+                "UPDATE course_documents SET status='queued',error_message='' WHERE document_id=?",
+                (job["document_id"],),
+            )
         return self.get_job(actor, job_id)
 
     def course_health(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
@@ -2319,7 +4470,7 @@ class IngestionService:
         if course["owner_id"] != actor["user_id"]:
             raise PermissionDenied("无权查看该课程体检单")
         rows = self.db.fetch_all(
-            """SELECT p.status,p.parse_method,
+            """SELECT p.status,p.parse_method,p.page_type,p.parse_level,p.validation_issues_json,
                       (SELECT COUNT(*) FROM document_blocks b WHERE b.page_id=p.page_id AND b.block_type='formula') formulas,
                       (SELECT COUNT(*) FROM document_blocks b WHERE b.page_id=p.page_id AND b.block_type='table') tables,
                       (SELECT COUNT(*) FROM document_blocks b WHERE b.page_id=p.page_id AND b.verification_status='review_required') pending
@@ -2338,10 +4489,80 @@ class IngestionService:
             "table_count": sum(int(row["tables"]) for row in rows),
             "pending_regions": sum(int(row["pending"]) for row in rows),
             "failed_pages": sum(1 for row in rows if row["status"] == "failed"),
+            "suspect_pages": sum(1 for row in rows if row["status"] == "review_required" and row.get("validation_issues_json") not in (None, "", "[]")),
+            "page_type_counts": {
+                page_type: sum(1 for row in rows if row.get("page_type") == page_type)
+                for page_type in sorted({str(row.get("page_type") or "UNKNOWN") for row in rows})
+            },
+            "parse_level_counts": {
+                parse_level: sum(1 for row in rows if row.get("parse_level") == parse_level)
+                for parse_level in sorted({str(row.get("parse_level") or "NORMAL") for row in rows})
+            },
             "local_processing_ratio": 1.0 if total else 0.0,
             "cloud_model_calls": 0, "cloud_tokens": 0,
             "publication": version or {"version_number": 0, "status": "unpublished", "published_at": None},
         }
+
+    def _sync_approved_source_blocks(self, document_id: str) -> None:
+        """Materialize the approved layer from reviewed, immutable source blocks."""
+        document = self.db.fetch_one(
+            "SELECT stored_path FROM course_documents WHERE document_id=?", (document_id,)
+        )
+        if not document:
+            return
+        root = Path(document["stored_path"]).parent / f"{document_id}_ingestion" / "approved"
+        root.mkdir(parents=True, exist_ok=True)
+        rows = self.db.fetch_all(
+            """SELECT block_id,page_index,page_number,bbox_json,markdown,plain_text,latex,
+                      visibility_level FROM document_blocks
+               WHERE document_id=? AND content_destination='knowledge'
+                 AND verification_status IN ('auto_verified','teacher_verified')
+               ORDER BY page_index,block_order""",
+            (document_id,),
+        )
+        path = root / "blocks.jsonl"
+        with path.open("w", encoding="utf-8") as stream:
+            for row in rows:
+                stream.write(json.dumps({
+                    "source_block_ids": [row["block_id"]],
+                    "page_index": row["page_index"], "page_number": row["page_number"],
+                    "bbox": json.loads(row["bbox_json"] or "[]"),
+                    "markdown": row["markdown"], "plain_text": row["plain_text"],
+                    "latex": row["latex"], "visibility_level": row["visibility_level"],
+                }, ensure_ascii=False) + "\n")
+        candidates = self.db.fetch_all(
+            """SELECT candidate_id,title,knowledge_type,source_block_ids_json,page_start,page_end,
+                      chapter_path_json,markdown_content,teacher_revision,confidence,review_status
+               FROM knowledge_candidates WHERE document_id=? AND review_status='APPROVED'
+               ORDER BY page_start,candidate_id""", (document_id,),
+        )
+        points_path = root / "knowledge_points.jsonl"
+        with points_path.open("w", encoding="utf-8") as stream:
+            for candidate in candidates:
+                try:
+                    source_ids = json.loads(candidate["source_block_ids_json"] or "[]")
+                except json.JSONDecodeError:
+                    source_ids = []
+                stream.write(json.dumps({
+                    "candidate_id": candidate["candidate_id"],
+                    "title": candidate["title"],
+                    "knowledge_type": candidate["knowledge_type"],
+                    "source_block_ids": source_ids,
+                    "page_start": candidate["page_start"], "page_end": candidate["page_end"],
+                    "chapter_path": json.loads(candidate.get("chapter_path_json") or "[]"),
+                    "markdown": candidate["teacher_revision"] or candidate["markdown_content"],
+                    "confidence": candidate["confidence"],
+                    "review_status": candidate["review_status"],
+                }, ensure_ascii=False) + "\n")
+
+    def _enforce_navigation_exclusion(self, document_id: str) -> None:
+        """Keep routed navigation/decoration blocks out of semantic extraction."""
+        self.db.execute(
+            """UPDATE document_blocks SET content_destination='excluded',semantic_role='navigation',
+                      analysis_reason='页面路由标记为导航或非知识内容',updated_at=CURRENT_TIMESTAMP
+               WHERE document_id=? AND include_as_knowledge=0""",
+            (document_id,),
+        )
 
     def list_blocks(self, actor: dict[str, Any], document_id: str) -> list[dict[str, Any]]:
         doc = self.db.fetch_one("SELECT * FROM course_documents WHERE document_id=?", (document_id,))
@@ -2372,13 +4593,14 @@ class IngestionService:
         if visibility_level not in {"PUBLIC", "GUIDANCE", "ASSESSMENT", "VAULT"}:
             raise ValidationError("知识能力域不合法")
         status = "teacher_verified" if accepted else "rejected"
-        destination = "knowledge" if accepted else "excluded"
+        destination = "knowledge" if accepted and bool(block.get("include_as_knowledge", 1)) else "excluded"
         self.db.execute(
             """UPDATE document_blocks SET markdown=?,plain_text=?,latex=?,visibility_level=?,verification_status=?,
                content_destination=?,reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP,
                updated_at=CURRENT_TIMESTAMP WHERE block_id=?""",
             (markdown, plain_text, latex, visibility_level, status, destination, actor["user_id"], block_id),
         )
+        self._sync_approved_source_blocks(block["document_id"])
         return self.db.fetch_one("SELECT * FROM document_blocks WHERE block_id=?", (block_id,)) or {}
 
     def update_classification(self, actor: dict[str, Any], block_id: str, *, destination: str,
@@ -2397,6 +4619,8 @@ class IngestionService:
             raise ValidationError("内容去向无效")
         if destination == "knowledge" and block["block_type"] in {"image", "table"}:
             raise ValidationError("图片和表格不能直接进入知识库，可进入习题附件或排除")
+        if destination == "knowledge" and not bool(block.get("include_as_knowledge", 1)):
+            raise ValidationError("导航、封面和装饰页不能进入知识库")
         group = question_group_key.strip()[:100]
         if destination == "question_bank" and not group:
             group = f"page-{block['page_number'] or 1}-item-{block['block_order']}"
@@ -2408,6 +4632,7 @@ class IngestionService:
         )
         self.db.execute("DELETE FROM question_bank_attachments WHERE block_id=?", (block_id,))
         self._rebuild_question_drafts(block["document_id"], block["course_id"])
+        self._sync_approved_source_blocks(block["document_id"])
         return self.db.fetch_one("SELECT * FROM document_blocks WHERE block_id=?", (block_id,)) or {}
 
     def get_classification(self, actor: dict[str, Any], block_id: str) -> dict[str, Any]:
@@ -2570,10 +4795,14 @@ class IngestionService:
         return self.db.fetch_one("SELECT * FROM question_bank_versions WHERE version_id=?", (version_id,)) or {}
 
     def _outline(self, actor: dict[str, Any], course_id: str, *, document_id: str | None,
-                 scope: str) -> dict[str, Any]:
+                 scope: str, material_type: str | None = None) -> dict[str, Any]:
         course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
         if course["owner_id"] != actor["user_id"]:
             raise PermissionDenied("无权查看该知识目录")
+        if material_type is not None and material_type not in MATERIAL_TYPES:
+            raise ValidationError("资料用途类型无效")
+        if scope == "course":
+            self._ensure_partitioned_course_outline(course_id)
         condition = "course_id=? AND node_scope=?"
         params: tuple[Any, ...] = (course_id, scope)
         if document_id:
@@ -2585,12 +4814,18 @@ class IngestionService:
                 (document_id,),
             )
         else:
-            latest = self.db.fetch_one(
-                """SELECT analysis_job_id FROM semantic_analysis_jobs WHERE course_id=?
-                   AND status IN ('review_required','completed') ORDER BY created_at DESC LIMIT 1""",
-                (course_id,),
-            )
-        if latest:
+            latest = None
+            condition += """ AND (
+                generation_id IN (SELECT generation_id FROM course_outline_generations WHERE course_id=? AND status='current')
+                OR (generation_id IS NULL AND NOT EXISTS (
+                    SELECT 1 FROM course_outline_generations WHERE course_id=? AND status='current'
+                ))
+            )"""
+            params += (course_id, course_id)
+            if material_type:
+                condition += " AND material_type=?"
+                params += (material_type,)
+        if latest and scope == "document":
             condition += " AND (analysis_job_id=? OR analysis_job_id IS NULL)"
             params += (latest["analysis_job_id"],)
         rows = self.db.fetch_all(
@@ -2617,14 +4852,48 @@ class IngestionService:
             )
             for source in row["sources"]:
                 source["bbox"] = json.loads(source.pop("bbox_json") or "[]")
-        return {"nodes": rows, "relations": self.list_relations(actor, course_id)}
+        partitions: list[dict[str, Any]] = []
+        if scope == "course":
+            partition_rows = self.db.fetch_all(
+                """SELECT g.material_type,g.generation_id,g.fallback_reason,g.completed_at,
+                          (SELECT COUNT(*) FROM knowledge_nodes n
+                           WHERE n.generation_id=g.generation_id AND n.node_type='knowledge_point'
+                             AND n.status!='rejected') knowledge_point_count,
+                          (SELECT COUNT(*) FROM knowledge_nodes n
+                           WHERE n.generation_id=g.generation_id AND n.node_type='knowledge_point'
+                             AND n.status='draft') pending_review_count,
+                          (SELECT COUNT(*) FROM course_documents d
+                           LEFT JOIN document_material_metadata m ON m.document_id=d.document_id
+                           WHERE d.course_id=g.course_id AND COALESCE(m.material_type,'other')=g.material_type) document_count,
+                          (SELECT COUNT(*) FROM course_documents d
+                           LEFT JOIN document_material_metadata m ON m.document_id=d.document_id
+                           WHERE d.course_id=g.course_id AND COALESCE(m.material_type,'other')=g.material_type
+                             AND COALESCE(m.classification_status,'suggested')!='confirmed') unconfirmed_document_count
+                   FROM course_outline_generations g
+                   WHERE g.course_id=? AND g.status='current'""",
+                (course_id,),
+            )
+            rank = {value: index for index, value in enumerate(MATERIAL_ORDER)}
+            partitions = sorted(({
+                **row, "label": MATERIAL_LABELS.get(str(row["material_type"]), "其他"),
+                "rebuild_status": "safe_fallback" if row.get("fallback_reason") else "completed",
+            } for row in partition_rows if int(row.get("knowledge_point_count") or 0) > 0),
+                key=lambda row: rank.get(str(row["material_type"]), len(rank)))
+        return {
+            "nodes": rows,
+            "relations": self.list_relations(actor, course_id, material_type=material_type),
+            "partitions": partitions,
+        }
 
     def document_outline(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
         document = self.require_document_access(actor, document_id)
         return self._outline(actor, document["course_id"], document_id=document_id, scope="document")
 
-    def course_outline(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
-        return self._outline(actor, course_id, document_id=None, scope="course")
+    def course_outline(self, actor: dict[str, Any], course_id: str, *,
+                       material_type: str | None = None) -> dict[str, Any]:
+        return self._outline(
+            actor, course_id, document_id=None, scope="course", material_type=material_type
+        )
 
     def _require_node(self, actor: dict[str, Any], node_id: str) -> dict[str, Any]:
         node = self.db.fetch_one("SELECT * FROM knowledge_nodes WHERE node_id=?", (node_id,))
@@ -2664,7 +4933,12 @@ class IngestionService:
         parent_id = updates.get("parent_id", node["parent_id"])
         if parent_id:
             parent = self._require_node(actor, str(parent_id))
-            if parent["course_id"] != node["course_id"] or parent["node_scope"] != node["node_scope"]:
+            if (
+                parent["course_id"] != node["course_id"]
+                or parent["node_scope"] != node["node_scope"]
+                or parent.get("material_type") != node.get("material_type")
+                or parent.get("generation_id") != node.get("generation_id")
+            ):
                 raise ValidationError("父节点必须位于同一课程和同一目录范围")
         with self.db.connect() as conn:
             conn.execute(
@@ -2716,21 +4990,346 @@ class IngestionService:
         updated.pop("summary", None)
         return updated
 
+    def move_nodes(
+        self,
+        actor: dict[str, Any],
+        node_ids: list[str],
+        target_parent_id: str | None,
+        target_index: int,
+    ) -> list[dict[str, Any]]:
+        """Move same-level knowledge nodes with folder-like semantics."""
+        unique = list(dict.fromkeys(str(value) for value in node_ids if str(value)))
+        if not unique:
+            raise ValidationError("至少选择一个知识节点")
+        nodes = [self._require_node(actor, node_id) for node_id in unique]
+        first = nodes[0]
+        if any(
+            node["course_id"] != first["course_id"]
+            or node["node_scope"] != first["node_scope"]
+            or node["node_type"] != first["node_type"]
+            or node.get("material_type") != first.get("material_type")
+            or node.get("generation_id") != first.get("generation_id")
+            for node in nodes
+        ):
+            raise ValidationError("只能批量移动同一目录范围、同一层级的节点")
+
+        node_type = str(first["node_type"])
+        expected_parent_type = {
+            "chapter": None,
+            "section": "chapter",
+            "knowledge_point": "section",
+        }.get(node_type)
+        if node_type == "chapter":
+            if target_parent_id:
+                raise ValidationError("章节点只能位于知识树根目录")
+        else:
+            if not target_parent_id:
+                raise ValidationError("节或知识点必须放入对应文件夹")
+            parent = self._require_node(actor, target_parent_id)
+            if (
+                parent["course_id"] != first["course_id"]
+                or parent["node_scope"] != first["node_scope"]
+                or parent["node_type"] != expected_parent_type
+                or parent.get("material_type") != first.get("material_type")
+                or parent.get("generation_id") != first.get("generation_id")
+                or parent["status"] == "rejected"
+            ):
+                raise ValidationError("目标文件夹层级不合法")
+
+        siblings = self.db.fetch_all(
+            """SELECT * FROM knowledge_nodes WHERE course_id=? AND node_scope=?
+               AND node_type=? AND material_type=?
+               AND ((generation_id IS NULL AND ? IS NULL) OR generation_id=?)
+               AND status!='rejected'
+               AND ((parent_id IS NULL AND ? IS NULL) OR parent_id=?)
+               ORDER BY sort_order,node_id""",
+            (
+                first["course_id"], first["node_scope"], node_type,
+                first.get("material_type") or "other",
+                first.get("generation_id"), first.get("generation_id"),
+                target_parent_id, target_parent_id,
+            ),
+        )
+        moving_ids = set(unique)
+        remaining = [row for row in siblings if row["node_id"] not in moving_ids]
+        # Preserve the caller's visible tree order for a checked multi-drag.
+        moving = nodes
+        index = max(0, min(int(target_index), len(remaining)))
+        ordered = [*remaining[:index], *moving, *remaining[index:]]
+        with self.db.connect() as conn:
+            conn.executemany(
+                """UPDATE knowledge_nodes SET parent_id=?,sort_order=?,reviewed_by=?,
+                   reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=?""",
+                [
+                    (target_parent_id, (position + 1) * 10, actor["user_id"], row["node_id"])
+                    for position, row in enumerate(ordered)
+                ],
+            )
+        return [
+            self.db.fetch_one("SELECT * FROM knowledge_nodes WHERE node_id=?", (node_id,)) or {}
+            for node_id in unique
+        ]
+
+    def move_nodes_as_visible_siblings(
+        self,
+        actor: dict[str, Any],
+        node_ids: list[str],
+        target_node_id: str,
+        position: str,
+    ) -> dict[str, Any]:
+        """Promote child branches to the target's visible level.
+
+        The persisted outline keeps the strict chapter -> section -> point
+        hierarchy. When, for example, a point is dragged beside a section, an
+        empty section wrapper is inserted around the point. The compact tree
+        hides that wrapper, so the teacher sees the requested peer branches
+        without corrupting the semantic hierarchy.
+        """
+        unique = list(dict.fromkeys(str(value) for value in node_ids if str(value)))
+        if not unique:
+            raise ValidationError("至少选择一个知识节点")
+        if position not in {"before", "after"}:
+            raise ValidationError("并列移动位置只能是上方或下方")
+        nodes = [self._require_node(actor, node_id) for node_id in unique]
+        target = self._require_node(actor, str(target_node_id))
+        first = nodes[0]
+        if target["node_id"] in unique:
+            raise ValidationError("不能把节点拖到自身旁边")
+        if any(
+            node["course_id"] != first["course_id"]
+            or node["node_scope"] != first["node_scope"]
+            or node["node_type"] != first["node_type"]
+            or node.get("material_type") != first.get("material_type")
+            or node.get("generation_id") != first.get("generation_id")
+            for node in nodes
+        ):
+            raise ValidationError("只能批量提升同一目录范围、同一层级的节点")
+        if (
+            target["course_id"] != first["course_id"]
+            or target["node_scope"] != first["node_scope"]
+            or target.get("material_type") != first.get("material_type")
+            or target.get("generation_id") != first.get("generation_id")
+            or target["status"] == "rejected"
+        ):
+            raise ValidationError("目标节点必须位于同一材料分区")
+
+        type_order = ["chapter", "section", "knowledge_point"]
+        moving_rank = type_order.index(str(first["node_type"]))
+        target_rank = type_order.index(str(target["node_type"]))
+        if moving_rank <= target_rank:
+            raise ValidationError("该操作只用于把子项提升到父级旁边")
+
+        target_parent_id = target.get("parent_id")
+        siblings = self.db.fetch_all(
+            """SELECT * FROM knowledge_nodes WHERE course_id=? AND node_scope=?
+               AND node_type=? AND material_type=?
+               AND ((generation_id IS NULL AND ? IS NULL) OR generation_id=?)
+               AND status!='rejected'
+               AND ((parent_id IS NULL AND ? IS NULL) OR parent_id=?)
+               ORDER BY sort_order,node_id""",
+            (
+                first["course_id"], first["node_scope"], target["node_type"],
+                first.get("material_type") or "other",
+                first.get("generation_id"), first.get("generation_id"),
+                target_parent_id, target_parent_id,
+            ),
+        )
+        target_position = next(
+            (index for index, row in enumerate(siblings) if row["node_id"] == target["node_id"]),
+            -1,
+        )
+        if target_position < 0:
+            raise ValidationError("目标节点已不在当前目录中，请刷新后重试")
+        insert_at = target_position + (1 if position == "after" else 0)
+
+        created_node_ids: list[str] = []
+        top_wrappers: list[dict[str, Any]] = []
+        wrapper_types = type_order[target_rank:moving_rank]
+        with self.db.connect() as conn:
+            for node in nodes:
+                parent_id = target_parent_id
+                top_wrapper: dict[str, Any] | None = None
+                for wrapper_type in wrapper_types:
+                    wrapper_id = f"kn_{uuid.uuid4().hex}"
+                    fingerprint = f"manual-wrapper:{uuid.uuid4().hex}"
+                    conn.execute(
+                        """INSERT INTO knowledge_nodes(
+                               node_id,course_id,document_id,node_scope,parent_id,node_type,title,
+                               summary,markdown,keywords_json,source_pages_json,sort_order,status,
+                               analysis_job_id,reviewed_by,reviewed_at,material_type,generation_id,
+                               source_fingerprint
+                           ) VALUES(?,?,?,?,?,?,?,'','','[]','[]',?,?,?,?,CURRENT_TIMESTAMP,?,?,?)""",
+                        (
+                            wrapper_id, node["course_id"], node.get("document_id"),
+                            node["node_scope"], parent_id, wrapper_type, node["title"], 10,
+                            node["status"], node.get("analysis_job_id"), actor["user_id"],
+                            node.get("material_type") or "other", node.get("generation_id"),
+                            fingerprint,
+                        ),
+                    )
+                    created_node_ids.append(wrapper_id)
+                    if top_wrapper is None:
+                        top_wrapper = {"node_id": wrapper_id}
+                    parent_id = wrapper_id
+                conn.execute(
+                    """UPDATE knowledge_nodes SET parent_id=?,sort_order=10,reviewed_by=?,
+                       reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=?""",
+                    (parent_id, actor["user_id"], node["node_id"]),
+                )
+                if top_wrapper:
+                    top_wrappers.append(top_wrapper)
+
+            ordered = [
+                *siblings[:insert_at], *top_wrappers, *siblings[insert_at:],
+            ]
+            conn.executemany(
+                """UPDATE knowledge_nodes SET sort_order=?,reviewed_by=?,
+                   reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=?""",
+                [
+                    ((index + 1) * 10, actor["user_id"], row["node_id"])
+                    for index, row in enumerate(ordered)
+                ],
+            )
+        return {
+            "moved_node_ids": unique,
+            "created_node_ids": created_node_ids,
+            "status": "promoted",
+        }
+
+    def restore_node_positions(
+        self,
+        actor: dict[str, Any],
+        placements: list[dict[str, Any]],
+        *,
+        remove_node_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Restore a tree-position snapshot created immediately before a drag.
+
+        The client sends all nodes in the active document/material partition so
+        both the moved branch and any siblings renumbered by ``move_nodes`` are
+        restored exactly. Every parent is revalidated server-side; this is not
+        a way to bypass material, generation, or hierarchy isolation.
+        """
+        unique: dict[str, dict[str, Any]] = {}
+        for placement in placements:
+            node_id = str(placement.get("node_id") or "")
+            if node_id:
+                unique[node_id] = {
+                    "node_id": node_id,
+                    "parent_id": (
+                        str(placement["parent_id"])
+                        if placement.get("parent_id") else None
+                    ),
+                    "sort_order": max(0, int(placement.get("sort_order") or 0)),
+                }
+        if not unique:
+            raise ValidationError("没有可撤销的目录位置")
+
+        nodes = {node_id: self._require_node(actor, node_id) for node_id in unique}
+        first = next(iter(nodes.values()))
+        if any(
+            node["course_id"] != first["course_id"]
+            or node["node_scope"] != first["node_scope"]
+            or node.get("material_type") != first.get("material_type")
+            or node.get("generation_id") != first.get("generation_id")
+            for node in nodes.values()
+        ):
+            raise ValidationError("只能撤销同一目录范围、同一材料分区的调整")
+
+        expected_parent_types = {
+            "chapter": None,
+            "section": "chapter",
+            "knowledge_point": "section",
+        }
+        parents: dict[str, dict[str, Any]] = {}
+        for placement in unique.values():
+            node = nodes[placement["node_id"]]
+            node_type = str(node["node_type"])
+            expected_parent_type = expected_parent_types.get(node_type)
+            parent_id = placement["parent_id"]
+            if expected_parent_type is None:
+                if parent_id:
+                    raise ValidationError("章节点只能恢复到知识树根目录")
+                continue
+            if not parent_id:
+                raise ValidationError("节或知识点缺少原父目录，无法安全撤销")
+            parent = parents.get(parent_id)
+            if parent is None:
+                parent = self._require_node(actor, parent_id)
+                parents[parent_id] = parent
+            if (
+                parent["course_id"] != first["course_id"]
+                or parent["node_scope"] != first["node_scope"]
+                or parent["node_type"] != expected_parent_type
+                or parent.get("material_type") != first.get("material_type")
+                or parent.get("generation_id") != first.get("generation_id")
+                or parent["status"] == "rejected"
+            ):
+                raise ValidationError("原目录层级已经变化，不能直接撤销")
+
+        removable: list[dict[str, Any]] = []
+        for node_id in dict.fromkeys(str(value) for value in (remove_node_ids or []) if str(value)):
+            if node_id in unique:
+                raise ValidationError("撤销快照不能同时恢复并删除同一节点")
+            node = self._require_node(actor, node_id)
+            if (
+                node["course_id"] != first["course_id"]
+                or node["node_scope"] != first["node_scope"]
+                or node.get("material_type") != first.get("material_type")
+                or node.get("generation_id") != first.get("generation_id")
+                or not str(node.get("source_fingerprint") or "").startswith("manual-wrapper:")
+            ):
+                raise ValidationError("只能清理本次提升自动生成的空目录")
+            removable.append(node)
+
+        with self.db.connect() as conn:
+            conn.executemany(
+                """UPDATE knowledge_nodes SET parent_id=?,sort_order=?,reviewed_by=?,
+                   reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=?""",
+                [
+                    (
+                        placement["parent_id"], placement["sort_order"],
+                        actor["user_id"], placement["node_id"],
+                    )
+                    for placement in unique.values()
+                ],
+            )
+            rank = {"knowledge_point": 2, "section": 1, "chapter": 0}
+            for node in sorted(removable, key=lambda value: rank.get(str(value["node_type"]), 0), reverse=True):
+                child = conn.execute(
+                    "SELECT 1 FROM knowledge_nodes WHERE parent_id=? LIMIT 1", (node["node_id"],)
+                ).fetchone()
+                if child:
+                    raise ValidationError("自动目录已有其他内容，不能直接撤销")
+                conn.execute("DELETE FROM knowledge_nodes WHERE node_id=?", (node["node_id"],))
+        return {
+            "restored": len(unique), "removed": len(removable), "status": "restored",
+        }
+
     def merge_nodes(self, actor: dict[str, Any], node_ids: list[str], title: str) -> dict[str, Any]:
         unique = list(dict.fromkeys(node_ids))
         if len(unique) < 2:
             raise ValidationError("至少选择两个知识点进行合并")
         nodes = [self._require_node(actor, node_id) for node_id in unique]
         if any(node["node_type"] != "knowledge_point" or node["course_id"] != nodes[0]["course_id"] or
-               node["node_scope"] != nodes[0]["node_scope"] for node in nodes):
+               node["node_scope"] != nodes[0]["node_scope"] or
+               node.get("material_type") != nodes[0].get("material_type") or
+               node.get("generation_id") != nodes[0].get("generation_id") for node in nodes):
             raise ValidationError("只能合并同一目录范围内的知识点")
         target = nodes[0]
+        merged_fingerprint = self._outline_fingerprint(
+            str(target.get("material_type") or "other"), "merged", [
+                str(node.get("source_fingerprint") or node["node_id"]) for node in nodes
+            ]
+        )
         with self.db.connect() as conn:
             conn.execute(
-                """UPDATE knowledge_nodes SET title=?,summary='',markdown=?,status='draft',updated_at=CURRENT_TIMESTAMP
+                """UPDATE knowledge_nodes SET title=?,summary='',markdown=?,status='draft',
+                   source_fingerprint=?,updated_at=CURRENT_TIMESTAMP
                    WHERE node_id=?""",
                 (self._clean_title(title, target["title"]),
-                 "\n\n".join(x["markdown"] for x in nodes if x["markdown"]), target["node_id"]),
+                 "\n\n".join(x["markdown"] for x in nodes if x["markdown"]),
+                 merged_fingerprint, target["node_id"]),
             )
             for source in nodes[1:]:
                 conn.execute(
@@ -2763,12 +5362,20 @@ class IngestionService:
                 new_id = f"kn_{uuid.uuid4().hex}"
                 conn.execute(
                     """INSERT INTO knowledge_nodes(node_id,course_id,document_id,node_scope,parent_id,node_type,title,
-                       summary,markdown,keywords_json,source_pages_json,sort_order,status)
-                       VALUES(?,?,?,?,?,'knowledge_point',?,?,?,?,?,?,'draft')""",
+                       summary,markdown,keywords_json,source_pages_json,sort_order,status,
+                       material_type,generation_id,source_fingerprint)
+                       VALUES(?,?,?,?,?,'knowledge_point',?,?,?,?,?,?,'draft',?,?,?)""",
                     (new_id, node["course_id"], node["document_id"], node["node_scope"], node["parent_id"],
                      self._clean_title(part.get("title"), f"{node['title']}（{offset}）"), "",
                      str(part.get("markdown") or ""), json.dumps(part.get("keywords") or [], ensure_ascii=False),
-                     node["source_pages_json"], node["sort_order"] + offset),
+                     node["source_pages_json"], node["sort_order"] + offset,
+                     node.get("material_type") or "other", node.get("generation_id"),
+                     self._outline_fingerprint(
+                         str(node.get("material_type") or "other"), "split", [
+                             str(node.get("source_fingerprint") or node_id), str(offset),
+                             str(part.get("title") or ""), str(part.get("markdown") or ""),
+                         ],
+                     )),
                 )
                 conn.execute(
                     """INSERT INTO knowledge_node_sources(node_id,block_id,document_id,page_number,bbox_json)
@@ -2913,15 +5520,28 @@ class IngestionService:
             "failed": failed,
         }
 
-    def list_relations(self, actor: dict[str, Any], course_id: str) -> list[dict[str, Any]]:
+    def list_relations(self, actor: dict[str, Any], course_id: str, *,
+                       material_type: str | None = None) -> list[dict[str, Any]]:
         course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
         if course["owner_id"] != actor["user_id"]:
             raise PermissionDenied("无权查看知识关系")
+        if material_type is not None and material_type not in MATERIAL_TYPES:
+            raise ValidationError("资料用途类型无效")
+        condition = ""
+        params: tuple[Any, ...] = (course_id, course_id, course_id)
+        if material_type:
+            condition = " AND r.material_type=?"
+            params += (material_type,)
         return self.db.fetch_all(
             """SELECT r.*,s.title source_title,t.title target_title FROM knowledge_relations r
                JOIN knowledge_nodes s ON s.node_id=r.source_node_id JOIN knowledge_nodes t ON t.node_id=r.target_node_id
                WHERE r.course_id=? AND r.status!='rejected' AND s.status!='rejected' AND t.status!='rejected'
-               ORDER BY r.created_at""", (course_id,),
+                 AND (r.generation_id IN (SELECT generation_id FROM course_outline_generations
+                                         WHERE course_id=? AND status='current')
+                      OR (r.generation_id IS NULL AND NOT EXISTS (
+                          SELECT 1 FROM course_outline_generations WHERE course_id=? AND status='current'
+                      )))"""
+            + condition + " ORDER BY r.created_at", params,
         )
 
     def review_relation(self, actor: dict[str, Any], course_id: str, relation_id: str,
@@ -2943,17 +5563,16 @@ class IngestionService:
         course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
         if course["course_type"] != "shared_course" or course["owner_id"] != actor["user_id"]:
             raise PermissionDenied("只能检查自己的共享课程")
-        latest = self.db.fetch_one(
-            """SELECT analysis_job_id FROM semantic_analysis_jobs WHERE course_id=?
-               AND status IN ('review_required','completed') ORDER BY created_at DESC LIMIT 1""",
-            (course_id,),
+        self._ensure_partitioned_course_outline(course_id)
+        nodes = self.db.fetch_all(
+            """SELECT * FROM knowledge_nodes WHERE course_id=? AND node_scope='course'
+               AND (generation_id IN (SELECT generation_id FROM course_outline_generations
+                                      WHERE course_id=? AND status='current')
+                    OR (generation_id IS NULL AND NOT EXISTS (
+                        SELECT 1 FROM course_outline_generations WHERE course_id=? AND status='current'
+                    )))""",
+            (course_id, course_id, course_id),
         )
-        params: tuple[Any, ...] = (course_id,)
-        condition = "course_id=? AND node_scope='course'"
-        if latest:
-            condition += " AND (analysis_job_id=? OR analysis_job_id IS NULL)"
-            params += (latest["analysis_job_id"],)
-        nodes = self.db.fetch_all(f"SELECT * FROM knowledge_nodes WHERE {condition}", params)
         legacy_verified_blocks = int((self.db.fetch_one(
             """SELECT COUNT(*) n FROM document_blocks b JOIN course_documents d USING(document_id)
                WHERE d.course_id=? AND b.content_destination='knowledge'
@@ -3097,7 +5716,16 @@ class IngestionService:
             raise ValidationError(f"知识库尚未达到发布条件：{messages}")
         outline_nodes = self.db.fetch_all(
             """SELECT * FROM knowledge_nodes WHERE course_id=? AND node_scope='course'
-               ORDER BY sort_order""", (course_id,),
+               AND (generation_id IN (SELECT generation_id FROM course_outline_generations
+                                      WHERE course_id=? AND status='current')
+                    OR (generation_id IS NULL AND NOT EXISTS (
+                        SELECT 1 FROM course_outline_generations WHERE course_id=? AND status='current'
+                    )))
+               ORDER BY CASE material_type
+                   WHEN 'slides' THEN 1 WHEN 'textbook' THEN 2 WHEN 'syllabus' THEN 3
+                   WHEN 'lesson_plan' THEN 4 WHEN 'experiment' THEN 5 WHEN 'question_bank' THEN 6
+                   WHEN 'knowledge_graph' THEN 7 WHEN 'teaching_schedule' THEN 8 ELSE 9 END,
+                   sort_order""", (course_id, course_id, course_id),
         )
         approved_ids = {node["node_id"] for node in outline_nodes if node["status"] == "approved"}
         if approved_ids:
@@ -3109,10 +5737,14 @@ class IngestionService:
                     node_ids.add(parent_id)
                     parent_id = node_map[parent_id].get("parent_id")
             markdown_lines: list[str] = []
-            heading_marks = {"chapter": "#", "section": "##", "knowledge_point": "###"}
+            heading_marks = {"chapter": "##", "section": "###", "knowledge_point": "####"}
+            active_material = ""
             for node in outline_nodes:
                 if node["node_id"] not in node_ids:
                     continue
+                if node["material_type"] != active_material:
+                    active_material = str(node["material_type"])
+                    markdown_lines.append(f"\n# {MATERIAL_LABELS.get(active_material, '其他')}")
                 markdown_lines.append(f"\n{heading_marks[node['node_type']]} {node['title']}")
                 if node["node_id"] not in approved_ids:
                     continue
@@ -3133,7 +5765,13 @@ class IngestionService:
                 tuple(approved_list),
             )
             relations = self.db.fetch_all(
-                "SELECT relation_id FROM knowledge_relations WHERE course_id=? AND status='approved'", (course_id,),
+                """SELECT relation_id FROM knowledge_relations WHERE course_id=? AND status='approved'
+                   AND (generation_id IN (SELECT generation_id FROM course_outline_generations
+                                          WHERE course_id=? AND status='current')
+                        OR (generation_id IS NULL AND NOT EXISTS (
+                            SELECT 1 FROM course_outline_generations WHERE course_id=? AND status='current'
+                        )))""",
+                (course_id, course_id, course_id),
             )
             current = self.db.fetch_one("SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?", (course_id,))
             version_id = f"kv_{uuid.uuid4().hex}"

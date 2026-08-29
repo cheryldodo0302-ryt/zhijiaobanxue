@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import re
 import ssl
 from abc import ABC, abstractmethod
@@ -12,14 +13,15 @@ from urllib3.util.retry import Retry
 
 from config import get_ai_settings
 
+logger = logging.getLogger(__name__)
+
 
 class TLS12Adapter(HTTPAdapter):
-    """Use TLS 1.2 for compatibility with restrictive campus network middleboxes."""
+    """Require TLS 1.2 or newer while allowing TLS 1.3 negotiation."""
 
     def __init__(self, *args, **kwargs):
         self.ssl_context = ssl.create_default_context(cafile=certifi.where())
         self.ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        self.ssl_context.maximum_version = ssl.TLSVersion.TLSv1_2
         super().__init__(*args, **kwargs)
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
@@ -35,6 +37,35 @@ class LLMProvider(ABC):
     @abstractmethod
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         """Return plain text generated from the supplied prompts."""
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> Any:
+        raw = self.generate(system_prompt, user_prompt)
+        return json.loads(raw)
+
+
+class MockProvider(LLMProvider):
+    """Offline provider for a safe, inspectable demonstration without API keys.
+
+    It does not pretend to be a real model. The returned text is extracted from
+    the supplied course evidence, which keeps the no-network demo deterministic.
+    """
+
+    _evidence = re.compile(
+        r"(?:\[证据\s*#\d+\][^\n]*\n|来源：[^\n]*\n|<evidence[^>]*>\n)([^\n<]+)"
+    )
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        matches = [item.strip() for item in self._evidence.findall(user_prompt) if item.strip()]
+        evidence = matches[0][:320] if matches else "当前课程证据中没有可直接概括的内容"
+        if "苏格拉底式助教" in system_prompt:
+            return "先回到课程证据，找出与题目关键词最直接相关的一句话。你认为这句话说明了什么？"
+        return f"根据当前课程资料：{evidence} [证据 #1]"
+
+    def generate_json(self, system_prompt: str, user_prompt: str) -> Any:
+        # Mock mode intentionally avoids inventing semantic structures.
+        if "classifications" in system_prompt or "分类" in system_prompt:
+            return {"classifications": [], "knowledge_points": []}
+        return {}
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -57,7 +88,7 @@ class OpenAICompatibleProvider(LLMProvider):
         if not self.base_url:
             raise RuntimeError("尚未配置智能服务 Base URL")
         base_urls = [self.base_url]
-        failures = []
+        failures: list[str] = []
         response = None
         for base_url in base_urls:
             endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
@@ -77,17 +108,36 @@ class OpenAICompatibleProvider(LLMProvider):
                 break
             except (requests.exceptions.SSLError, requests.exceptions.ProxyError,
                     requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-                failures.append(f"{endpoint} -> {type(exc).__name__}: {exc}")
+                failures.append(type(exc).__name__)
+                logger.warning("LLM request failed for %s: %s", endpoint, exc)
         if response is None:
-            raise RuntimeError("无法连接智能服务，请检查网络或接口配置。详情：" + " | ".join(failures))
+            raise RuntimeError("无法连接智能服务，请检查网络、接口地址或超时设置（" + "、".join(failures) + "）")
         try:
             data = response.json()
         except ValueError as exc:
-            raise RuntimeError(f"智能服务返回了非 JSON 内容（HTTP {response.status_code}）：{response.text[:300]}") from exc
+            logger.warning("LLM returned non-JSON response, status=%s", response.status_code)
+            raise RuntimeError(f"智能服务返回格式异常（HTTP {response.status_code}）") from exc
         if response.status_code >= 400:
-            message = data.get("message") or data.get("error", {}).get("message") or str(data)
-            raise RuntimeError(f"智能服务 API 调用失败（HTTP {response.status_code}）：{message}")
+            logger.warning("LLM upstream error, status=%s", response.status_code)
+            raise RuntimeError(f"智能服务暂时不可用（HTTP {response.status_code}）")
         return data
+
+    @staticmethod
+    def _message_text(data: dict[str, Any]) -> str:
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError("智能服务 API 返回格式异常") from exc
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            text = "".join(
+                str(item.get("text", "")) for item in content
+                if isinstance(item, dict) and item.get("type") in {None, "text"}
+            ).strip()
+            if text:
+                return text
+        raise RuntimeError("智能服务 API 返回了不支持的内容格式")
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         data = self._post({
@@ -99,10 +149,7 @@ class OpenAICompatibleProvider(LLMProvider):
             "temperature": 0.2,
             "max_tokens": 3500,
         })
-        try:
-            content = data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"智能服务 API 返回格式异常：{str(data)[:300]}") from exc
+        content = self._message_text(data)
         if not content:
             raise RuntimeError("智能服务返回了空内容")
         return content
@@ -120,7 +167,7 @@ class OpenAICompatibleProvider(LLMProvider):
         }
         try:
             data = self._post(payload)
-            raw = data["choices"][0]["message"]["content"].strip()
+            raw = self._message_text(data)
         except RuntimeError as exc:
             # A few OpenAI-compatible relays do not expose response_format.
             # Fall back to ordinary generation only for that explicit API rejection.
@@ -130,8 +177,8 @@ class OpenAICompatibleProvider(LLMProvider):
             fallback_payload.pop("response_format", None)
             data = self._post(fallback_payload)
             try:
-                raw = data["choices"][0]["message"]["content"].strip()
-            except (KeyError, IndexError, TypeError) as fallback_exc:
+                raw = self._message_text(data)
+            except RuntimeError as fallback_exc:
                 raise RuntimeError("智能服务 JSON 响应格式异常") from fallback_exc
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("智能服务 JSON 响应格式异常") from exc
@@ -168,6 +215,13 @@ class QwenProvider(OpenAICompatibleProvider):
             return data["choices"][0]["message"]["content"].strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("千问 OCR 返回格式异常") from exc
+
+
+class OllamaProvider(OpenAICompatibleProvider):
+    """Ollama through its OpenAI-compatible ``/v1`` endpoint."""
+
+    def __init__(self, base_url: str, model: str, timeout: int = 90):
+        super().__init__("ollama", base_url, model, timeout=timeout)
 
 
 class GeminiProvider(OpenAICompatibleProvider):
@@ -270,6 +324,8 @@ def build_backend_provider() -> LLMProvider:
     base_url = str(settings["base_url"])
     model = str(settings["model"])
     timeout = int(settings.get("read_timeout") or 115)
+    if provider == "mock":
+        return MockProvider()
     if not settings["configured"]:
         if provider == "relay":
             raise RuntimeError("默认云端智能服务尚未部署或客户端中转配置缺失")
@@ -280,6 +336,8 @@ def build_backend_provider() -> LLMProvider:
         # Use QwenProvider here because it also implements the OpenAI-compatible
         # multimodal OCR request used by the student material workflow.
         return QwenProvider(api_key, base_url, model, timeout=timeout)
+    if provider == "ollama":
+        return OllamaProvider(base_url, model, timeout=timeout)
     if provider in {"gemini", "google", "google_gemini"}:
         return GeminiProvider(api_key, base_url, model, timeout=timeout)
     raise RuntimeError(f"后端智能体类型不受支持：{provider}")

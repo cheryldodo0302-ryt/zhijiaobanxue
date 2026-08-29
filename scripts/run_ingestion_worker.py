@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import sys
 import socket
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -11,6 +12,7 @@ from campus_service import CampusService
 from config import DB_PATH
 from database import LearningDatabase
 from ingestion_service import IngestionService
+from runtime_contract import RUNTIME_SOURCE_FINGERPRINT
 
 
 def acquire_single_worker_lock():
@@ -28,8 +30,22 @@ def acquire_single_worker_lock():
     return handle
 
 
+def serve_runtime_contract(handle: socket.socket) -> None:
+    """Expose the loaded source fingerprint on the worker lock socket."""
+    while True:
+        try:
+            connection, _address = handle.accept()
+            with connection:
+                connection.sendall(RUNTIME_SOURCE_FINGERPRINT.encode("ascii"))
+        except OSError:
+            return
+
+
 def main() -> None:
     worker_lock = acquire_single_worker_lock()
+    threading.Thread(
+        target=serve_runtime_contract, args=(worker_lock,), daemon=True
+    ).start()
     db = LearningDatabase(DB_PATH)
     service = IngestionService(db, CampusService(db))
     db.execute("UPDATE ingestion_jobs SET status='queued' WHERE status='running'")

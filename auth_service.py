@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import threading
+import time
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -22,15 +25,26 @@ class AuthService:
         self.passwords = PasswordHasher()
         self.secret = os.environ.get("ZHIJIAO_JWT_SECRET", "").strip() or self._local_secret(secret_path)
         self.issuer = "zhijiao-banxue"
-        self.document_token_minutes = max(10, int(os.environ.get("ZHIJIAO_PREVIEW_TOKEN_MINUTES", "120")))
+        self.document_token_minutes = max(1, int(os.environ.get("ZHIJIAO_PREVIEW_TOKEN_MINUTES", "5")))
+        self._login_attempts: dict[str, deque[float]] = defaultdict(deque)
+        self._login_lock = threading.Lock()
+        self.login_limit = max(3, int(os.environ.get("ZHIJIAO_LOGIN_LIMIT", "8")))
 
     def _local_secret(self, secret_path: Path | None) -> str:
         path = secret_path or self.db.db_path.parent / "auth_secret"
         if path.exists():
-            return path.read_text(encoding="utf-8").strip()
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
         value = secrets.token_urlsafe(48)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(value, encoding="utf-8")
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(value, encoding="utf-8")
+        temporary.replace(path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
         return value
 
     def create_user(self, username: str, password: str, role: str, display_name: str = "",
@@ -67,14 +81,29 @@ class AuthService:
             raise PermissionDenied("用户不存在")
         return user
 
-    def login(self, username: str, password: str) -> tuple[dict[str, Any], str, str]:
-        row = self.db.fetch_one("SELECT * FROM users WHERE username=?", (username.strip().lower(),))
+    def login(self, username: str, password: str, client_id: str = "local") -> tuple[dict[str, Any], str, str]:
+        normalized = username.strip().lower()
+        key = f"{client_id[:80]}:{normalized[:64]}"
+        now = time.monotonic()
+        with self._login_lock:
+            attempts = self._login_attempts[key]
+            while attempts and attempts[0] <= now - 300:
+                attempts.popleft()
+            if len(attempts) >= self.login_limit:
+                raise PermissionDenied("登录尝试过于频繁，请稍后再试")
+        row = self.db.fetch_one("SELECT * FROM users WHERE username=?", (normalized,))
         if not row or row["status"] != "active":
+            with self._login_lock:
+                self._login_attempts[key].append(now)
             raise PermissionDenied("用户名或密码错误")
         try:
             self.passwords.verify(row["password_hash"], password)
         except VerifyMismatchError as exc:
+            with self._login_lock:
+                self._login_attempts[key].append(now)
             raise PermissionDenied("用户名或密码错误") from exc
+        with self._login_lock:
+            self._login_attempts.pop(key, None)
         user = self.get_user(row["user_id"])
         return user, self._access_token(user), self._refresh_token(user)
 
@@ -110,7 +139,10 @@ class AuthService:
         return payload
 
     def authenticate(self, token: str) -> dict[str, Any]:
-        return self.get_user(str(self.decode(token)["sub"]))
+        user = self.get_user(str(self.decode(token)["sub"]))
+        if user.get("status") != "active":
+            raise PermissionDenied("账号已停用")
+        return user
 
     def issue_document_token(self, user: dict[str, Any], document_id: str) -> str:
         now = datetime.now(timezone.utc)
@@ -128,7 +160,10 @@ class AuthService:
         payload = self.decode(token, "document_source")
         if payload.get("document_id") != document_id:
             raise PermissionDenied("资料预览令牌与文件不匹配")
-        return self.get_user(str(payload["sub"]))
+        user = self.get_user(str(payload["sub"]))
+        if user.get("status") != "active":
+            raise PermissionDenied("账号已停用")
+        return user
 
     def refresh(self, token: str) -> tuple[dict[str, Any], str, str]:
         payload = self.decode(token, "refresh")
@@ -141,6 +176,8 @@ class AuthService:
             raise PermissionDenied("刷新令牌已失效")
         self.db.execute("UPDATE refresh_tokens SET revoked_at=CURRENT_TIMESTAMP WHERE token_id=?", (payload["jti"],))
         user = self.get_user(str(payload["sub"]))
+        if user.get("status") != "active":
+            raise PermissionDenied("账号已停用")
         return user, self._access_token(user), self._refresh_token(user)
 
     def change_password(self, user: dict[str, Any], old_password: str,

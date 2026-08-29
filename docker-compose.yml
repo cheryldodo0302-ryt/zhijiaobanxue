@@ -1,0 +1,65 @@
+x-zhijiao-environment: &zhijiao-environment
+  ZHIJIAO_AI_MODE: ${ZHIJIAO_AI_MODE:-mock}
+  ZHIJIAO_DATA_DIR: /app/data
+  ZHIJIAO_AI_READ_TIMEOUT: ${ZHIJIAO_AI_READ_TIMEOUT:-115}
+  ZHIJIAO_CUSTOM_PROVIDER: ${ZHIJIAO_CUSTOM_PROVIDER:-}
+  ZHIJIAO_CUSTOM_BASE_URL: ${ZHIJIAO_CUSTOM_BASE_URL:-}
+  ZHIJIAO_CUSTOM_API_KEY: ${ZHIJIAO_CUSTOM_API_KEY:-}
+  ZHIJIAO_CUSTOM_MODEL: ${ZHIJIAO_CUSTOM_MODEL:-}
+  ZHIJIAO_RELAY_URL: ${ZHIJIAO_RELAY_URL:-}
+  ZHIJIAO_RELAY_TOKEN: ${ZHIJIAO_RELAY_TOKEN:-}
+  ZHIJIAO_MAX_UPLOAD_MB: ${ZHIJIAO_MAX_UPLOAD_MB:-500}
+  ZHIJIAO_TEACHER_AGENT_ENABLED: ${ZHIJIAO_TEACHER_AGENT_ENABLED:-1}
+  ZHIJIAO_JWT_SECRET: ${ZHIJIAO_JWT_SECRET:-}
+  ZHIJIAO_MINERU_URL: ${ZHIJIAO_MINERU_URL:-}
+  ZHIJIAO_MINERU_TOKEN: ${ZHIJIAO_MINERU_TOKEN:-}
+  ZHIJIAO_FORMULA_URL: ${ZHIJIAO_FORMULA_URL:-}
+  ZHIJIAO_FORMULA_TOKEN: ${ZHIJIAO_FORMULA_TOKEN:-}
+
+services:
+  api:
+    build:
+      context: .
+      args:
+        PYTHON_VERSION: ${ZHIJIAO_DOCKER_PYTHON_VERSION:-3.11}
+    command: ["sh", "-c", "python scripts/bootstrap_demo.py --if-empty && python -m uvicorn api:app --host 0.0.0.0 --port 8000"]
+    environment:
+      <<: *zhijiao-environment
+      ZHIJIAO_ALLOWED_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      ZHIJIAO_STUDENT_DEFAULT_PASSWORD: ${ZHIJIAO_STUDENT_DEFAULT_PASSWORD:-}
+    volumes:
+      - zhijiao_data:/app/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      args:
+        PYTHON_VERSION: ${ZHIJIAO_DOCKER_PYTHON_VERSION:-3.11}
+    command: ["python", "scripts/run_ingestion_worker.py"]
+    environment: *zhijiao-environment
+    volumes:
+      - zhijiao_data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    ports:
+      - "5173:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  zhijiao_data:

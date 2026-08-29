@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: fallback_skill
+summary: 为无证据、超时、断网和模型不可用返回统一可理解提示。
+roles: [student, teacher]
+input_schema: skills.fallback_skill.service.FallbackInput
+output_schema: skills.contracts.DictOutput

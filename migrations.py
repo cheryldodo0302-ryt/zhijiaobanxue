@@ -548,6 +548,274 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
            AND replace(lower(options_json),' ','') LIKE '%"text":"n"%';
         """,
     ),
+    (
+        "013_adaptive_pdf_ingestion",
+        """
+        ALTER TABLE ingestion_jobs ADD COLUMN pipeline_stage TEXT NOT NULL DEFAULT 'queued';
+        ALTER TABLE ingestion_jobs ADD COLUMN manifest_path TEXT NOT NULL DEFAULT '';
+        ALTER TABLE ingestion_jobs ADD COLUMN batch_size INTEGER NOT NULL DEFAULT 40;
+        ALTER TABLE ingestion_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+
+        CREATE TABLE IF NOT EXISTS document_batches (
+            batch_id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            batch_number INTEGER NOT NULL,
+            original_page_start INTEGER NOT NULL,
+            original_page_end INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING'
+                CHECK(status IN ('PENDING','PROCESSING','PARSED_OK','PARSED_PARTIAL','TEXT_ONLY','SUSPECT','FAILED')),
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            completed_pages INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT NOT NULL DEFAULT '',
+            artifact_path TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(document_id) REFERENCES course_documents(document_id) ON DELETE CASCADE,
+            UNIQUE(document_id,batch_number)
+        );
+        CREATE INDEX IF NOT EXISTS idx_document_batches_document
+            ON document_batches(document_id,batch_number,status);
+
+        ALTER TABLE document_pages ADD COLUMN page_index INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN batch_number INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE document_pages ADD COLUMN page_type TEXT NOT NULL DEFAULT 'UNKNOWN';
+        ALTER TABLE document_pages ADD COLUMN parse_level TEXT NOT NULL DEFAULT 'NORMAL';
+        ALTER TABLE document_pages ADD COLUMN native_text_chars INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN text_chars INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN parsed_text_chars INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN block_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN equation_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN table_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN image_count INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN image_area_ratio REAL NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN include_as_navigation INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_pages ADD COLUMN include_as_knowledge INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE document_pages ADD COLUMN validation_issues_json TEXT NOT NULL DEFAULT '[]';
+        UPDATE document_pages SET page_index=page_number-1 WHERE page_number>0;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_document_pages_global
+            ON document_pages(document_id,page_index);
+
+        ALTER TABLE document_blocks ADD COLUMN page_index INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_blocks ADD COLUMN page_type TEXT NOT NULL DEFAULT 'UNKNOWN';
+        ALTER TABLE document_blocks ADD COLUMN parse_level TEXT NOT NULL DEFAULT 'NORMAL';
+        ALTER TABLE document_blocks ADD COLUMN chapter_path_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE document_blocks ADD COLUMN include_as_navigation INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE document_blocks ADD COLUMN include_as_knowledge INTEGER NOT NULL DEFAULT 1;
+        UPDATE document_blocks SET page_index=page_number-1 WHERE page_number>0;
+        """,
+    ),
+    (
+        "014_knowledge_boundaries_and_fast_inspection",
+        """
+        ALTER TABLE document_blocks ADD COLUMN region_type TEXT NOT NULL DEFAULT 'knowledge';
+        ALTER TABLE document_blocks ADD COLUMN region_confidence REAL NOT NULL DEFAULT 0.45;
+        ALTER TABLE document_blocks ADD COLUMN region_reason TEXT NOT NULL DEFAULT '';
+        ALTER TABLE document_blocks ADD COLUMN parent_region_block_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE document_blocks ADD COLUMN knowledge_candidate INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS idx_document_blocks_region
+            ON document_blocks(document_id,region_type,include_as_knowledge,block_order);
+
+        CREATE TABLE IF NOT EXISTS document_structures (
+            document_id TEXT PRIMARY KEY,
+            outline_json TEXT NOT NULL DEFAULT '[]',
+            toc_entries_json TEXT NOT NULL DEFAULT '[]',
+            warnings_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','warning','failed')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(document_id) REFERENCES course_documents(document_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_candidates (
+            candidate_id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            knowledge_type TEXT NOT NULL DEFAULT 'concept',
+            source_block_ids_json TEXT NOT NULL DEFAULT '[]',
+            page_start INTEGER,
+            page_end INTEGER,
+            bbox_json TEXT NOT NULL DEFAULT '[]',
+            markdown_content TEXT NOT NULL DEFAULT '',
+            teacher_revision TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0,
+            region_type TEXT NOT NULL DEFAULT 'knowledge',
+            review_status TEXT NOT NULL DEFAULT 'PENDING'
+                CHECK(review_status IN ('PENDING','NEEDS_REVIEW','APPROVED','MODIFIED','REJECTED')),
+            reviewed_by TEXT,
+            reviewed_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+            FOREIGN KEY(document_id) REFERENCES course_documents(document_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_document
+            ON knowledge_candidates(document_id,review_status,created_at);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_candidates_course
+            ON knowledge_candidates(course_id,review_status,updated_at);
+
+        CREATE TABLE IF NOT EXISTS knowledge_candidate_blocks (
+            candidate_id TEXT NOT NULL,
+            block_id TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(candidate_id,block_id),
+            FOREIGN KEY(candidate_id) REFERENCES knowledge_candidates(candidate_id) ON DELETE CASCADE,
+            FOREIGN KEY(block_id) REFERENCES document_blocks(block_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS presentation_slides (
+            document_id TEXT NOT NULL,
+            slide_index INTEGER NOT NULL,
+            slide_type TEXT NOT NULL DEFAULT 'SIMPLE_CONTENT',
+            parse_level TEXT NOT NULL DEFAULT 'FAST',
+            title TEXT NOT NULL DEFAULT '',
+            shape_count INTEGER NOT NULL DEFAULT 0,
+            text_count INTEGER NOT NULL DEFAULT 0,
+            picture_count INTEGER NOT NULL DEFAULT 0,
+            reading_order_json TEXT NOT NULL DEFAULT '[]',
+            shapes_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(document_id,slide_index),
+            FOREIGN KEY(document_id) REFERENCES course_documents(document_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_presentation_slides_document
+            ON presentation_slides(document_id,slide_index);
+        """,
+    ),
+    (
+        "015_knowledge_paths_and_ppt_regions",
+        """
+        ALTER TABLE knowledge_candidates ADD COLUMN chapter_path_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE presentation_slides ADD COLUMN layout_kind TEXT NOT NULL DEFAULT 'single_column';
+        ALTER TABLE presentation_slides ADD COLUMN regions_json TEXT NOT NULL DEFAULT '[]';
+        """,
+    ),
+    (
+        "016_teacher_ai_settings",
+        """
+        CREATE TABLE IF NOT EXISTS teacher_ai_settings (
+            teacher_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT 'openai_compatible'
+                CHECK(provider IN ('openai_compatible','gemini')),
+            base_url TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            api_key_encrypted TEXT NOT NULL DEFAULT '',
+            verification_status TEXT NOT NULL DEFAULT 'untested'
+                CHECK(verification_status IN ('untested','connected','failed')),
+            verification_message TEXT NOT NULL DEFAULT '',
+            verified_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(teacher_id) REFERENCES users(user_id) ON DELETE CASCADE
+        );
+        """,
+    ),
+    (
+        "017_material_partitioned_course_outlines",
+        """
+        ALTER TABLE knowledge_nodes ADD COLUMN material_type TEXT NOT NULL DEFAULT 'other'
+            CHECK(material_type IN (
+                'syllabus','lesson_plan','slides','textbook','experiment',
+                'question_bank','knowledge_graph','teaching_schedule','other'
+            ));
+        ALTER TABLE knowledge_nodes ADD COLUMN generation_id TEXT;
+        ALTER TABLE knowledge_nodes ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT '';
+
+        ALTER TABLE knowledge_relations ADD COLUMN material_type TEXT NOT NULL DEFAULT 'other'
+            CHECK(material_type IN (
+                'syllabus','lesson_plan','slides','textbook','experiment',
+                'question_bank','knowledge_graph','teaching_schedule','other'
+            ));
+        ALTER TABLE knowledge_relations ADD COLUMN generation_id TEXT;
+
+        CREATE TABLE IF NOT EXISTS course_outline_generations (
+            generation_id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL,
+            material_type TEXT NOT NULL
+                CHECK(material_type IN (
+                    'syllabus','lesson_plan','slides','textbook','experiment',
+                    'question_bank','knowledge_graph','teaching_schedule','other'
+                )),
+            analysis_job_id TEXT,
+            status TEXT NOT NULL DEFAULT 'building'
+                CHECK(status IN ('building','current','superseded','failed')),
+            fallback_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+            FOREIGN KEY(analysis_job_id) REFERENCES semantic_analysis_jobs(analysis_job_id) ON DELETE SET NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_course_outline_generation_current
+            ON course_outline_generations(course_id,material_type) WHERE status='current';
+        CREATE INDEX IF NOT EXISTS idx_course_outline_generation_course
+            ON course_outline_generations(course_id,status,material_type);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_nodes_partition
+            ON knowledge_nodes(course_id,node_scope,material_type,generation_id,sort_order);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_relations_partition
+            ON knowledge_relations(course_id,material_type,generation_id,status);
+
+        UPDATE knowledge_nodes
+           SET material_type=COALESCE((
+               SELECT m.material_type FROM document_material_metadata m
+               WHERE m.document_id=knowledge_nodes.document_id
+           ),'other')
+         WHERE node_scope='document';
+        """,
+    ),
+    (
+        "018_guided_qa_sessions",
+        """
+        CREATE TABLE IF NOT EXISTS guided_qa_sessions (
+            session_id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            question TEXT NOT NULL,
+            phase TEXT NOT NULL DEFAULT 'initial',
+            turn_count INTEGER NOT NULL DEFAULT 0,
+            evidence_json TEXT NOT NULL DEFAULT '[]',
+            history_json TEXT NOT NULL DEFAULT '[]',
+            retrieval_scope TEXT NOT NULL DEFAULT 'all',
+            material_type TEXT,
+            status TEXT NOT NULL DEFAULT 'active'
+                CHECK(status IN ('active','revealed','closed')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_guided_qa_owner
+            ON guided_qa_sessions(user_id,course_id,status,updated_at);
+        """,
+    ),
+    (
+        "019_teacher_ai_provider_expansion",
+        """
+        CREATE TABLE teacher_ai_settings_v2 (
+            teacher_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT 'openai_compatible'
+                CHECK(provider IN ('openai_compatible','gemini','ollama')),
+            base_url TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            api_key_encrypted TEXT NOT NULL DEFAULT '',
+            verification_status TEXT NOT NULL DEFAULT 'untested'
+                CHECK(verification_status IN ('untested','connected','failed')),
+            verification_message TEXT NOT NULL DEFAULT '',
+            verified_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(teacher_id) REFERENCES users(user_id) ON DELETE CASCADE
+        );
+        INSERT INTO teacher_ai_settings_v2(
+            teacher_id,provider,base_url,model,api_key_encrypted,
+            verification_status,verification_message,verified_at,created_at,updated_at
+        )
+        SELECT teacher_id,provider,base_url,model,api_key_encrypted,
+               verification_status,verification_message,verified_at,created_at,updated_at
+          FROM teacher_ai_settings;
+        DROP TABLE teacher_ai_settings;
+        ALTER TABLE teacher_ai_settings_v2 RENAME TO teacher_ai_settings;
+        """,
+    ),
 )
 
 

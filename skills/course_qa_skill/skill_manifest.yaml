@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: course_qa_skill
+summary: 基于课程证据进行服务端状态管理的引导式问答。
+roles: [student]
+input_schema: skills.course_qa_skill.service.CourseQAInput
+output_schema: skills.contracts.DictOutput

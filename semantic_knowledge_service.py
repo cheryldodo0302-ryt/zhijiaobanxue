@@ -35,6 +35,26 @@ class SemanticKnowledgeService:
         ):
             raise ValidationError("AI Provider 不可用，知识树分析尚未发起任何 API 调用")
 
+    @staticmethod
+    def _source_meta(row: dict[str, Any]) -> dict[str, Any]:
+        raw = row.get("raw")
+        if not isinstance(raw, dict):
+            try:
+                raw = json.loads(row.get("raw_payload_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                raw = {}
+        if not isinstance(raw, dict) or str(raw.get("source_kind") or "").lower() != "pptx":
+            return {}
+        return {
+            "source_kind": "pptx",
+            "slide_number": raw.get("ppt_slide_number") or row.get("page_number"),
+            "slide_title": raw.get("ppt_slide_title") or "",
+            "is_slide_title": bool(raw.get("is_slide_title_block")),
+            "title_number": raw.get("ppt_title_number") or "",
+            "title_level_hint": raw.get("ppt_title_level_hint") or 0,
+            "ambiguous_numbering": bool(raw.get("ppt_title_number_ambiguous")),
+        }
+
     def _generate_json(self, system: str, prompt: str, on_call: Callable[[], None] | None = None) -> Any:
         errors: list[str] = []
         for attempt in range(3):
@@ -108,8 +128,12 @@ class SemanticKnowledgeService:
         compact = [{
             "block_id": row["block_id"], "type": row["block_type"], "page": row["page_number"],
             "order": row["block_order"], "content": (row["markdown"] or row["latex"] or row["plain_text"])[:2800],
+            **self._source_meta(row),
         } for row in blocks]
-        previous = [{"page": x["page_number"], "content": (x["markdown"] or x["plain_text"])[:500]} for x in context[-3:]]
+        previous = [{
+            "page": x["page_number"], "content": (x["markdown"] or x["plain_text"])[:500],
+            **self._source_meta(x),
+        } for x in context[-3:]]
         prompt = {
             "previous_context": previous,
             "blocks": compact,
@@ -124,6 +148,12 @@ class SemanticKnowledgeService:
         result = self._generate_json(
             "你是教师课程知识库结构分析器。输入是已经完成 OCR/原生解析并落库的 Markdown/公式块，不要重新 OCR。"
             "先区分知识正文、题目答案和装饰内容，再把知识正文组织为章节、分节和可独立学习的知识点。"
+            "对于 PPTX，is_slide_title=true 的标题栏是知识边界；连续相同 slide_title 必须归入同一知识点，"
+            "不同标题不得混入同一知识点，且知识点顺序必须严格按 slide_number 递增。"
+            "标题序列如 1.2 后接 1.3 时必须保持同级和原顺序；孤立的 3 或 3. 可能是章标题、当前 1.3 下的子标题或第三条，"
+            "必须结合前后 slide_title 与正文判断，不能只按数字位数升级为章。"
+            "原文有 x.x 二级标题时，其下 x.x.x 标题和正文必须并为一个知识点，不得再拆分。"
+            "章节编号必须按教材出现顺序单调前进；正文中的‘2.1节提出’‘见3.2节’等章节引用不是标题，禁止据此新建知识点。"
             "原文没有标题时可以按语义补充简洁标题；knowledge_points 的 block_ids 必须来自输入且只引用支撑该知识点的原文。"
             "不要生成摘要或知识正文。每个知识点必须给出来源 block_id 和至少一段可在来源块逐字找到的 evidence_quote。"
             "每个输入 block_id 最多分类一次；无法可靠判断的块必须标记为 unclassified。"
@@ -142,19 +172,43 @@ class SemanticKnowledgeService:
             points = []
         if not isinstance(points, list):
             raise ValidationError("AI 响应中的 knowledge_points 必须是数组")
-        expected_ids = {str(row["block_id"]) for row in blocks}
-        returned_ids = {
-            str(item.get("block_id") or "") for item in classifications if isinstance(item, dict)
-        }
-        for block_id in expected_ids - returned_ids:
-            classifications.append({
+        expected_order = [str(row["block_id"]) for row in blocks]
+        expected_ids = set(expected_order)
+        normalized: dict[str, dict[str, Any]] = {}
+        valid_destinations = {"knowledge", "question_bank", "excluded", "unclassified"}
+        for item in classifications:
+            if not isinstance(item, dict):
+                continue
+            block_id = str(item.get("block_id") or "")
+            if block_id not in expected_ids or block_id in normalized:
+                continue
+            destination = str(item.get("destination") or "unclassified")
+            if destination not in valid_destinations:
+                destination = "unclassified"
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            normalized[block_id] = {
+                "block_id": block_id,
+                "destination": destination,
+                "semantic_role": str(item.get("semantic_role") or "teacher_review")[:64],
+                "question_group_key": str(item.get("question_group_key") or "")[:100],
+                "confidence": confidence,
+                "reason": str(item.get("reason") or "AI 未提供分类理由")[:500],
+            }
+        for block_id in expected_order:
+            if block_id in normalized:
+                continue
+            normalized[block_id] = {
                 "block_id": block_id,
                 "destination": "unclassified",
                 "semantic_role": "ai_omitted_teacher_review",
                 "question_group_key": "",
                 "confidence": 0.0,
                 "reason": "AI 未返回该块；保留原文并交由教师复核",
-            })
+            }
+        classifications = [normalized[block_id] for block_id in expected_order]
         clean_points: list[dict[str, Any]] = []
         used_ids: set[str] = set()
         block_map = {str(row["block_id"]): row for row in blocks}
@@ -188,7 +242,56 @@ class SemanticKnowledgeService:
                 "evidence_quotes": evidence,
             })
         result["knowledge_points"] = clean_points
+        result["classifications"] = classifications
         return result
+
+    def resolve_presentation_outline(
+        self, groups: list[dict[str, Any]], *,
+        on_call: Callable[[], None] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve PPT title hierarchy without allowing the model to regroup it."""
+        payload_groups = [{
+            "group_id": row["point_key"], "source_order": index + 1,
+            "title": row["title"], "pages": row.get("pages", []),
+            "number": row.get("title_number", ""),
+            "local_level_hint": row.get("title_level_hint", 2),
+            "ambiguous_numbering": bool(row.get("ambiguous_numbering")),
+            "evidence_excerpt": str(row.get("evidence_excerpt") or "")[:600],
+        } for index, row in enumerate(groups)]
+        result = self._generate_json(
+            "你是 PPT 课程标题层级判定器。标题分组和幻灯片顺序已经由程序锁定，你只能判定层级，"
+            "不得合并、拆分、遗漏、重命名或重排 group。1.2 后接 1.3 通常为同级；"
+            "孤立的 3/3. 必须结合前后标题和 evidence_excerpt 判断：若是第三条或当前 1.3 的展开，保留在当前节；"
+            "只有标题语义与后续 3.1/3.2 等序列共同支持时才提升为第3章。只返回合法 JSON。",
+            json.dumps({
+                "presentation_groups": payload_groups,
+                "required_output": {"outline": [{
+                    "group_id": "", "hierarchy_level": "chapter|section|point",
+                    "chapter": "", "section": "", "reason": "",
+                }]},
+            }, ensure_ascii=False),
+            on_call,
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("outline"), list):
+            raise ValidationError("PPT 标题层级分析响应缺少 outline 数组")
+        items = [item for item in result["outline"] if isinstance(item, dict)]
+        expected = [str(row["point_key"]) for row in groups]
+        returned = [str(item.get("group_id") or "") for item in items]
+        if returned != expected:
+            raise ValidationError("PPT 标题层级分析改变了标题分组或幻灯片顺序")
+        resolved: list[dict[str, Any]] = []
+        for source, item in zip(groups, items):
+            level = str(item.get("hierarchy_level") or "point")
+            if level not in {"chapter", "section", "point"}:
+                level = "point"
+            resolved.append({
+                **source,
+                "chapter": str(item.get("chapter") or source.get("chapter") or "PPT 课程结构").strip()[:180],
+                "section": str(item.get("section") or source.get("section") or "PPT 标题序列").strip()[:180],
+                "hierarchy_level": level,
+                "hierarchy_reason": str(item.get("reason") or "")[:240],
+            })
+        return resolved
 
     def reduce_document_outline(self, candidates: list[dict[str, Any]], *,
                                 on_call: Callable[[], None] | None = None) -> dict[str, Any]:
@@ -198,10 +301,12 @@ class SemanticKnowledgeService:
             "candidate_id": row["candidate_id"], "chapter": row["chapter"],
             "section": row["section"], "title": row["title"],
             "keywords": row.get("keywords", []), "pages": row.get("pages", []),
-        } for row in candidates]
+            "source_order": index + 1,
+        } for index, row in enumerate(candidates)]
         result = self._generate_json(
             "你是课程文档目录归并器。将分批候选合并为整篇文档的章节、分节和知识点。"
             "可以调整标题和层级、合并同义候选，但不得生成摘要或正文，不得引用不存在的 candidate_id。"
+            "输出点必须按其最早 source_order 升序，禁止改变教材或幻灯片的原始先后顺序。"
             "只返回合法 JSON。",
             json.dumps({
                 "candidates": compact,
@@ -229,6 +334,7 @@ class SemanticKnowledgeService:
             sources = [candidate_map[value] for value in source_candidate_ids]
             points.append({
                 "point_key": str(item.get("point_key") or f"reduced-{index + 1}"),
+                "source_candidate_ids": source_candidate_ids,
                 "chapter": str(item.get("chapter") or sources[0]["chapter"]).strip()[:180],
                 "section": str(item.get("section") or sources[0]["section"]).strip()[:180],
                 "title": str(item.get("title") or sources[0]["title"]).strip()[:180],
@@ -247,16 +353,26 @@ class SemanticKnowledgeService:
             raise ValidationError(f"文档目录归并遗漏候选：{', '.join(missing[:5])}")
         if not points:
             raise ValidationError("AI 未生成整篇文档目录")
+        position = {row["candidate_id"]: index for index, row in enumerate(candidates)}
+        points.sort(key=lambda point: min(
+            position.get(source_id, len(position))
+            for source_id in point.get("source_candidate_ids", [])
+        ) if point.get("source_candidate_ids") else len(position))
         return {"knowledge_points": points}
 
     def unify_course_outline(self, points: list[dict[str, Any]], *, on_call: Callable[[], None] | None = None) -> dict[str, Any]:
         payload = [{
             "source_node_id": row["node_id"], "document_id": row["document_id"],
+            "material_type": row.get("material_type", "other"),
             "chapter": row.get("chapter_title", ""), "section": row.get("section_title", ""),
             "title": row["title"], "keywords": row.get("keywords", []),
-        } for row in points]
+            "source_order": index + 1,
+        } for index, row in enumerate(points)]
         result = self._generate_json(
-            "你是课程知识架构师。合并多份资料为统一目录；同义知识点可合并，同名异义必须分开。分析并列、前置、后续、相关、易混淆关系。只返回合法JSON。",
+            "你是课程知识架构师。输入只属于同一种材料用途；只能在该材料分区内合并多份资料，"
+            "不得跨材料类型归并。同义知识点可合并，同名异义必须分开。"
+            "所有输出知识点必须按其最早 source_order 升序，不能把 1.3 排到 1.2 前。"
+            "分析并列、前置、后续、相关、易混淆关系。只返回合法JSON。",
             json.dumps({
                 "source_points": payload,
                 "required_output": {
@@ -267,6 +383,18 @@ class SemanticKnowledgeService:
         )
         if not isinstance(result, dict):
             raise ValidationError("课程目录合并必须返回 JSON 对象")
+        suggestions = result.get("points")
+        if not isinstance(suggestions, list):
+            raise ValidationError("课程目录合并响应缺少 points 数组")
+        expected_ids = {str(row["node_id"]) for row in points}
+        returned_ids = {
+            str(value)
+            for item in suggestions if isinstance(item, dict)
+            for value in item.get("source_node_ids", [])
+            if str(value) in expected_ids
+        }
+        if returned_ids != expected_ids:
+            raise ValidationError("课程目录归并遗漏来源知识点")
         return result
 
     def analyze_relations(self, nodes: list[dict[str, Any]], *,
