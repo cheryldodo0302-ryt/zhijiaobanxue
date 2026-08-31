@@ -52,7 +52,6 @@ server.env.*
 !server.env.example
 user_ai.env
 relay_client.env
-.streamlit/secrets.toml
 *.pem
 *.key
 
