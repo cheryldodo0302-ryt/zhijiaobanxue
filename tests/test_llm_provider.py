@@ -28,7 +28,7 @@ def test_openai_json_generation_requests_structured_output_and_accepts_trailing_
     assert provider.generate_json("system", "user") == {"classifications": []}
     payload = provider.session.post.call_args.kwargs["json"]
     assert payload["response_format"] == {"type": "json_object"}
-    assert payload["max_tokens"] == 4000
+    assert payload["max_tokens"] == 6000
 
 
 def test_gemini_root_url_uses_native_payload_and_header():

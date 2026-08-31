@@ -162,7 +162,10 @@ class OpenAICompatibleProvider(LLMProvider):
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 4000,
+            # Evidence-map responses contain one classification per source
+            # block in addition to the reduced knowledge points. Four thousand
+            # tokens was routinely exhausted by ordinary syllabi.
+            "max_tokens": 6000,
             "response_format": {"type": "json_object"},
         }
         try:

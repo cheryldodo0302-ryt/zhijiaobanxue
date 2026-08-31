@@ -13,6 +13,8 @@ const folderFilter = ref('all')
 const importFolderId = ref('')
 const selectedItems = ref<any[]>([])
 const moveTargetFolder = ref('')
+const draggingIds = ref<string[]>([])
+const dragOverFolder = ref('')
 const newFolderName = ref('')
 const newFolderType = ref('homework')
 const imports = ref<any[]>([])
@@ -22,6 +24,7 @@ const statusFilter = ref('all')
 const loading = ref(false)
 const uploading = ref(false)
 const uploadFile = ref<File | null>(null)
+const folderFiles = ref<File[]>([])
 const aiMode = ref('auto')
 const useOwnApi = ref(false)
 const aiProvider = ref('openai_compatible')
@@ -49,6 +52,12 @@ const summary = computed(() => ({
   approved: items.value.filter(item => item.status === 'approved').length,
   rejected: items.value.filter(item => item.status === 'rejected').length,
 }))
+const folderGroups = computed(() => ([
+  { type: 'exam', title: '试卷', subtitle: '阶段测验与正式考试', folders: folders.value.filter(folder => folder.folder_type === 'exam') },
+  { type: 'homework', title: '作业', subtitle: '课后作业与提交任务', folders: folders.value.filter(folder => folder.folder_type === 'homework') },
+  { type: 'chapter', title: '章节练习', subtitle: '按章节组织的练习集', folders: folders.value.filter(folder => !['exam','homework'].includes(folder.folder_type)) },
+]))
+const allVisibleSelected = computed(() => filteredItems.value.length > 0 && filteredItems.value.every(item => selectedItems.value.some(value => value.item_id === item.item_id)))
 
 async function loadBase() {
   loading.value = true
@@ -94,6 +103,52 @@ async function changeCourse(switched = false) {
   } catch (error) { fail(error, '题库加载失败') } finally { loading.value = false }
 }
 function chooseUpload(file: any) { uploadFile.value = file.raw }
+function chooseFolderUpload(event: Event) {
+  const input = event.target as HTMLInputElement
+  folderFiles.value = Array.from(input.files || []).filter(file => /\.xlsx?$/i.test(file.name))
+  if (!folderFiles.value.length) ElMessage.warning('所选目录中没有 XLS 或 XLSX 题库')
+}
+async function ensureFolderPath(path: string) {
+  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean).slice(0, -1)
+  let parentId: string | null = null
+  let currentPath = ''
+  for (const part of parts) {
+    currentPath = currentPath ? `${currentPath}/${part}` : part
+    let folder = folders.value.find(item => item.relative_path === currentPath)
+    if (!folder) {
+      folder = (await api.post(`/teacher/courses/${courseId.value}/question-folders`, {
+        folder_name: part, folder_type: 'chapter', parent_folder_id: parentId, relative_path: currentPath,
+      })).data
+      folders.value.push(folder)
+    }
+    parentId = folder.folder_id
+  }
+  return parentId
+}
+async function importFolderPackage() {
+  if (!courseId.value || !folderFiles.value.length) return
+  uploading.value = true
+  let accepted = 0
+  let failed = 0
+  try {
+    for (const file of folderFiles.value) {
+      try {
+        const relativePath = (file as any).webkitRelativePath || file.name
+        const targetFolder = await ensureFolderPath(relativePath)
+        const form = new FormData()
+        form.append('file', file)
+        form.append('ai_mode', 'local')
+        if (targetFolder) form.append('folder_id', targetFolder)
+        await api.post(`/teacher/courses/${courseId.value}/question-bank/import`, form, { timeout: 120000 })
+        accepted++
+      } catch { failed++ }
+    }
+    folderFiles.value = []
+    if (failed) ElMessage.warning(`已本地导入 ${accepted} 个题库，${failed} 个文件需要单独检查`)
+    else ElMessage.success(`整包 ${accepted} 个题库已导入，父子目录已保留`)
+    await changeCourse()
+  } finally { uploading.value = false }
+}
 async function importWorkbook() {
   if (!courseId.value) return ElMessage.warning('请先选择课程；如果没有课程，请先在教学管理中创建共享课程')
   if (!uploadFile.value) return ElMessage.warning('请先选择 XLS 或 XLSX 题库文件')
@@ -136,17 +191,36 @@ async function createFolder() {
     await changeCourse()
   } catch (error) { fail(error, '创建文件夹失败') }
 }
-async function moveSelected() {
-  if (!selectedItems.value.length) return ElMessage.warning('请先勾选题目')
+async function moveItems(itemIds: string[], folderId: string | null) {
+  if (!itemIds.length) return ElMessage.warning('请先选择题目')
   try {
     await api.post(`/teacher/courses/${courseId.value}/question-bank/move`, {
-      item_ids: selectedItems.value.map(item => item.item_id),
-      folder_id: moveTargetFolder.value || null,
+      item_ids: itemIds,
+      folder_id: folderId,
     })
-    ElMessage.success(`已移动 ${selectedItems.value.length} 道题`)
+    ElMessage.success(`已整理 ${itemIds.length} 道题`)
     selectedItems.value = []
     await changeCourse()
   } catch (error) { fail(error, '移动题目失败') }
+}
+async function moveSelected() {
+  await moveItems(selectedItems.value.map(item => item.item_id), moveTargetFolder.value || null)
+}
+function startQuestionDrag(item: any, event: DragEvent) {
+  const selectedIds = selectedItems.value.map(value => value.item_id)
+  draggingIds.value = selectedIds.includes(item.item_id) ? selectedIds : [item.item_id]
+  event.dataTransfer?.setData('text/plain', draggingIds.value.join(','))
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+}
+async function dropQuestions(folderId: string | null) {
+  const ids = [...draggingIds.value]
+  dragOverFolder.value = ''
+  draggingIds.value = []
+  await moveItems(ids, folderId)
+}
+function toggleVisibleSelection(checked: any) {
+  if (checked) selectedItems.value = [...filteredItems.value]
+  else selectedItems.value = selectedItems.value.filter(item => !filteredItems.value.some(value => value.item_id === item.item_id))
 }
 function toggleItem(item: any, checked: boolean) {
   selectedItems.value = checked
@@ -224,7 +298,7 @@ onMounted(loadBase)
 
 <template>
   <main class="content question-center" v-loading="loading">
-    <div class="page-title">
+    <div class="page-title workbench-hero">
       <span class="eyebrow">REVIEWED QUESTION BANK</span>
       <h1>习题中心</h1>
       <p class="muted">教师导入任意常见 Excel 题库并审核，学生只作答已发布版本；教材例题不会自动进入正式题库。</p>
@@ -249,7 +323,7 @@ onMounted(loadBase)
     </el-alert>
 
     <template v-if="activeTab === 'manage'">
-      <section class="metric-grid">
+      <section class="metric-grid workbench-metrics">
         <div class="metric"><span>全部题目</span><strong>{{ summary.total }}</strong></div>
         <div class="metric warning"><span>待审核</span><strong>{{ summary.draft }}</strong></div>
         <div class="metric success"><span>已批准</span><strong>{{ summary.approved }}</strong></div>
@@ -265,17 +339,13 @@ onMounted(loadBase)
           <el-input v-model="newFolderName" placeholder="输入名称，例如：第三章作业"/>
           <el-button type="primary" @click="createFolder">创建文件夹</el-button>
         </div>
-        <div class="folder-list">
-          <el-button :type="folderFilter==='all'?'primary':'default'" @click="folderFilter='all'">全部题目</el-button>
-          <el-button :type="folderFilter==='unfiled'?'warning':'default'" @click="folderFilter='unfiled'">未归档</el-button>
-          <el-button v-for="folder in folders" :key="folder.folder_id"
-                     :type="folderFilter===folder.folder_id?'primary':'default'"
-                     @click="folderFilter=folder.folder_id;importFolderId=folder.folder_id">
-            {{folder.folder_name}}（{{folder.item_count||0}}）
-            <el-tag v-if="folder.issue_count" type="danger" size="small">{{folder.issue_count}} 异常</el-tag>
-          </el-button>
+        <div class="organizer-head"><button :class="{active:folderFilter==='all'}" @click="folderFilter='all'">全部题目 <b>{{items.length}}</b></button><button class="unfiled" :class="{active:folderFilter==='unfiled',over:dragOverFolder==='unfiled'}" @click="folderFilter='unfiled'" @dragover.prevent="dragOverFolder='unfiled'" @dragleave="dragOverFolder=''" @drop.prevent="dropQuestions(null)">未归档 <b>{{items.filter(item=>!item.folder_id).length}}</b><small>可拖到这里解除分组</small></button></div>
+        <div class="folder-board">
+          <section v-for="group in folderGroups" :key="group.type" class="folder-column"><header><b>{{group.title}}</b><span>{{group.subtitle}}</span></header><button v-for="folder in group.folders" :key="folder.folder_id" class="folder-drop" :class="{active:folderFilter===folder.folder_id,over:dragOverFolder===folder.folder_id}" @click="folderFilter=folder.folder_id;importFolderId=folder.folder_id" @dragover.prevent="dragOverFolder=folder.folder_id" @dragleave="dragOverFolder=''" @drop.prevent="dropQuestions(folder.folder_id)"><span>{{folder.folder_name}}</span><b>{{folder.item_count||0}} 题</b><small v-if="folder.issue_count">{{folder.issue_count}} 项待检查</small><small v-else>拖放题目到这里</small></button><div v-if="!group.folders.length" class="empty-folder">创建一个{{group.title}}后可拖入题目</div></section>
         </div>
         <div class="bulk-actions">
+          <el-checkbox :model-value="allVisibleSelected" @change="toggleVisibleSelection">全选当前结果</el-checkbox>
+          <b v-if="selectedItems.length" class="selected-count">已选 {{selectedItems.length}} 题</b>
           <el-select v-model="moveTargetFolder" clearable placeholder="移动到文件夹；留空为未归档">
             <el-option v-for="folder in folders" :key="folder.folder_id"
                        :label="folder.folder_name" :value="folder.folder_id"/>
@@ -303,6 +373,8 @@ onMounted(loadBase)
           </el-upload>
           <el-button type="primary" :loading="uploading"
                      :disabled="!courseId || !uploadFile" @click="importWorkbook">导入并进入审核</el-button>
+          <label class="folder-picker"><input type="file" multiple webkitdirectory accept=".xls,.xlsx" @change="chooseFolderUpload"/>选择整个题库文件夹</label>
+          <el-button type="success" plain :loading="uploading" :disabled="!folderFiles.length" @click="importFolderPackage">整包本地导入（{{folderFiles.length}}）</el-button>
         </div>
         <el-collapse class="ai-settings">
           <el-collapse-item title="智能识别与教师自有 API（可选）">
@@ -355,8 +427,9 @@ onMounted(loadBase)
         <el-radio-button label="rejected">已驳回</el-radio-button>
       </el-radio-group>
       <el-empty v-if="!filteredItems.length" description="暂无符合条件的题目，请先导入题库模板" />
-      <el-card v-for="(item, index) in filteredItems" :key="item.item_id" shadow="never" class="question-card">
+      <el-card v-for="(item, index) in filteredItems" :key="item.item_id" shadow="never" class="question-card" :class="{selected:selectedItems.some(value=>value.item_id===item.item_id)}">
         <div class="question-head">
+          <span class="drag-handle" draggable="true" title="拖到上方试卷、作业或章节练习" @dragstart="startQuestionDrag(item,$event)">⠿</span>
           <el-checkbox :model-value="selectedItems.some(value=>value.item_id===item.item_id)"
                        @change="itemSelectionChanged(item,$event)"/>
           <span class="question-index">{{ index + 1 }}</span>
@@ -471,18 +544,21 @@ onMounted(loadBase)
 .question-center{display:grid;gap:18px}.toolbar-card,.import-card,.question-card,.stats-card,.stats-filter{border-radius:16px}
 .toolbar,.card-title,.upload-row,.question-head,.question-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .toolbar,.card-title{justify-content:space-between}.card-title h3,.card-title p,.stats-card h3{margin:0}
-.card-title p{margin-top:5px;color:#64748b}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
-.metric{padding:18px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px}.metric span{display:block;color:#64748b;font-size:13px}
-.metric strong{display:block;margin-top:8px;font-size:30px;color:#0f172a}.metric.success strong{color:#15803d}
+.card-title p{margin-top:5px;color:#687d77}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.metric{padding:18px;background:#f2faf8;border:1px solid #dce9e5;border-radius:14px}.metric span{display:block;color:#687d77;font-size:13px}
+.metric strong{display:block;margin-top:8px;font-size:30px;color:#173e49}.metric.success strong{color:#23746f}
 .metric.warning strong{color:#b45309}.metric.danger strong{color:#b91c1c}.import-history{margin-top:18px}
 .ai-settings{margin-top:18px}.ai-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px}
 .folder-create,.folder-list,.bulk-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.folder-create .el-input{max-width:420px}.folder-create .el-select,.bulk-actions .el-select{width:220px}.folder-list{margin:14px 0}.folder-card{border-radius:16px}
-.ai-grid label{display:block;margin-bottom:6px;color:#475569;font-size:13px;font-weight:600}.ai-grid .el-select{width:100%}
-.import-history :deep(.el-collapse-item__title){gap:10px}.question-card{border-left:4px solid #3b82f6}
-.question-card label{display:block;margin:14px 0 6px;color:#475569;font-size:13px;font-weight:600}
-.question-index{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#dbeafe;color:#1d4ed8;font-weight:700}
+.ai-grid label{display:block;margin-bottom:6px;color:#47655e;font-size:13px;font-weight:600}.ai-grid .el-select{width:100%}
+.import-history :deep(.el-collapse-item__title){gap:10px}.question-card{border-left:4px solid #378f81}
+.question-card label{display:block;margin:14px 0 6px;color:#47655e;font-size:13px;font-weight:600}
+.question-index{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#d9eee8;color:#23746f;font-weight:700}
 .type-select{width:130px}.options-editor{margin-top:12px;display:grid;gap:8px}.option-row{display:grid;grid-template-columns:28px 1fr;align-items:center;gap:8px}
 .answer-grid{display:grid;grid-template-columns:1.4fr .7fr .7fr;gap:12px}.question-actions{justify-content:flex-end;margin-top:16px}
-.stats-filter :deep(.el-card__body){display:flex;align-items:center;gap:12px;flex-wrap:wrap}.muted{color:#64748b;font-size:13px}
+.stats-filter :deep(.el-card__body){display:flex;align-items:center;gap:12px;flex-wrap:wrap}.muted{color:#687d77;font-size:13px}
+.question-center{background:#f3f7f7;min-height:100vh}.question-center :deep(.el-button--primary){--el-button-bg-color:#23746f;--el-button-border-color:#23746f;--el-button-hover-bg-color:#378f81;--el-button-hover-border-color:#378f81}.question-center :deep(.el-segmented__item-selected){color:#173e49;background:#dcefe9}.folder-card,.import-card,.stats-filter{border-color:#dce9e5}
+.organizer-head{display:flex;gap:10px;margin:15px 0 12px}.organizer-head button{display:grid;grid-template-columns:1fr auto;gap:4px 14px;min-width:160px;padding:11px 14px;border:1px solid #d4e3df;border-radius:11px;background:#fff;color:#365b55;text-align:left;cursor:pointer}.organizer-head button small{grid-column:1/-1;color:#81938f}.organizer-head button.active{border-color:#378f81;background:#eaf6f2;color:#173e49}.folder-board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:14px}.folder-column{display:grid;align-content:start;gap:8px;min-height:142px;padding:12px;border:1px solid #dbe8e5;border-radius:13px;background:#f7fbfa}.folder-column>header{display:grid;margin-bottom:2px}.folder-column>header b{color:#173e49}.folder-column>header span{font-size:12px;color:#7b8e89}.folder-drop{display:grid;grid-template-columns:1fr auto;gap:5px 10px;padding:11px;border:1px solid #dce8e5;border-radius:10px;background:#fff;color:#365b55;text-align:left;cursor:pointer;transition:.16s ease}.folder-drop small{grid-column:1/-1;color:#84948f}.folder-drop.active{border-color:#378f81;background:#edf8f5}.folder-drop.over,.organizer-head button.over{border-color:#23746f;background:#dcefe9;box-shadow:0 0 0 3px #378f8126;transform:translateY(-2px)}.empty-folder{padding:17px 8px;border:1px dashed #c8dbd6;border-radius:9px;color:#879792;text-align:center;font-size:12px}.selected-count{padding:6px 10px;border-radius:9px;background:#dcefe9;color:#173e49}.drag-handle{display:grid;place-items:center;width:26px;height:30px;border-radius:7px;color:#5e7c75;font-size:22px;cursor:grab;user-select:none}.drag-handle:active{cursor:grabbing}.question-card.selected{border-color:#378f81;background:#fbfefd;box-shadow:0 0 0 2px #378f811c}
 @media(max-width:900px){.metric-grid{grid-template-columns:repeat(2,1fr)}.answer-grid,.ai-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.folder-board{grid-template-columns:1fr}.organizer-head{flex-wrap:wrap}}
 </style>

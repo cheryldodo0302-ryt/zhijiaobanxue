@@ -153,6 +153,8 @@ class SemanticKnowledgeService:
             "标题序列如 1.2 后接 1.3 时必须保持同级和原顺序；孤立的 3 或 3. 可能是章标题、当前 1.3 下的子标题或第三条，"
             "必须结合前后 slide_title 与正文判断，不能只按数字位数升级为章。"
             "原文有 x.x 二级标题时，其下 x.x.x 标题和正文必须并为一个知识点，不得再拆分。"
+            "对于教学大纲，‘教学内容’‘目标与要求’‘教学方法’‘考核形式’等重复字段只是实验/任务的属性，"
+            "必须并入最近的实验、实训、项目、任务或模块，不得把字段名本身创建为知识点标题。"
             "章节编号必须按教材出现顺序单调前进；正文中的‘2.1节提出’‘见3.2节’等章节引用不是标题，禁止据此新建知识点。"
             "原文没有标题时可以按语义补充简洁标题；knowledge_points 的 block_ids 必须来自输入且只引用支撑该知识点的原文。"
             "不要生成摘要或知识正文。每个知识点必须给出来源 block_id 和至少一段可在来源块逐字找到的 evidence_quote。"
@@ -297,6 +299,18 @@ class SemanticKnowledgeService:
                                 on_call: Callable[[], None] | None = None) -> dict[str, Any]:
         if not candidates:
             raise ValidationError("AI 没有生成可归并的知识点候选")
+        if len(candidates) > 24:
+            combined: list[dict[str, Any]] = []
+            for start in range(0, len(candidates), 24):
+                reduced = self.reduce_document_outline(
+                    candidates[start:start + 24], on_call=on_call
+                )
+                for point in reduced["knowledge_points"]:
+                    combined.append({
+                        **point,
+                        "point_key": f"batch-{start // 24 + 1}-{point['point_key']}",
+                    })
+            return {"knowledge_points": combined}
         compact = [{
             "candidate_id": row["candidate_id"], "chapter": row["chapter"],
             "section": row["section"], "title": row["title"],
@@ -361,6 +375,28 @@ class SemanticKnowledgeService:
         return {"knowledge_points": points}
 
     def unify_course_outline(self, points: list[dict[str, Any]], *, on_call: Callable[[], None] | None = None) -> dict[str, Any]:
+        if len(points) > 24:
+            combined_points: list[dict[str, Any]] = []
+            combined_relations: list[dict[str, Any]] = []
+            for start in range(0, len(points), 24):
+                batch_number = start // 24 + 1
+                unified = self.unify_course_outline(points[start:start + 24], on_call=on_call)
+                key_map: dict[str, str] = {}
+                for index, point in enumerate(unified.get("points") or [], 1):
+                    old_key = str(point.get("course_key") or f"point-{index}")
+                    new_key = f"batch-{batch_number}-{old_key}"
+                    key_map[old_key] = new_key
+                    combined_points.append({**point, "course_key": new_key})
+                for relation in unified.get("relations") or []:
+                    source_key = key_map.get(str(relation.get("source_course_key") or ""))
+                    target_key = key_map.get(str(relation.get("target_course_key") or ""))
+                    if source_key and target_key:
+                        combined_relations.append({
+                            **relation,
+                            "source_course_key": source_key,
+                            "target_course_key": target_key,
+                        })
+            return {"points": combined_points, "relations": combined_relations}
         payload = [{
             "source_node_id": row["node_id"], "document_id": row["document_id"],
             "material_type": row.get("material_type", "other"),

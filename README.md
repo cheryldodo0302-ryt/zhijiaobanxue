@@ -144,7 +144,7 @@ D:\anapython\python.exe scripts\create_teacher.py teacher01 --display-name "教�
 
 访问 `http://127.0.0.1:5173`。解析容器的安装与检查说明见 [docker/INGESTION.md](docker/INGESTION.md)。
 
-教师共享课程的 PDF 由自适应管线分批调用 MinerU：普通页使用 `auto`，扫描/复杂公式页升级到 `ocr`；TXT、Markdown、DOCX、PPTX 有有效文字时仍只走原生解析。正式部署推荐带 Bearer Token 和 TLS 的校内/远程解析服务；本地 Docker 与 SSH 隧道仅作为可选开发方式。PPTX/DOCX 网页预览还需要服务器安装 LibreOffice，缺失时界面会明确提示并保留原文件下载。
+教师共享课程的 PDF 由自适应管线分批调用 MinerU：普通页使用 `auto`，扫描/复杂公式页升级到 `ocr`；TXT、Markdown、DOCX、PPTX 有有效文字时仍只走原生解析。正式部署推荐带 Bearer Token 和 TLS 的校内/远程解析服务；本地 Docker 与 SSH 隧道仅作为可选开发方式。PPTX 在浏览器端渲染，DOCX 由服务端通过 `python-docx` 生成经过转义的审阅 HTML，二者都不要求安装 LibreOffice，并始终保留原文件下载。
 
 PDF 自适应导入的默认批次大小为 40 页，可在 `server.env` 中通过 `ZHIJIAO_INGESTION_BATCH_SIZE` 调整。教师可通过以下接口查看页级清单和批次恢复状态：
 

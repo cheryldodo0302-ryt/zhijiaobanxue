@@ -816,6 +816,478 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
         ALTER TABLE teacher_ai_settings_v2 RENAME TO teacher_ai_settings;
         """,
     ),
+    (
+        "020_teaching_archives_and_class_dimensions",
+        """
+        ALTER TABLE knowledge_nodes ADD COLUMN content_domain TEXT NOT NULL DEFAULT 'knowledge'
+            CHECK(content_domain IN ('knowledge','teaching_archive'));
+        ALTER TABLE knowledge_nodes ADD COLUMN teaching_category TEXT NOT NULL DEFAULT '';
+
+        ALTER TABLE terms ADD COLUMN academic_year TEXT NOT NULL DEFAULT '';
+        ALTER TABLE terms ADD COLUMN teaching_period TEXT NOT NULL DEFAULT '';
+        ALTER TABLE classes ADD COLUMN difficulty_level TEXT NOT NULL DEFAULT 'standard';
+        ALTER TABLE classes ADD COLUMN teaching_time_slot TEXT NOT NULL DEFAULT '';
+
+        CREATE INDEX IF NOT EXISTS idx_knowledge_nodes_content_domain
+            ON knowledge_nodes(course_id,content_domain,material_type,node_scope,sort_order);
+        CREATE INDEX IF NOT EXISTS idx_terms_academic_year
+            ON terms(owner_id,academic_year,teaching_period);
+        CREATE INDEX IF NOT EXISTS idx_classes_teaching_dimensions
+            ON classes(course_id,term_id,difficulty_level,teaching_time_slot);
+
+        UPDATE terms
+           SET academic_year=CASE
+               WHEN term_name GLOB '*[0-9][0-9][0-9][0-9]*'
+               THEN substr(term_name, instr(term_name, '20'), 4)
+               ELSE '' END,
+               teaching_period=term_name
+         WHERE academic_year='';
+
+        UPDATE knowledge_nodes
+           SET content_domain='teaching_archive',
+               teaching_category=CASE
+                   WHEN title LIKE '%考核%' OR title LIKE '%成绩评定%' OR title LIKE '%评价方式%'
+                       THEN 'assessment'
+                   WHEN title LIKE '%培养目标%' OR title LIKE '%课程目标%' OR title LIKE '%学习目标%'
+                       THEN 'objectives'
+                   WHEN title LIKE '%教学方法%' OR title LIKE '%教学模式%' OR title LIKE '%学习模式%'
+                        OR title LIKE '%学习模板%' THEN 'teaching_design'
+                   ELSE 'course_profile' END
+         WHERE material_type='syllabus' AND node_type='knowledge_point'
+           AND (
+               title LIKE '%课程基本信息%' OR title LIKE '%课程介绍%' OR title LIKE '%课程性质%'
+               OR title LIKE '%课程定位%' OR title LIKE '%先修知识%'
+               OR title LIKE '%培养目标%' OR title LIKE '%课程目标%' OR title LIKE '%学习目标%'
+               OR title LIKE '%教学方法%' OR title LIKE '%教学模式%' OR title LIKE '%学习模式%'
+               OR title LIKE '%学习模板%' OR title LIKE '%考核%' OR title LIKE '%成绩评定%'
+               OR title LIKE '%评价方式%'
+           );
+
+        UPDATE document_blocks
+           SET content_destination='excluded',semantic_role='teaching_archive',
+               include_as_knowledge=0,verification_status='auto_verified',
+               updated_at=CURRENT_TIMESTAMP
+         WHERE block_id IN (
+             SELECT DISTINCT s.block_id FROM knowledge_node_sources s
+             JOIN knowledge_nodes n ON n.node_id=s.node_id
+             WHERE n.content_domain='teaching_archive'
+         )
+           AND block_id NOT IN (
+             SELECT DISTINCT s.block_id FROM knowledge_node_sources s
+             JOIN knowledge_nodes n ON n.node_id=s.node_id
+             WHERE n.content_domain='knowledge' AND n.node_type='knowledge_point'
+         );
+        """,
+    ),
+    (
+        "021_custom_class_variants",
+        """
+        ALTER TABLE classes ADD COLUMN class_variant TEXT NOT NULL DEFAULT '';
+        UPDATE classes
+           SET class_variant=CASE
+               WHEN difficulty_level='standard' THEN ''
+               ELSE difficulty_level END
+         WHERE class_variant='';
+        CREATE INDEX IF NOT EXISTS idx_classes_custom_variant
+            ON classes(course_id,term_id,class_variant,teaching_time_slot);
+        """,
+    ),
+    (
+        "022_teaching_archive_document_assignments",
+        """
+        CREATE TABLE IF NOT EXISTS teaching_archive_document_assignments (
+            assignment_id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            class_id TEXT NOT NULL,
+            assigned_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(document_id) REFERENCES course_documents(document_id) ON DELETE CASCADE,
+            FOREIGN KEY(class_id) REFERENCES classes(class_id) ON DELETE CASCADE,
+            UNIQUE(document_id,class_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_teaching_archive_assignment_class
+            ON teaching_archive_document_assignments(class_id,document_id);
+        """,
+    ),
+    (
+        "023_knowledge_node_class_scopes",
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_node_class_scopes (
+            node_id TEXT NOT NULL,
+            class_id TEXT NOT NULL,
+            assignment_source TEXT NOT NULL DEFAULT 'document'
+                CHECK(assignment_source IN ('document','manual')),
+            assigned_by TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(node_id,class_id),
+            FOREIGN KEY(node_id) REFERENCES knowledge_nodes(node_id) ON DELETE CASCADE,
+            FOREIGN KEY(class_id) REFERENCES classes(class_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_node_class_scope_class
+            ON knowledge_node_class_scopes(class_id,node_id);
+
+        INSERT OR IGNORE INTO knowledge_node_class_scopes(node_id,class_id,assignment_source,assigned_by)
+        SELECT n.node_id,a.class_id,'document',a.assigned_by
+          FROM knowledge_nodes n
+          JOIN teaching_archive_document_assignments a ON a.document_id=n.document_id
+         WHERE n.node_type='knowledge_point' AND n.content_domain='knowledge';
+        """,
+    ),
+    (
+        "024_manual_course_wide_scope_override",
+        """
+        ALTER TABLE knowledge_nodes ADD COLUMN teaching_scope_mode TEXT NOT NULL DEFAULT 'inherited'
+            CHECK(teaching_scope_mode IN ('inherited','manual'));
+        UPDATE knowledge_nodes SET teaching_scope_mode='manual'
+         WHERE node_id IN (
+             SELECT node_id FROM knowledge_node_class_scopes WHERE assignment_source='manual'
+         );
+        """,
+    ),
+    (
+        "025_teaching_archive_workbench",
+        """
+        ALTER TABLE classes ADD COLUMN campus TEXT NOT NULL DEFAULT '';
+        ALTER TABLE classes ADD COLUMN cohort_year TEXT NOT NULL DEFAULT '';
+        ALTER TABLE classes ADD COLUMN major TEXT NOT NULL DEFAULT '';
+        ALTER TABLE classes ADD COLUMN teaching_level TEXT NOT NULL DEFAULT '';
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_versions (
+            version_id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL,
+            term_id TEXT,
+            version_name TEXT NOT NULL,
+            scope_type TEXT NOT NULL DEFAULT 'course'
+                CHECK(scope_type IN ('course','major','class')),
+            campus TEXT NOT NULL DEFAULT '',
+            cohort_year TEXT NOT NULL DEFAULT '',
+            major TEXT NOT NULL DEFAULT '',
+            class_variant TEXT NOT NULL DEFAULT '',
+            teaching_level TEXT NOT NULL DEFAULT '',
+            parent_version_id TEXT,
+            version_number INTEGER NOT NULL DEFAULT 1,
+            lifecycle TEXT NOT NULL DEFAULT 'published'
+                CHECK(lifecycle IN ('processing','review_required','published','withdrawn','failed')),
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+            FOREIGN KEY(term_id) REFERENCES terms(term_id) ON DELETE SET NULL,
+            FOREIGN KEY(parent_version_id) REFERENCES teaching_archive_versions(version_id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_archive_versions_scope
+            ON teaching_archive_versions(course_id,term_id,campus,cohort_year,major,scope_type,lifecycle);
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_version_classes (
+            version_id TEXT NOT NULL,
+            class_id TEXT NOT NULL,
+            PRIMARY KEY(version_id,class_id),
+            FOREIGN KEY(version_id) REFERENCES teaching_archive_versions(version_id) ON DELETE CASCADE,
+            FOREIGN KEY(class_id) REFERENCES classes(class_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_import_batches (
+            batch_id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL,
+            term_id TEXT,
+            batch_name TEXT NOT NULL DEFAULT '',
+            defaults_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'staging'
+                CHECK(status IN ('staging','committing','completed','completed_with_warnings','failed')),
+            file_count INTEGER NOT NULL DEFAULT 0,
+            published_count INTEGER NOT NULL DEFAULT 0,
+            review_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+            FOREIGN KEY(term_id) REFERENCES terms(term_id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_import_files (
+            file_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            relative_path TEXT NOT NULL DEFAULT '',
+            stored_path TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            sha256 TEXT NOT NULL,
+            suggested_record_type TEXT NOT NULL DEFAULT 'other',
+            confirmed_record_type TEXT NOT NULL DEFAULT 'other',
+            routing_target TEXT NOT NULL DEFAULT 'teaching_archive'
+                CHECK(routing_target IN ('teaching_archive','knowledge_center','question_center','attachment','ignored')),
+            scope_json TEXT NOT NULL DEFAULT '{}',
+            class_ids_json TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'staged'
+                CHECK(status IN ('staged','ignored','blocked','processing','published','review_required','routed','failed')),
+            risk_codes_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(batch_id) REFERENCES teaching_archive_import_batches(batch_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_archive_import_files_batch
+            ON teaching_archive_import_files(batch_id,status,confirmed_record_type);
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_documents (
+            archive_document_id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL UNIQUE,
+            version_id TEXT NOT NULL,
+            course_document_id TEXT,
+            record_type TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            relative_path TEXT NOT NULL DEFAULT '',
+            stored_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            preview_kind TEXT NOT NULL DEFAULT 'unavailable',
+            conversion_status TEXT NOT NULL DEFAULT 'ready',
+            lifecycle TEXT NOT NULL DEFAULT 'processing'
+                CHECK(lifecycle IN ('processing','review_required','published','withdrawn','failed')),
+            risk_codes_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(file_id) REFERENCES teaching_archive_import_files(file_id) ON DELETE CASCADE,
+            FOREIGN KEY(version_id) REFERENCES teaching_archive_versions(version_id) ON DELETE CASCADE,
+            FOREIGN KEY(course_document_id) REFERENCES course_documents(document_id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_items (
+            item_id TEXT PRIMARY KEY,
+            archive_document_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            parent_item_id TEXT,
+            record_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            content_markdown TEXT NOT NULL DEFAULT '',
+            structured_json TEXT NOT NULL DEFAULT '{}',
+            source_json TEXT NOT NULL DEFAULT '{}',
+            lifecycle TEXT NOT NULL DEFAULT 'processing'
+                CHECK(lifecycle IN ('processing','review_required','published','withdrawn','failed')),
+            risk_codes_json TEXT NOT NULL DEFAULT '[]',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(archive_document_id) REFERENCES teaching_archive_documents(archive_document_id) ON DELETE CASCADE,
+            FOREIGN KEY(version_id) REFERENCES teaching_archive_versions(version_id) ON DELETE CASCADE,
+            FOREIGN KEY(parent_item_id) REFERENCES teaching_archive_items(item_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_archive_items_workbench
+            ON teaching_archive_items(version_id,record_type,lifecycle,sort_order);
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_item_overrides (
+            override_id TEXT PRIMARY KEY,
+            base_item_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            patch_json TEXT NOT NULL DEFAULT '{}',
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(base_item_id) REFERENCES teaching_archive_items(item_id) ON DELETE CASCADE,
+            FOREIGN KEY(version_id) REFERENCES teaching_archive_versions(version_id) ON DELETE CASCADE,
+            UNIQUE(base_item_id,version_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS teaching_archive_attachments (
+            attachment_id TEXT PRIMARY KEY,
+            file_id TEXT NOT NULL UNIQUE,
+            version_id TEXT NOT NULL,
+            experiment_item_id TEXT,
+            attachment_type TEXT NOT NULL DEFAULT 'archive',
+            original_name TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            manifest_json TEXT NOT NULL DEFAULT '[]',
+            lifecycle TEXT NOT NULL DEFAULT 'published'
+                CHECK(lifecycle IN ('processing','review_required','published','withdrawn','failed')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(file_id) REFERENCES teaching_archive_import_files(file_id) ON DELETE CASCADE,
+            FOREIGN KEY(version_id) REFERENCES teaching_archive_versions(version_id) ON DELETE CASCADE,
+            FOREIGN KEY(experiment_item_id) REFERENCES teaching_archive_items(item_id) ON DELETE SET NULL
+        );
+
+        INSERT INTO teaching_archive_versions(
+            version_id,course_id,version_name,scope_type,created_by,lifecycle
+        )
+        SELECT 'tav_legacy_' || substr(c.course_id,1,20),c.course_id,'历史大纲档案','course',c.owner_id,'published'
+          FROM courses c
+         WHERE c.course_type='shared_course'
+           AND EXISTS(SELECT 1 FROM knowledge_nodes n WHERE n.course_id=c.course_id AND n.content_domain='teaching_archive')
+           AND NOT EXISTS(SELECT 1 FROM teaching_archive_versions v WHERE v.course_id=c.course_id);
+        """,
+    ),
+    (
+        "026_teaching_archive_preview_path",
+        """
+        ALTER TABLE teaching_archive_documents ADD COLUMN preview_path TEXT NOT NULL DEFAULT '';
+        """,
+    ),
+    (
+        "027_independent_knowledge_graph",
+        """
+        CREATE TABLE IF NOT EXISTS knowledge_graphs (
+            graph_id TEXT PRIMARY KEY,
+            course_id TEXT NOT NULL UNIQUE,
+            graph_name TEXT NOT NULL DEFAULT '课程知识图谱',
+            relation_definitions_json TEXT NOT NULL DEFAULT '{}',
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_graph_import_batches (
+            batch_id TEXT PRIMARY KEY,
+            graph_id TEXT NOT NULL,
+            course_id TEXT NOT NULL,
+            batch_name TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'staging'
+                CHECK(status IN ('staging','committing','completed','completed_with_warnings','failed')),
+            file_count INTEGER NOT NULL DEFAULT 0,
+            node_count INTEGER NOT NULL DEFAULT 0,
+            relation_count INTEGER NOT NULL DEFAULT 0,
+            review_count INTEGER NOT NULL DEFAULT 0,
+            error_count INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(graph_id) REFERENCES knowledge_graphs(graph_id) ON DELETE CASCADE,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_graph_import_files (
+            file_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            relative_path TEXT NOT NULL DEFAULT '',
+            stored_path TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            sha256 TEXT NOT NULL,
+            suggested_kind TEXT NOT NULL DEFAULT 'auto'
+                CHECK(suggested_kind IN ('auto','nodes','relations','definitions','ignore')),
+            confirmed_kind TEXT NOT NULL DEFAULT 'auto'
+                CHECK(confirmed_kind IN ('auto','nodes','relations','definitions','ignore')),
+            status TEXT NOT NULL DEFAULT 'staged'
+                CHECK(status IN ('staged','ignored','processing','completed','review_required','failed')),
+            progress INTEGER NOT NULL DEFAULT 0,
+            stage TEXT NOT NULL DEFAULT '等待确认',
+            risk_codes_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(batch_id) REFERENCES knowledge_graph_import_batches(batch_id) ON DELETE CASCADE,
+            UNIQUE(batch_id,sha256)
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_graph_nodes (
+            graph_node_id TEXT PRIMARY KEY,
+            graph_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            normalized_title TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            markdown TEXT NOT NULL DEFAULT '',
+            is_key INTEGER NOT NULL DEFAULT 0,
+            is_difficult INTEGER NOT NULL DEFAULT 0,
+            is_exam INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            origin TEXT NOT NULL DEFAULT 'file'
+                CHECK(origin IN ('file','knowledge_center','relation_only','ai_suggested')),
+            source_knowledge_node_id TEXT,
+            source_revision TEXT NOT NULL DEFAULT '',
+            review_status TEXT NOT NULL DEFAULT 'draft'
+                CHECK(review_status IN ('draft','approved','rejected')),
+            risk_codes_json TEXT NOT NULL DEFAULT '[]',
+            source_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(graph_id) REFERENCES knowledge_graphs(graph_id) ON DELETE CASCADE,
+            FOREIGN KEY(source_knowledge_node_id) REFERENCES knowledge_nodes(node_id) ON DELETE SET NULL,
+            UNIQUE(graph_id,normalized_title)
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_nodes_review
+            ON knowledge_graph_nodes(graph_id,review_status,origin,title);
+
+        CREATE TABLE IF NOT EXISTS knowledge_graph_relations (
+            graph_relation_id TEXT PRIMARY KEY,
+            graph_id TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            target_node_id TEXT NOT NULL,
+            relation_kind TEXT NOT NULL
+                CHECK(relation_kind IN ('part_of','prerequisite','progression','parallel','related')),
+            relation_label TEXT NOT NULL DEFAULT '',
+            origin TEXT NOT NULL DEFAULT 'explicit'
+                CHECK(origin IN ('explicit','suggested')),
+            confidence REAL,
+            reason TEXT NOT NULL DEFAULT '',
+            review_status TEXT NOT NULL DEFAULT 'draft'
+                CHECK(review_status IN ('draft','approved','rejected')),
+            risk_codes_json TEXT NOT NULL DEFAULT '[]',
+            source_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(graph_id) REFERENCES knowledge_graphs(graph_id) ON DELETE CASCADE,
+            FOREIGN KEY(source_node_id) REFERENCES knowledge_graph_nodes(graph_node_id) ON DELETE CASCADE,
+            FOREIGN KEY(target_node_id) REFERENCES knowledge_graph_nodes(graph_node_id) ON DELETE CASCADE,
+            UNIQUE(graph_id,source_node_id,target_node_id,relation_kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_relations_review
+            ON knowledge_graph_relations(graph_id,review_status,origin,relation_kind);
+
+        CREATE TABLE IF NOT EXISTS knowledge_graph_versions (
+            graph_version_id TEXT PRIMARY KEY,
+            graph_id TEXT NOT NULL,
+            course_id TEXT NOT NULL,
+            version_number INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'published'
+                CHECK(status IN ('published','superseded')),
+            node_count INTEGER NOT NULL DEFAULT 0,
+            relation_count INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL,
+            published_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(graph_id) REFERENCES knowledge_graphs(graph_id) ON DELETE CASCADE,
+            FOREIGN KEY(course_id) REFERENCES courses(course_id) ON DELETE CASCADE,
+            UNIQUE(graph_id,version_number)
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_graph_version_nodes (
+            graph_version_id TEXT NOT NULL,
+            graph_node_id TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            PRIMARY KEY(graph_version_id,graph_node_id),
+            FOREIGN KEY(graph_version_id) REFERENCES knowledge_graph_versions(graph_version_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS knowledge_graph_version_relations (
+            graph_version_id TEXT NOT NULL,
+            graph_relation_id TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            PRIMARY KEY(graph_version_id,graph_relation_id),
+            FOREIGN KEY(graph_version_id) REFERENCES knowledge_graph_versions(graph_version_id) ON DELETE CASCADE
+        );
+
+        ALTER TABLE question_bank_folders ADD COLUMN parent_folder_id TEXT
+            REFERENCES question_bank_folders(folder_id) ON DELETE SET NULL;
+        ALTER TABLE question_bank_folders ADD COLUMN relative_path TEXT NOT NULL DEFAULT '';
+        """,
+    ),
+    (
+        "028_course_document_source_path",
+        """
+        ALTER TABLE course_documents ADD COLUMN source_relative_path TEXT NOT NULL DEFAULT '';
+        """,
+    ),
+    (
+        "029_archive_duplicates_and_student_reset",
+        """
+        ALTER TABLE teaching_archive_import_files ADD COLUMN duplicate_of_document_id TEXT;
+        ALTER TABLE teaching_archive_import_files ADD COLUMN duplicate_action TEXT NOT NULL DEFAULT 'none'
+            CHECK(duplicate_action IN ('none','skip','new_version'));
+        CREATE INDEX IF NOT EXISTS idx_archive_documents_course_hash
+            ON teaching_archive_documents(sha256,lifecycle);
+        """,
+    ),
 )
 
 

@@ -44,6 +44,12 @@ _KNOWLEDGE_TYPE_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("fact", ("事实", "事实数据", "fact")),
 )
 
+_OUTLINE_FIELD_HEADINGS = {
+    "教学内容", "教学目标", "学习目标", "目标与要求", "教学要求", "学习要求",
+    "教学方法", "教学方式", "教学重点", "教学难点", "重点与难点", "课程思政",
+    "考核形式", "考核方式", "考核内容", "考核要求", "学时安排", "教学时数",
+}
+
 
 def block_text(block: dict[str, Any]) -> str:
     return str(
@@ -75,6 +81,21 @@ def normalize_title(value: str) -> str:
         flags=re.I,
     )
     return re.sub(r"\s+", " ", value).strip(" ：:.-")
+
+
+def is_outline_field_heading(value: str) -> bool:
+    """Return whether a heading is a repeated outline/table field label."""
+    normalized = normalize_title(value).replace(" ", "")
+    return normalized.rstrip("：:") in _OUTLINE_FIELD_HEADINGS
+
+
+def is_outline_unit_heading(value: str) -> bool:
+    """Identify a concrete experiment/task/module that can own field labels."""
+    normalized = re.sub(r"^\s*#{1,6}\s*", "", str(value or "")).strip()
+    return bool(re.match(
+        r"^(?:实验|实训|项目|任务|模块|专题|单元)\s*(?:第?[0-9一二三四五六七八九十百千万]+)?(?:[、.．:：)）\s]|$)",
+        normalized,
+    ))
 
 
 def _is_heading(block: dict[str, Any]) -> bool:
@@ -321,6 +342,14 @@ class KnowledgeBoundaryExtractor:
                 if current:
                     candidates.append(self._candidate(current, document_id))
                     current = []
+                continue
+            if (
+                _is_heading(block)
+                and current
+                and is_outline_field_heading(block_text(block))
+                and is_outline_unit_heading(block_text(current[0]))
+            ):
+                current.append(block)
                 continue
             if _is_heading(block) and current:
                 candidates.append(self._candidate(current, document_id))

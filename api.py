@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import date
+from pathlib import Path
 
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,8 @@ from question_bank_service import QuestionBankService
 from runtime_contract import RUNTIME_SOURCE_FINGERPRINT
 from teacher_service import TeacherService
 from study_room_service import StudyRoomBusy, StudyRoomService, StudyRoomUnavailable
+from teaching_archive_service import TeachingArchiveService
+from knowledge_graph_service import KnowledgeGraphService
 
 db = LearningDatabase(DB_PATH)
 campus = CampusService(db)
@@ -29,6 +32,8 @@ agents = CampusAgentService(campus)
 auth = AuthService(db)
 teachers = TeacherService(db, campus)
 ingestion = IngestionService(db, campus)
+teaching_archives = TeachingArchiveService(db, campus, ingestion)
+knowledge_graphs = KnowledgeGraphService(db, campus)
 question_banks = QuestionBankService(db, campus)
 study_room = StudyRoomService()
 app = FastAPI(title="智教伴学 API", version="1.0.0")
@@ -83,12 +88,76 @@ class TermCreatePayload(BaseModel):
     term_name: str
     starts_on: date | None = None
     ends_on: date | None = None
+    academic_year: str = ""
+    teaching_period: str = ""
 
 
 class ClassCreatePayload(BaseModel):
     course_id: str
     term_id: str
     class_name: str
+    class_variant: str = ""
+    teaching_time_slot: str = ""
+    campus: str = ""
+    cohort_year: str = ""
+    major: str = ""
+    teaching_level: str = ""
+
+
+class TeachingArchiveBatchPayload(BaseModel):
+    term_id: str | None = None
+    batch_name: str = ""
+    defaults: dict = Field(default_factory=dict)
+
+
+class TeachingArchiveFilePayload(BaseModel):
+    record_type: str | None = None
+    routing_target: str | None = None
+    scope: dict | None = None
+    class_ids: list[str] | None = None
+    include: bool | None = None
+    duplicate_action: str | None = None
+
+
+class TeachingArchiveItemPayload(BaseModel):
+    title: str | None = None
+    content_markdown: str | None = None
+    structured: dict | None = None
+    target_version_id: str | None = None
+
+
+class KnowledgeGraphBatchPayload(BaseModel):
+    batch_name: str = ""
+
+
+class KnowledgeGraphFilePayload(BaseModel):
+    kind: str
+
+
+class KnowledgeGraphNodeImportPayload(BaseModel):
+    node_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+
+class KnowledgeGraphSyncPayload(BaseModel):
+    graph_node_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+
+class KnowledgeGraphNodePayload(BaseModel):
+    title: str | None = None
+    summary: str | None = None
+    markdown: str | None = None
+    notes: str | None = None
+    is_key: bool | None = None
+    is_difficult: bool | None = None
+    is_exam: bool | None = None
+    review_status: str | None = None
+
+
+class KnowledgeGraphRelationPayload(BaseModel):
+    relation_kind: str | None = None
+    relation_label: str | None = None
+    reason: str | None = None
+    review_status: str | None = None
 
 
 class MemberImportPayload(BaseModel):
@@ -98,6 +167,10 @@ class MemberImportPayload(BaseModel):
 class ChangePasswordPayload(BaseModel):
     old_password: str
     new_password: str
+
+
+class TeacherResetStudentPasswordPayload(BaseModel):
+    new_password: str = Field(min_length=10, max_length=256)
 
 
 class BlockReviewPayload(BaseModel):
@@ -141,6 +214,8 @@ class QuestionBankSubmitPayload(BaseModel):
 class QuestionFolderPayload(BaseModel):
     folder_name: str
     folder_type: str
+    parent_folder_id: str | None = None
+    relative_path: str = ""
 
 
 class QuestionMovePayload(BaseModel):
@@ -177,6 +252,7 @@ class KnowledgeNodePayload(BaseModel):
     sort_order: int | None = None
     status: str | None = None
     reason: str | None = None
+    class_ids: list[str] | None = None
 
 
 class MaterialMetadataPayload(BaseModel):
@@ -356,7 +432,10 @@ def teacher_terms(user: dict = Depends(current_teacher)) -> list[dict]:
 @app.post("/api/v1/teacher/terms", status_code=201)
 def teacher_term_create(payload: TermCreatePayload, user: dict = Depends(current_teacher)) -> dict:
     try:
-        return teachers.create_term(user, payload.term_name, payload.starts_on, payload.ends_on)
+        return teachers.create_term(
+            user, payload.term_name, payload.starts_on, payload.ends_on,
+            payload.academic_year, payload.teaching_period,
+        )
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -369,9 +448,349 @@ def teacher_classes(course_id: str | None = None, user: dict = Depends(current_t
 @app.post("/api/v1/teacher/classes", status_code=201)
 def teacher_class_create(payload: ClassCreatePayload, user: dict = Depends(current_teacher)) -> dict:
     try:
-        return teachers.create_class(user, payload.course_id, payload.term_id, payload.class_name)
+        return teachers.create_class(
+            user, payload.course_id, payload.term_id, payload.class_name,
+            payload.class_variant, payload.teaching_time_slot, payload.campus,
+            payload.cohort_year, payload.major, payload.teaching_level,
+        )
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/courses/{course_id}/teaching-archive")
+def teacher_course_teaching_archive(
+    course_id: str, class_id: str | None = None,
+    user: dict = Depends(current_teacher)
+) -> dict:
+    try:
+        return ingestion.teaching_archive(user, course_id, class_id=class_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/teaching-archive/documents", status_code=202)
+async def teacher_teaching_archive_document_upload(
+    course_id: str, file: UploadFile = File(...), class_ids: str = Form(...),
+    analysis_mode: str = Form("api"), user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        parsed_class_ids = [value.strip() for value in class_ids.split(",") if value.strip()]
+        await file.seek(0)
+        return await run_in_threadpool(
+            ingestion.queue_teaching_archive_document_stream,
+            user, course_id, file.filename or "syllabus",
+            file.content_type or "application/octet-stream", file.file,
+            parsed_class_ids, analysis_mode=analysis_mode,
+        )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/teaching-archive/import-batches", status_code=201)
+def teacher_teaching_archive_batch_create(
+    course_id: str, payload: TeachingArchiveBatchPayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.create_import_batch(
+            user, course_id, term_id=payload.term_id,
+            batch_name=payload.batch_name, defaults=payload.defaults,
+        )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/teaching-archive/import-batches/{batch_id}/files", status_code=201)
+async def teacher_teaching_archive_batch_file_upload(
+    batch_id: str, file: UploadFile = File(...), relative_path: str = Form(""),
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        await file.seek(0)
+        return await run_in_threadpool(
+            teaching_archives.add_import_file, user, batch_id,
+            file.filename or "document", file.content_type or "application/octet-stream",
+            file.file, relative_path=relative_path,
+        )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/teaching-archive/import-batches/{batch_id}")
+def teacher_teaching_archive_batch_get(
+    batch_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.get_import_batch(user, batch_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/teaching-archive/import-batches/{batch_id}/files/{file_id}")
+def teacher_teaching_archive_batch_file_update(
+    batch_id: str, file_id: str, payload: TeachingArchiveFilePayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.update_import_file(
+            user, batch_id, file_id, payload.model_dump(exclude_none=True),
+        )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/teaching-archive/import-batches/{batch_id}/commit")
+async def teacher_teaching_archive_batch_commit(
+    batch_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return await run_in_threadpool(teaching_archives.commit_import_batch, user, batch_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/courses/{course_id}/teaching-archive/workbench")
+def teacher_teaching_archive_workbench(
+    course_id: str, term_id: str = "", campus: str = "", cohort_year: str = "",
+    major: str = "", class_id: str = "", class_variant: str = "",
+    teaching_level: str = "", record_type: str = "", status: str = "",
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.workbench(user, course_id, {
+            "term_id": term_id, "campus": campus, "cohort_year": cohort_year,
+            "major": major, "class_id": class_id, "class_variant": class_variant,
+            "teaching_level": teaching_level, "record_type": record_type, "status": status,
+        })
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/teaching-archive/items/{item_id}")
+def teacher_teaching_archive_item_update(
+    item_id: str, payload: TeachingArchiveItemPayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.update_item(user, item_id, payload.model_dump(exclude_none=True))
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/teaching-archive/items/{item_id}/publish")
+def teacher_teaching_archive_item_publish(
+    item_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.set_item_lifecycle(user, item_id, "published")
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/teaching-archive/items/{item_id}/withdraw")
+def teacher_teaching_archive_item_withdraw(
+    item_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.set_item_lifecycle(user, item_id, "withdrawn")
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/teaching-archive/versions/compare")
+def teacher_teaching_archive_versions_compare(
+    left_version_id: str, right_version_id: str,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.compare_versions(user, left_version_id, right_version_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/teaching-archive/documents/{archive_document_id}/preview")
+def teacher_teaching_archive_document_preview(
+    archive_document_id: str, user: dict = Depends(current_teacher),
+) -> Response:
+    try:
+        media_type, value = teaching_archives.preview_content(user, archive_document_id)
+        if isinstance(value, str):
+            return Response(value, media_type=media_type)
+        return FileResponse(value, media_type=media_type, content_disposition_type="inline")
+    except CampusError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/teaching-archive/documents/{archive_document_id}/download")
+def teacher_teaching_archive_document_download(
+    archive_document_id: str, user: dict = Depends(current_teacher),
+) -> FileResponse:
+    try:
+        row, _preview = teaching_archives._require_document(user, archive_document_id)
+        source = Path(row["stored_path"]).resolve()
+        return FileResponse(source, media_type="application/octet-stream", filename=row["original_name"])
+    except CampusError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/v1/teacher/teaching-archive/documents/{archive_document_id}")
+def teacher_teaching_archive_document_delete(
+    archive_document_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.delete_document(user, archive_document_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/v1/teacher/teaching-archive/attachments/{attachment_id}")
+def teacher_teaching_archive_attachment_delete(
+    attachment_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teaching_archives.delete_attachment(user, attachment_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/courses/{course_id}/knowledge-graph")
+def teacher_knowledge_graph(course_id: str, user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return knowledge_graphs.workbench(user, course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/knowledge-graph/import-batches", status_code=201)
+def teacher_knowledge_graph_batch_create(
+    course_id: str, payload: KnowledgeGraphBatchPayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.create_import_batch(user, course_id, payload.batch_name)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/knowledge-graph/import-batches/{batch_id}/files", status_code=201)
+async def teacher_knowledge_graph_file_upload(
+    batch_id: str, file: UploadFile = File(...), relative_path: str = Form(""),
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        await file.seek(0)
+        return await run_in_threadpool(
+            knowledge_graphs.add_import_file, user, batch_id, file.filename or "graph.xlsx",
+            file.content_type or "application/octet-stream", file.file,
+            relative_path=relative_path,
+        )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/knowledge-graph/import-batches/{batch_id}")
+def teacher_knowledge_graph_batch_get(
+    batch_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.get_import_batch(user, batch_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/knowledge-graph/import-batches/{batch_id}/files/{file_id}")
+def teacher_knowledge_graph_file_update(
+    batch_id: str, file_id: str, payload: KnowledgeGraphFilePayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.update_import_file(user, batch_id, file_id, payload.kind)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/knowledge-graph/import-batches/{batch_id}/commit")
+async def teacher_knowledge_graph_batch_commit(
+    batch_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return await run_in_threadpool(knowledge_graphs.commit_import_batch, user, batch_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/knowledge-graph/import-approved-nodes")
+def teacher_knowledge_graph_import_approved_nodes(
+    course_id: str, payload: KnowledgeGraphNodeImportPayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.import_approved_nodes(user, course_id, payload.node_ids or None)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/courses/{course_id}/knowledge-graph/source-diff")
+def teacher_knowledge_graph_source_diff(
+    course_id: str, user: dict = Depends(current_teacher),
+) -> list[dict]:
+    try:
+        return knowledge_graphs.source_diff(user, course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/knowledge-graph/sync")
+def teacher_knowledge_graph_sync(
+    course_id: str, payload: KnowledgeGraphSyncPayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.sync_sources(user, course_id, payload.graph_node_ids or None)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/knowledge-graph/nodes/{node_id}")
+def teacher_knowledge_graph_node_update(
+    node_id: str, payload: KnowledgeGraphNodePayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.update_node(user, node_id, payload.model_dump(exclude_none=True))
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/knowledge-graph/relations/{relation_id}")
+def teacher_knowledge_graph_relation_update(
+    relation_id: str, payload: KnowledgeGraphRelationPayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.update_relation(user, relation_id, payload.model_dump(exclude_none=True))
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/knowledge-graph/publish")
+def teacher_knowledge_graph_publish(
+    course_id: str, user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return knowledge_graphs.publish(user, course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/student/courses/{course_id}/knowledge-graph")
+def student_knowledge_graph(
+    course_id: str, user: dict = Depends(current_student),
+) -> dict:
+    try:
+        return knowledge_graphs.student_graph(user, course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/teacher/classes/{class_id}/members")
@@ -380,6 +799,17 @@ def teacher_class_members(class_id: str, user: dict = Depends(current_teacher)) 
         return teachers.list_members(user, class_id)
     except CampusError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/classes/{class_id}/members/{student_id}/reset-password")
+def teacher_student_password_reset(
+    class_id: str, student_id: str, payload: TeacherResetStudentPasswordPayload,
+    user: dict = Depends(current_teacher),
+) -> dict:
+    try:
+        return teachers.reset_student_password(user, class_id, student_id, payload.new_password)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/teacher/classes/{class_id}/members/import")
@@ -488,6 +918,7 @@ def student_study_room_video_token(user: dict = Depends(current_student)) -> dic
 
 @app.post("/api/v1/teacher/courses/{course_id}/documents", status_code=202)
 async def teacher_document_upload(course_id: str, file: UploadFile = File(...),
+                                  relative_path: str = Form(""),
                                   analysis_mode: str = Form("api"),
                                   ai_provider: str = Form("openai_compatible"),
                                   ai_base_url: str = Form(""),
@@ -501,6 +932,7 @@ async def teacher_document_upload(course_id: str, file: UploadFile = File(...),
             ingestion.queue_document_stream,
             user, course_id, file.filename or "document",
             file.content_type or "application/octet-stream", file.file,
+            relative_path=relative_path,
             analysis_mode=analysis_mode,
             ai_settings={
                 "provider": ai_provider, "base_url": ai_base_url,
@@ -769,18 +1201,22 @@ def teacher_analysis_cancel(analysis_job_id: str, user: dict = Depends(current_t
 
 
 @app.get("/api/v1/teacher/documents/{document_id}/outline")
-def teacher_document_outline(document_id: str, user: dict = Depends(current_teacher)) -> dict:
+def teacher_document_outline(document_id: str, class_id: str | None = Query(default=None),
+                             user: dict = Depends(current_teacher)) -> dict:
     try:
-        return ingestion.document_outline(user, document_id)
+        return ingestion.document_outline(user, document_id, class_id=class_id)
     except CampusError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/teacher/courses/{course_id}/outline")
 def teacher_course_outline(course_id: str, material_type: str | None = Query(default=None),
+                           class_id: str | None = Query(default=None),
                            user: dict = Depends(current_teacher)) -> dict:
     try:
-        return ingestion.course_outline(user, course_id, material_type=material_type)
+        return ingestion.course_outline(
+            user, course_id, material_type=material_type, class_id=class_id
+        )
     except CampusError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
@@ -790,6 +1226,16 @@ def teacher_knowledge_node(node_id: str, payload: KnowledgeNodePayload,
                            user: dict = Depends(current_teacher)) -> dict:
     try:
         return ingestion.update_node(user, node_id, payload.model_dump(exclude_none=True))
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/knowledge-nodes/batch-approve")
+def teacher_knowledge_nodes_batch_approve(
+    payload: BatchDeletePayload, user: dict = Depends(current_teacher)
+) -> dict:
+    try:
+        return ingestion.approve_nodes_batch(user, payload.ids)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -952,7 +1398,13 @@ def document_preview(document_id: str, token: str = Query(...)) -> Response:
         if isinstance(value, str):
             return Response(
                 content=value, media_type=f"{media_type}; charset=utf-8",
-                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+                headers={
+                    "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+                    "Content-Security-Policy": (
+                        "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+                        if media_type == "text/html" else "default-src 'none'"
+                    ),
+                },
             )
         return FileResponse(
             value, media_type=media_type, filename="preview.pdf", content_disposition_type="inline",
@@ -1045,7 +1497,9 @@ def teacher_question_folder_create(course_id: str, payload: QuestionFolderPayloa
                                    user: dict = Depends(current_teacher)) -> dict:
     try:
         return question_banks.create_folder(
-            user, course_id, payload.folder_name, payload.folder_type
+            user, course_id, payload.folder_name, payload.folder_type,
+            parent_folder_id=payload.parent_folder_id,
+            relative_path=payload.relative_path,
         )
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
