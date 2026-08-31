@@ -70,7 +70,7 @@ def get_runtime_setting(name: str, default: str = "") -> str:
 
 
 def get_ai_settings() -> dict[str, str | bool]:
-    """Resolve AI settings dynamically so Streamlit can switch modes without restarting."""
+    """Resolve AI settings dynamically so the web client can switch modes without restarting."""
     bundled_values = _read_env_file(BUNDLED_RELAY_ENV)
     server_values = _read_env_file(SERVER_ENV)
     user_values = _read_env_file(USER_AI_ENV)
@@ -241,6 +241,19 @@ def save_user_ai_settings(
         pass
 
 
+def get_public_ai_settings() -> dict[str, str | bool]:
+    """Return runtime AI settings without ever exposing a stored credential."""
+    settings = get_ai_settings()
+    return {
+        "mode": str(settings["mode"]),
+        "provider": str(settings["provider"]),
+        "base_url": str(settings["base_url"]),
+        "model": str(settings["model"]),
+        "configured": bool(settings["configured"]),
+        "has_api_key": bool(settings["api_key"]),
+    }
+
+
 def validate_ai_base_url(base_url: str, *, allow_private: bool = False) -> None:
     """Reject credentials and internal-network destinations unless explicitly allowed.
 
@@ -287,7 +300,7 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 TOP_K = 4
 MIN_EVIDENCE_SCORE = 0.12
 MAX_EVIDENCE_CHARS = 800
-TEACHER_PORTAL_ENABLED = get_runtime_setting("ZHIJIAO_TEACHER_AGENT_ENABLED", "1").lower() in {"1", "true", "yes"}
+TEACHER_PORTAL_ENABLED = get_runtime_setting("ZHIJIAO_TEACHER_AGENT_ENABLED", "0").lower() in {"1", "true", "yes"}
 
 # Compatibility constants for existing imports. Provider construction reads the
 # dynamic settings above on every call.

@@ -51,4 +51,4 @@ Write-Host "Running a real connectivity check..."
 if ($LASTEXITCODE -ne 0) {
     throw "Qwen configuration was saved, but the real API connectivity check failed."
 }
-Write-Host "Configuration complete. Run .\start.ps1 ui"
+Write-Host "Configuration complete. Run .\start.cmd and open http://127.0.0.1:5173"

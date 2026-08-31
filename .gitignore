@@ -25,6 +25,7 @@ relay-deploy-linux-x64.zip
 *.egg-info/
 web/node_modules/
 web/dist/
+web/.npm-cache/
 *.tsbuildinfo
 vendor/
 docker/mineru.Dockerfile

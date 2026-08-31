@@ -143,7 +143,7 @@ onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(pars
 
 <template><main class="content knowledge-center">
   <div class="teacher-page-topbar workbench-hero">
-    <div class="page-title"><span class="eyebrow">KNOWLEDGE CENTER</span><h1>知识中心</h1><p class="muted">完整 Markdown 经可选 API 或本地规则分批整理、证据校验和教师审核后发布。</p></div>
+    <div class="page-title"><h1>知识中心</h1><p class="muted">上传课程资料，检查系统整理结果，确认后发布给学生使用。</p></div>
     <div class="topbar-tools">
     <el-tooltip :content="parserStatusDetail" placement="bottom">
       <span class="service-indicator" :class="parserConnected?'connected':'disconnected'"><i></i>{{parserStatusLabel}}</span>

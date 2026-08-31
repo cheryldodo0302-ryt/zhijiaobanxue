@@ -1,6 +1,6 @@
 # 智教伴学
 
-一个可本地运行和部署的校园智能学习系统。当前仓库包含 Streamlit 学生端、Vue 3 + FastAPI 教师端、SQLite 数据层、文档入库 Worker、题库/知识库治理和可选 AI 中转服务；所有访问、写入、删除、检索和统计权限都应在服务层校验。
+一个可本地运行和部署的校园智能学习系统。当前仓库使用 Vue 3 作为学生与教师的统一前端，并包含 FastAPI、SQLAlchemy 管理的 SQLite 数据层、FAISS 课程检索、文档入库 Worker、题库/知识库治理和可选 AI 中转服务；所有访问、写入、删除、检索和统计权限都应在服务层校验。
 
 项目只服务学生学习辅助和教师教学辅助，不包含行政办公端。教师端、教师知识中心和教师 Agent 均已接入统一权限校验；可用 `ZHIJIAO_TEACHER_AGENT_ENABLED=0` 在特殊部署中关闭教师 Agent。
 
@@ -65,12 +65,11 @@
 
 ```text
 zhijiao_banxue/
-├── app.py                         # Streamlit 学生端
 ├── api.py                         # FastAPI 接口
 ├── campus_service.py              # 课程、资料、问答、练习和统计
 ├── agent_service.py               # Agent 校验和 Action 路由
 ├── teacher_service.py             # 教师领域服务
-├── database.py / migrations.py    # SQLite 数据层
+├── database.py / migrations.py    # SQLAlchemy + SQLite 数据层
 ├── ingestion_service.py           # 文档解析和入库任务
 ├── document_ir.py                 # 文档块、证据和中间表示
 ├── semantic_knowledge_service.py  # 知识树和知识关系
@@ -84,7 +83,7 @@ zhijiao_banxue/
 ├── scripts/                       # 启动、建号和 Worker 脚本
 ├── tests/                         # Python 测试
 ├── course_materials/              # 演示资料
-└── data/                          # SQLite、上传文件和运行数据
+└── data/                          # 本地数据库、上传文件和运行数据（禁止提交）
 ```
 
 `data/`、`web/node_modules/`、`web/dist/`、Python 缓存和临时目录属于本地运行或构建产物，不应提交；密钥、本机 AI 配置和真实账号信息也不得提交。`reports/` 属于项目文档产物，应单独保留。
@@ -102,10 +101,11 @@ cd zhijiao_banxue
 
 ```powershell
 .\start.ps1 -Mode all       # FastAPI + Worker + Vue 学生/教师端
-.\start.ps1 -Mode ui        # Streamlit 学生端
 .\start.ps1 -Mode test      # 后端测试
 .\start.ps1 -Mode web-build # 前端生产构建
 ```
+
+启动成功后，统一入口为 `http://127.0.0.1:5173`，API 文档为 `http://127.0.0.1:8000/docs`。旧的 `ui` 启动模式已移除。
 
 无任何 AI 配置时系统默认使用确定性 Mock：不联网、不需要 API Key，相同输入得到稳定结果，适合开箱运行、测试和演示。也可切换到内置云中转、OpenAI 兼容接口、Google Gemini 或本机 Ollama。首次启动会在空数据库中创建完全虚构的演示账号与课程，随机密码写入本机 `data/demo_credentials.txt`，不会提交到 Git。
 
@@ -201,7 +201,7 @@ npm run build
 
 如需把运行数据放到其他位置，可设置环境变量 `ZHIJIAO_DATA_DIR`。
 
-个人课程不会进入教师统计；教师端的班级分析只读取共享课程数据且不返回学生 ID。Streamlit、FastAPI 和统一 Agent 接口均复用 `CampusService`，不能绕过这些规则。
+个人课程不会进入教师统计；教师端的班级分析只读取共享课程数据且不返回学生 ID。Vue、FastAPI 和统一 Agent 接口均复用 `CampusService`，不能绕过这些规则。
 
 ## 开发与安全规则
 
@@ -211,7 +211,7 @@ npm run build
 - 上传必须检查扩展名、MIME、大小、空文件、文件名安全、路径穿越和重复哈希；
 - OpenClaw/Agent 只能使用受控文件内容、引用或文件 ID，不能访问任意本地文件；
 - 未实现能力必须返回标准 `not_implemented`，不得用占位数据伪造分析；
-- Streamlit、FastAPI、Vue、CLI、Worker 和 OpenClaw 适配器必须复用服务层权限规则。
+- FastAPI、Vue、CLI、Worker 和 OpenClaw 适配器必须复用服务层权限规则。
 
 完整项目边界、Agent 规则、目录职责、安全要求和验收标准见仓库根目录 [AGENTS.md](../AGENTS.md)。
 

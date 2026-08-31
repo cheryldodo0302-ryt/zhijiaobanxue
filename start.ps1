@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet("all", "ui", "api", "worker", "web-dev", "web-build", "test", "ai-check")]
+    [ValidateSet("all", "api", "worker", "web-dev", "web-build", "test", "ai-check")]
     [string]$Mode = "all"
 )
 
@@ -98,7 +98,7 @@ function Ensure-PythonEnvironment {
 import sys
 
 try:
-    import fastapi, streamlit, sklearn, pypdf, docx, pptx, openpyxl, requests, jwt, argon2
+    import fastapi, faiss, sqlalchemy, sklearn, pypdf, docx, pptx, openpyxl, requests, jwt, argon2
 except Exception:
     # Keep the probe quiet; the caller will install requirements on status 1.
     sys.exit(1)
@@ -163,14 +163,13 @@ $pythonExe = Ensure-PythonEnvironment
 if ($Mode -eq "all") { [void](Ensure-WebEnvironment) }
 $version = & $pythonExe -c "import platform; print(platform.python_version())"
 Write-Host "使用项目 Python：$pythonExe（$version）"
-if ($Mode -in @("all", "ui", "api")) {
+if ($Mode -in @("all", "api")) {
     & $pythonExe scripts/bootstrap_demo.py --if-empty
     if ($LASTEXITCODE -ne 0) { throw "初始化演示账号失败。" }
 }
 
 switch ($Mode) {
     "all" { & $pythonExe scripts/run_all.py }
-    "ui" { & $pythonExe -m streamlit run app.py }
     "api" { & $pythonExe -m uvicorn api:app --host 127.0.0.1 --port 8000 }
     "worker" { & $pythonExe scripts/run_ingestion_worker.py }
     "test" { & $pythonExe -m pytest -q }

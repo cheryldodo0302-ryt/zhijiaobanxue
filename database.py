@@ -5,6 +5,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from sqlalchemy import create_engine
+from sqlalchemy.engine import URL
+
 from migrations import apply_migrations
 
 
@@ -19,11 +22,17 @@ class LearningDatabase:
     def __init__(self, db_path: Path | str):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.engine = create_engine(
+            URL.create("sqlite+pysqlite", database=str(self.db_path.resolve())),
+            connect_args={"check_same_thread": False},
+            pool_pre_ping=True,
+        )
         self.init_schema()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.db_path)
+        pooled = self.engine.raw_connection()
+        conn = getattr(pooled, "driver_connection", pooled)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         try:
@@ -33,7 +42,7 @@ class LearningDatabase:
             conn.rollback()
             raise
         finally:
-            conn.close()
+            pooled.close()
 
     def init_schema(self) -> None:
         with self.connect() as conn:
@@ -188,6 +197,23 @@ class LearningDatabase:
             """)
             apply_migrations(conn)
             self._backfill_class_scope(conn)
+        self._reconcile_missing_document_sources()
+
+    def _reconcile_missing_document_sources(self) -> None:
+        """Do not advertise a document as ready when its source file is gone."""
+        rows = self.fetch_all(
+            "SELECT document_id,stored_path FROM course_documents WHERE status='ready' AND TRIM(stored_path)<>''"
+        )
+        for row in rows:
+            try:
+                source_exists = Path(str(row["stored_path"])).is_file()
+            except (OSError, ValueError):
+                source_exists = False
+            if not source_exists:
+                self.execute(
+                    "UPDATE course_documents SET status='failed',error_message='源文件缺失，请重新上传' WHERE document_id=?",
+                    (row["document_id"],),
+                )
 
     @staticmethod
     def _backfill_class_scope(conn: sqlite3.Connection) -> None:

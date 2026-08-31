@@ -248,10 +248,10 @@ def test_student_memory_minimum_loop_and_teacher_disabled(campus):
         assert "宋体" in document_xml
         assert "宋体" in styles_xml
     teacher_course = campus.create_course("教师共享课程", "shared_course", "teacher_1", "teacher")
-    enabled = agent.invoke({"request_id":"t1","agent":"teacher_assistant","action":"teaching_report",
+    disabled = agent.invoke({"request_id":"t1","agent":"teacher_assistant","action":"teaching_report",
                             "actor":{"user_id":"teacher_1","role":"teacher"},
                             "scope":{"course_id":teacher_course["course_id"]}})
-    assert enabled.status == "success"
+    assert disabled.status == "disabled"
 
     deleted = agent.invoke({"request_id":"m7","agent":"student_assistant","action":"personal_course_delete",
                             "actor":{"user_id":"student_1","role":"student"},"scope":{"course_id":course["course_id"]}})

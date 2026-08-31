@@ -6,14 +6,14 @@ GitHub 项目中不保存真实千问 `DASHSCOPE_API_KEY`。下载者默认调�
 中转服务；中转服务在服务器端加入真实 Key，再请求阿里云百炼。
 
 ```text
-下载者的 Streamlit
+下载者的 Vue 统一前端
   -> HTTPS 中转地址 + 客户端令牌
   -> 云端 relay
   -> 服务器环境变量 DASHSCOPE_API_KEY
   -> 阿里云千问
 ```
 
-侧栏“AI 服务设置”也允许下载者选择自己的 OpenAI 兼容 Base URL、API Key
+账户菜单中的“AI 服务设置”也允许下载者选择自己的 OpenAI 兼容 Base URL、API Key
 和模型，也支持 Google Gemini 原生接口。该配置只写入本机 `user_ai.env`，已被
 `.gitignore` 排除。
 
@@ -111,7 +111,7 @@ ZHIJIAO_RELAY_TOKEN=上一步生成的令牌
 ```
 
 `relay_client.env` 可以提交到 GitHub，因为其中没有真实千问 Key。提交后，其他人
-下载 GitHub ZIP、安装依赖并执行 `.\start.ps1 ui`，即可默认使用你的云端服务。
+下载 GitHub ZIP、安装依赖并执行 `.\start.cmd`，再访问 `http://127.0.0.1:5173`，即可默认使用你的云端服务。
 
 ## 4. 上线前保护
 

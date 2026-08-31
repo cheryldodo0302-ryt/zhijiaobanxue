@@ -89,3 +89,17 @@ def test_legacy_server_key_overrides_bundled_relay(monkeypatch, tmp_path):
     settings = config.get_ai_settings()
     assert settings["mode"] == "qwen"
     assert settings["api_key"] == "server-secret"
+
+
+def test_public_ai_settings_never_exposes_secret(monkeypatch, tmp_path):
+    _isolate_settings(monkeypatch, tmp_path)
+    config.save_user_ai_settings(
+        "custom",
+        base_url="https://custom.example.com/v1",
+        api_key="never-return-this-secret",
+        model="custom-model",
+    )
+    public = config.get_public_ai_settings()
+    assert public["has_api_key"] is True
+    assert "api_key" not in public
+    assert "never-return-this-secret" not in repr(public)
