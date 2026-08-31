@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api'
 import { useAuthStore } from '../stores/auth'
@@ -9,7 +9,10 @@ const loading = ref(false)
 const status = ref<any>({ status: '等待开始', learning: false, score: 0, focus: 0, study_time: 0 })
 const records = ref<any[]>([])
 const statistics = ref<any>({ total_sessions: 0, total_study_time: 0, average_score: 0, average_focus: 0, best_score: 0 })
-const videoUrl = ref('')
+const videoRef = ref<HTMLVideoElement | null>(null)
+const cameraReady = ref(false)
+const cameraMessage = ref('摄像头画面只在本浏览器显示，不会上传服务器。')
+let browserStream: MediaStream | null = null
 let poller: number | undefined
 
 const isLearning = computed(() => Boolean(status.value.learning))
@@ -30,7 +33,7 @@ async function loadData() {
     status.value = current.data
     records.value = history.data
     statistics.value = summary.data
-    if (!status.value.learning) videoUrl.value = ''
+    if (!status.value.learning) stopBrowserCamera()
   } catch (error: any) {
     ElMessage.error(error.response?.data?.detail || '自习室状态加载失败')
   }
@@ -44,16 +47,22 @@ function startPolling() {
 async function startStudy() {
   loading.value = true
   try {
+    try {
+      browserStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+      cameraReady.value = true
+      cameraMessage.value = '摄像头画面只在本浏览器显示，不会上传服务器。'
+      await nextTick()
+      if (videoRef.value) videoRef.value.srcObject = browserStream
+    } catch (cameraError: any) {
+      stopBrowserCamera()
+      cameraMessage.value = cameraError?.name === 'NotAllowedError'
+        ? '未获得摄像头权限，已切换为仅计时；可在浏览器地址栏重新授权。'
+        : '浏览器摄像头不可用，已切换为仅计时。'
+    }
     const { data } = await api.post('/student/study-room/start')
     status.value = data
     startPolling()
-    if (data.camera_available) {
-      try {
-        const token = (await api.post('/student/study-room/video-token')).data.token
-        videoUrl.value = `/api/v1/student/study-room/video?stream_token=${encodeURIComponent(token)}`
-      } catch { videoUrl.value = '' }
-    }
-    ElMessage.success(data.camera_available ? '自习已开始，正在校准摄像头' : '自习计时已开始')
+    ElMessage.success(cameraReady.value ? '自习已开始，本地摄像头预览已开启' : '自习计时已开始')
   } catch (error: any) {
     ElMessage.error(error.response?.data?.detail || '无法开始自习')
   } finally { loading.value = false }
@@ -65,7 +74,7 @@ async function finishStudy() {
   try {
     const { data } = await api.post('/student/study-room/finish')
     status.value = data
-    videoUrl.value = ''
+    stopBrowserCamera()
     await loadData()
     ElMessage.success(`本次自习已保存，综合分 ${Number(data.score || 0).toFixed(1)}`)
   } catch (error: any) {
@@ -81,17 +90,22 @@ async function clearHistory() {
 }
 
 async function logout() { await auth.logout(); location.href = '/login' }
+function stopBrowserCamera() {
+  browserStream?.getTracks().forEach(track => track.stop())
+  browserStream = null
+  cameraReady.value = false
+  if (videoRef.value) videoRef.value.srcObject = null
+}
 onMounted(() => { loadData(); startPolling() })
-onUnmounted(() => { if (poller) window.clearInterval(poller) })
+onUnmounted(() => { if (poller) window.clearInterval(poller); stopBrowserCamera() })
 </script>
 
 <template>
-  <main class="content student-study-room" v-loading="loading">
+  <main class="content student-study-room" :aria-busy="loading">
     <header class="student-header">
       <div class="page-title">
-        <span class="eyebrow">STUDENT AI STUDY ROOM</span>
         <h1>AI 自习室</h1>
-        <p class="muted">用摄像头姿态、在场状态和专注时长帮助你复盘学习节奏；摄像头不可用时自动保留计时功能。</p>
+        <p class="muted">记录专注时长，并在当前浏览器中提供本地摄像头预览；摄像头不可用时仍可计时。</p>
       </div>
       <div class="student-account">
         <el-button plain @click="$router.push('/student/courses')">返回课程</el-button>
@@ -102,22 +116,20 @@ onUnmounted(() => { if (poller) window.clearInterval(poller) })
 
     <section class="study-room-hero">
       <div>
-        <span class="eyebrow">TODAY'S SESSION</span>
         <h2>{{ isLearning ? '保持自己的节奏，系统会记录本场变化' : '准备好后开始一场专注自习' }}</h2>
-        <p v-if="status.warning" class="study-room-warning">{{ status.warning }}</p>
-        <p v-else class="muted">开始后请正对摄像头约 3 秒完成姿态校准；系统只在本机保存统计结果。</p>
+        <p class="study-room-warning">{{ cameraMessage }}</p>
       </div>
       <div class="study-room-actions">
-        <el-button v-if="!isLearning" type="primary" size="large" @click="startStudy">开始自习</el-button>
-        <el-button v-else type="danger" size="large" @click="finishStudy">结束并保存</el-button>
+        <el-button v-if="!isLearning" type="primary" size="large" :loading="loading" @click="startStudy">开始自习</el-button>
+        <el-button v-else type="danger" size="large" :loading="loading" @click="finishStudy">结束并保存</el-button>
       </div>
     </section>
 
     <section class="study-room-layout">
       <el-card shadow="never" class="study-camera-card">
         <template #header><div class="card-heading"><b>实时状态</b><el-tag :type="isLearning ? 'success' : 'info'">{{ status.status || '等待开始' }}</el-tag></div></template>
-        <div v-if="videoUrl" class="study-video-wrap"><img :src="videoUrl" alt="AI 自习室摄像头画面" /></div>
-        <div v-else class="study-video-placeholder"><span class="study-video-icon">◉</span><b>{{ status.camera_available ? '等待视频画面' : '摄像头 AI 未启用' }}</b><p class="muted">{{ status.camera_available ? '启动后将显示带状态标注的画面。' : '可继续使用计时；安装可选视觉依赖并允许摄像头后启用行为评分。' }}</p></div>
+        <div v-show="cameraReady" class="study-video-wrap"><video ref="videoRef" autoplay muted playsinline aria-label="本地摄像头预览" /></div>
+        <div v-if="!cameraReady" class="study-video-placeholder"><span class="study-video-icon">◉</span><b>本地摄像头未开启</b><p class="muted">开始自习时浏览器会请求权限；拒绝授权不会影响计时。</p></div>
         <div class="study-metrics">
           <div><span>实时分</span><strong :class="scoreClass">{{ Number(status.score || 0).toFixed(1) }}</strong></div>
           <div><span>专注度</span><strong>{{ Number(status.focus || 0).toFixed(1) }}%</strong></div>
@@ -134,7 +146,7 @@ onUnmounted(() => { if (poller) window.clearInterval(poller) })
           <div><span>最高综合分</span><strong>{{ Number(statistics.best_score || 0).toFixed(1) }}</strong></div>
         </div>
         <el-divider />
-        <p class="muted small">评分由行为表现、专注度、稳定性和有效学习率综合组成。计时模式不会虚构行为评分。</p>
+        <p class="muted small">当前仅记录可核验的自习时长，不上传画面，也不根据摄像头内容生成行为评分。</p>
         <el-button text type="danger" @click="clearHistory" :disabled="!records.length">清空我的记录</el-button>
       </el-card>
     </section>

@@ -1,4 +1,0 @@
-# Optional dependencies for the student AI study room camera/vision mode.
-# The core system and timer-only fallback do not require these packages.
-opencv-python>=4.10,<5
-mediapipe>=0.10.30,<1

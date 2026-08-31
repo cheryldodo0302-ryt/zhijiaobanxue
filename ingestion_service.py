@@ -5320,20 +5320,49 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             (document_id,),
         )
 
-    def list_blocks(self, actor: dict[str, Any], document_id: str) -> list[dict[str, Any]]:
+    def list_blocks(self, actor: dict[str, Any], document_id: str, *, limit: int = 100,
+                    offset: int = 0, page_number: int | None = None) -> list[dict[str, Any]]:
         doc = self.db.fetch_one("SELECT * FROM course_documents WHERE document_id=?", (document_id,))
         if not doc:
             raise NotFound("资料不存在")
         course = self.campus.require_access(doc["course_id"], str(actor["user_id"]), "teacher")
         if course["owner_id"] != actor["user_id"]:
             raise PermissionDenied("无权审核该资料")
-        rows = self.db.fetch_all(
-            "SELECT * FROM document_blocks WHERE document_id=? ORDER BY page_number,block_order", (document_id,)
-        )
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        if page_number is None:
+            rows = self.db.fetch_all(
+                """SELECT * FROM document_blocks WHERE document_id=?
+                   ORDER BY page_number,block_order LIMIT ? OFFSET ?""",
+                (document_id, limit, offset),
+            )
+        else:
+            rows = self.db.fetch_all(
+                """SELECT * FROM document_blocks WHERE document_id=? AND page_number=?
+                   ORDER BY block_order LIMIT ? OFFSET ?""",
+                (document_id, max(1, int(page_number)), limit, offset),
+            )
         for row in rows:
             row["bbox"] = json.loads(row.pop("bbox_json"))
             row["search_aliases"] = json.loads(row.pop("search_aliases_json"))
         return rows
+
+    def count_blocks(self, actor: dict[str, Any], document_id: str,
+                     page_number: int | None = None) -> int:
+        doc = self.db.fetch_one("SELECT course_id FROM course_documents WHERE document_id=?", (document_id,))
+        if not doc:
+            raise NotFound("资料不存在")
+        course = self.campus.require_access(doc["course_id"], str(actor["user_id"]), "teacher")
+        if course["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("无权审核该资料")
+        if page_number is None:
+            row = self.db.fetch_one("SELECT COUNT(*) n FROM document_blocks WHERE document_id=?", (document_id,))
+        else:
+            row = self.db.fetch_one(
+                "SELECT COUNT(*) n FROM document_blocks WHERE document_id=? AND page_number=?",
+                (document_id, max(1, int(page_number))),
+            )
+        return int((row or {}).get("n") or 0)
 
     def review_block(self, actor: dict[str, Any], block_id: str, *, markdown: str, plain_text: str,
                      latex: str, visibility_level: str, accepted: bool) -> dict[str, Any]:

@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import normalize
 from sklearn.metrics.pairwise import cosine_similarity
 
 from config import DATA_DIR, MAX_EVIDENCE_CHARS, MAX_UPLOAD_BYTES, MIN_EVIDENCE_SCORE, TOP_K
@@ -160,8 +162,24 @@ class ChunkRetriever:
     def __init__(self, rows: list[dict]):
         self.rows = rows
         self.chunks = rows
-        self.vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(1, 3), min_df=1)
+        self.vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(1, 3), min_df=1, max_features=20000)
         self.matrix = self.vectorizer.fit_transform([row["content"] for row in rows]) if rows else None
+        self.reducer = None
+        self.faiss_index = None
+        if self.matrix is not None and self.matrix.shape[0]:
+            dimensions = min(256, self.matrix.shape[0] - 1, self.matrix.shape[1] - 1)
+            dense = self.matrix.toarray()
+            if dimensions >= 2:
+                self.reducer = TruncatedSVD(n_components=dimensions, random_state=42)
+                dense = self.reducer.fit_transform(self.matrix)
+            dense = normalize(dense).astype("float32")
+            try:
+                import faiss
+
+                self.faiss_index = faiss.IndexFlatIP(dense.shape[1])
+                self.faiss_index.add(dense)
+            except ImportError:
+                self.faiss_index = None
 
     @staticmethod
     def _keywords(text: str) -> set[str]:
@@ -172,10 +190,22 @@ class ChunkRetriever:
     def search(self, query: str, top_k: int = 4) -> list[Evidence]:
         if not query.strip() or self.matrix is None:
             return []
-        scores = cosine_similarity(self.vectorizer.transform([query]), self.matrix)[0]
+        query_sparse = self.vectorizer.transform([query])
+        scores = cosine_similarity(query_sparse, self.matrix)[0]
+        candidate_indexes = list(range(len(self.rows)))
+        if self.faiss_index is not None:
+            query_dense = self.reducer.transform(query_sparse) if self.reducer is not None else query_sparse.toarray()
+            query_dense = normalize(query_dense).astype("float32")
+            candidate_count = min(len(self.rows), max(20, int(top_k) * 8))
+            faiss_scores, faiss_indexes = self.faiss_index.search(query_dense, candidate_count)
+            candidate_indexes = [int(index) for index in faiss_indexes[0] if index >= 0]
+            scores = [0.0] * len(self.rows)
+            for index, score in zip(candidate_indexes, faiss_scores[0]):
+                scores[index] = float(score)
         query_keys = self._keywords(query)
         ranked = []
-        for index, row in enumerate(self.rows):
+        for index in candidate_indexes:
+            row = self.rows[index]
             keys = self._keywords(row["content"] + " " + row["section"])
             score = .72 * float(scores[index]) + .28 * len(query_keys & keys) / max(len(query_keys), 1)
             ranked.append((score, row))
@@ -741,9 +771,93 @@ class CampusService:
     def seed_demo(self, materials_dir: Path) -> None:
         self.upsert_virtual_course("virtual_ai_101", "人工智能基础（虚拟课程）", "demo_teacher_001",
                                    "用于演示教师共享课程、问答、练习和匿名学情分析。", "public")
-        existing = self.db.fetch_one("SELECT COUNT(*) n FROM course_documents WHERE course_id='virtual_ai_101'")
-        if existing and existing["n"]:
-            return
         for path in sorted(materials_dir.glob("*.md")):
             data = path.read_bytes()
-            self.upload_document("virtual_ai_101", "demo_teacher_001", "teacher", path.name, "text/markdown", data)
+            document = self.db.fetch_one(
+                "SELECT * FROM course_documents WHERE course_id='virtual_ai_101' AND original_name=?",
+                (path.name,),
+            )
+            if not document:
+                self.upload_document("virtual_ai_101", "demo_teacher_001", "teacher", path.name, "text/markdown", data)
+                continue
+            stored = Path(str(document.get("stored_path") or ""))
+            if not stored.is_file():
+                destination = (self.storage_dir / "virtual_ai_101" / f"{document['document_id']}_{_safe_name(path.name)}").resolve()
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+                self.db.execute(
+                    "UPDATE course_documents SET stored_path=?,size_bytes=?,sha256=?,status='ready',error_message='' WHERE document_id=?",
+                    (str(destination), len(data), hashlib.sha256(data).hexdigest(), document["document_id"]),
+                )
+            chunks = self.db.fetch_one(
+                "SELECT COUNT(*) n FROM document_chunks WHERE document_id=?", (document["document_id"],)
+            )
+            if not chunks or not chunks["n"]:
+                parsed = parse_document(data, ".md")
+                with self.db.connect() as conn:
+                    conn.executemany(
+                        "INSERT INTO document_chunks(document_id,course_id,section,page_number,content) VALUES(?,?,?,?,?)",
+                        [(document["document_id"], "virtual_ai_101", item["section"], item["page_number"], item["content"]) for item in parsed],
+                    )
+        self._publish_demo_knowledge()
+
+    def _publish_demo_knowledge(self) -> None:
+        """Create a small, source-bound published snapshot for reliable demos."""
+        existing = self.db.fetch_one(
+            """SELECT 1 ok FROM knowledge_versions v JOIN knowledge_version_nodes n USING(version_id)
+               WHERE v.course_id='virtual_ai_101' AND v.status='published' LIMIT 1"""
+        )
+        if existing:
+            return
+        chunks = self.db.fetch_all(
+            """SELECT c.chunk_id,c.document_id,c.section,c.page_number,c.content,d.original_name
+               FROM document_chunks c JOIN course_documents d USING(document_id)
+               WHERE c.course_id='virtual_ai_101' AND d.status='ready'
+               ORDER BY d.original_name,c.chunk_id LIMIT 24"""
+        )
+        if not chunks:
+            return
+        last = self.db.fetch_one(
+            "SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id='virtual_ai_101'"
+        )
+        version_number = int((last or {}).get("n") or 0) + 1
+        version_id = f"demo_version_{version_number}"
+        with self.db.connect() as conn:
+            conn.execute(
+                "UPDATE knowledge_versions SET status='superseded' WHERE course_id='virtual_ai_101' AND status='published'"
+            )
+            conn.execute(
+                """INSERT INTO knowledge_versions(version_id,course_id,version_number,status,created_by,published_at,markdown_snapshot)
+                   VALUES(?,'virtual_ai_101',?,'published','demo_teacher_001',CURRENT_TIMESTAMP,?)""",
+                (version_id, version_number, "\n\n".join(item["content"] for item in chunks)),
+            )
+            for order, item in enumerate(chunks, 1):
+                fingerprint = hashlib.sha256(f"{item['document_id']}:{item['chunk_id']}".encode()).hexdigest()[:20]
+                block_id = f"demo_block_{fingerprint}"
+                node_id = f"demo_node_{fingerprint}"
+                page_number = int(item.get("page_number") or 1)
+                title = str(item.get("section") or item["original_name"] or f"知识点 {order}")[:160]
+                conn.execute(
+                    """INSERT OR IGNORE INTO document_blocks(
+                           block_id,document_id,block_order,block_type,markdown,plain_text,page_number,
+                           verification_status,visibility_level,source_method,parser_name,parser_version,
+                           reviewed_by,reviewed_at)
+                       VALUES(?,?,?,'paragraph',?,?,?,'teacher_verified','PUBLIC','demo_seed',
+                              'demo_seed','1','demo_teacher_001',CURRENT_TIMESTAMP)""",
+                    (block_id, item["document_id"], order, item["content"], item["content"], page_number),
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO knowledge_nodes(
+                           node_id,course_id,document_id,node_scope,node_type,title,summary,markdown,
+                           keywords_json,source_pages_json,sort_order,status,reviewed_by,reviewed_at)
+                       VALUES(?,'virtual_ai_101',?,'course','knowledge_point',?,?,?,?,?,?,'approved',
+                              'demo_teacher_001',CURRENT_TIMESTAMP)""",
+                    (node_id, item["document_id"], title, title, item["content"], "[]", json.dumps([page_number]), order),
+                )
+                conn.execute(
+                    """INSERT OR IGNORE INTO knowledge_node_sources(node_id,block_id,document_id,page_number,bbox_json)
+                       VALUES(?,?,?,?, '[]')""",
+                    (node_id, block_id, item["document_id"], page_number),
+                )
+                conn.execute("INSERT OR IGNORE INTO knowledge_version_nodes(version_id,node_id) VALUES(?,?)", (version_id, node_id))
+                conn.execute("INSERT OR IGNORE INTO knowledge_version_blocks(version_id,block_id) VALUES(?,?)", (version_id, block_id))

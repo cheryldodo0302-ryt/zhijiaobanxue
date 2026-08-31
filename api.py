@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -14,14 +14,17 @@ from starlette.concurrency import run_in_threadpool
 from agent_service import CampusAgentService
 from auth_service import AuthService
 from campus_service import CampusError, CampusService, NotFound
-from config import DB_PATH, MATERIALS_DIR, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, student_import_config_status
+from config import (
+    DB_PATH, MATERIALS_DIR, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB,
+    get_ai_settings, get_public_ai_settings, save_user_ai_settings, student_import_config_status,
+)
 from database import LearningDatabase
 from llm_provider import backend_provider_status
 from ingestion_service import IngestionService
 from question_bank_service import QuestionBankService
 from runtime_contract import RUNTIME_SOURCE_FINGERPRINT
 from teacher_service import TeacherService
-from study_room_service import StudyRoomBusy, StudyRoomService, StudyRoomUnavailable
+from browser_study_room_service import BrowserStudyRoomService, StudyRoomUnavailable
 from teaching_archive_service import TeachingArchiveService
 from knowledge_graph_service import KnowledgeGraphService
 
@@ -35,7 +38,7 @@ ingestion = IngestionService(db, campus)
 teaching_archives = TeachingArchiveService(db, campus, ingestion)
 knowledge_graphs = KnowledgeGraphService(db, campus)
 question_banks = QuestionBankService(db, campus)
-study_room = StudyRoomService()
+study_room = BrowserStudyRoomService()
 app = FastAPI(title="智教伴学 API", version="1.0.0")
 allowed_origins = [value.strip() for value in os.environ.get(
     "ZHIJIAO_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
@@ -44,7 +47,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -58,10 +61,9 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(self), geolocation=()")
     return response
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
-oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
 class AgentPayload(BaseModel):
@@ -77,6 +79,14 @@ class AgentPayload(BaseModel):
 class LoginPayload(BaseModel):
     username: str
     password: str
+
+
+class RuntimeAiSettingsPayload(BaseModel):
+    mode: str
+    provider: str = "auto"
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
 
 
 class CourseCreatePayload(BaseModel):
@@ -350,6 +360,35 @@ def health() -> dict:
 @app.get("/api/v1/system/capabilities")
 def capabilities() -> dict:
     return {"max_upload_bytes": MAX_UPLOAD_BYTES, "max_upload_mb": MAX_UPLOAD_MB}
+
+
+@app.get("/api/v1/runtime/ai-settings")
+def runtime_ai_settings(user: dict = Depends(current_ready_user)) -> dict:
+    del user
+    return get_public_ai_settings()
+
+
+@app.put("/api/v1/runtime/ai-settings")
+def update_runtime_ai_settings(
+    payload: RuntimeAiSettingsPayload,
+    user: dict = Depends(current_ready_user),
+) -> dict:
+    del user
+    try:
+        current = get_ai_settings()
+        api_key = payload.api_key
+        if payload.mode == "custom" and not api_key and current.get("mode") == "custom":
+            api_key = str(current.get("api_key") or "")
+        save_user_ai_settings(
+            payload.mode,
+            provider=payload.provider,
+            base_url=payload.base_url,
+            model=payload.model,
+            api_key=api_key,
+        )
+        return get_public_ai_settings()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/system/student-import-config")
@@ -845,10 +884,7 @@ def student_study_room_status(user: dict = Depends(current_student)) -> dict:
 
 @app.post("/api/v1/student/study-room/start")
 def student_study_room_start(user: dict = Depends(current_student)) -> dict:
-    try:
-        return study_room.start(str(user["user_id"]))
-    except StudyRoomBusy as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return study_room.start(str(user["user_id"]))
 
 
 @app.post("/api/v1/student/study-room/finish")
@@ -877,43 +913,13 @@ def student_study_room_clear_records(user: dict = Depends(current_student)) -> d
 
 
 @app.get("/api/v1/student/study-room/video")
-def student_study_room_video(stream_token: str | None = Query(default=None),
-                             token: str | None = Depends(oauth2_scheme_optional)) -> StreamingResponse:
-    if stream_token:
-        student_id = study_room.resolve_stream_token(stream_token)
-        if not student_id:
-            raise HTTPException(status_code=401, detail="视频令牌无效或已过期")
-    else:
-        if not token:
-            raise HTTPException(status_code=401, detail="需要登录后查看视频流")
-        try:
-            user = auth.authenticate(token)
-        except CampusError as exc:
-            raise HTTPException(status_code=401, detail=str(exc), headers={"WWW-Authenticate": "Bearer"}) from exc
-        if user.get("role") != "student" or user.get("must_change_password"):
-            raise HTTPException(status_code=403, detail="仅已完成初始密码修改的学生可以查看视频流")
-        student_id = str(user["user_id"])
-    status = study_room.status(student_id)
-    if not status.get("learning") or not status.get("camera_available"):
-        raise HTTPException(status_code=409, detail="当前没有可用的摄像头视频流")
-    try:
-        stream = study_room.video_stream(student_id)
-    except StudyRoomUnavailable as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return StreamingResponse(
-        stream,
-        media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
-    )
+def student_study_room_video(user: dict = Depends(current_student)) -> dict:
+    raise HTTPException(status_code=410, detail="摄像头已迁移到学生浏览器，不再提供服务器视频流")
 
 
 @app.post("/api/v1/student/study-room/video-token")
 def student_study_room_video_token(user: dict = Depends(current_student)) -> dict:
-    try:
-        token = study_room.issue_stream_token(str(user["user_id"]))
-    except StudyRoomUnavailable as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return {"token": token, "expires_in": 300}
+    raise HTTPException(status_code=410, detail="摄像头已迁移到学生浏览器，不再签发视频令牌")
 
 
 @app.post("/api/v1/teacher/courses/{course_id}/documents", status_code=202)
@@ -1042,9 +1048,15 @@ def teacher_teaching_overview(course_id: str, class_id: str | None = None,
 
 
 @app.get("/api/v1/teacher/documents/{document_id}/blocks")
-def teacher_document_blocks(document_id: str, user: dict = Depends(current_teacher)) -> list[dict]:
+def teacher_document_blocks(document_id: str, response: Response,
+                            limit: int = Query(default=100, ge=1, le=200),
+                            offset: int = Query(default=0, ge=0),
+                            page_number: int | None = Query(default=None, ge=1),
+                            user: dict = Depends(current_teacher)) -> list[dict]:
     try:
-        return ingestion.list_blocks(user, document_id)
+        response.headers["X-Total-Count"] = str(ingestion.count_blocks(user, document_id, page_number))
+        response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
+        return ingestion.list_blocks(user, document_id, limit=limit, offset=offset, page_number=page_number)
     except CampusError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 

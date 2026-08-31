@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 MODE="${1:-all}"
 case "$MODE" in
-  all|ui|api|worker|web-dev|web-build|test|ai-check) ;;
+  all|api|worker|web-dev|web-build|test|ai-check) ;;
   *) echo "未知模式：$MODE" >&2; exit 2 ;;
 esac
 
@@ -58,19 +58,18 @@ if ! "$VENV_PYTHON" -c 'import sys; assert sys.version_info[:2] in ((3,10),(3,11
   echo "项目虚拟环境不是 Python 3.10/3.11/3.12，请重命名 $VENV_DIR 后重试。" >&2
   exit 2
 fi
-if ! "$VENV_PYTHON" -c 'import fastapi,streamlit,sklearn,pypdf,docx,pptx,openpyxl,requests,jwt,argon2' >/dev/null 2>&1; then
+if ! "$VENV_PYTHON" -c 'import fastapi,faiss,sqlalchemy,sklearn,pypdf,docx,pptx,openpyxl,requests,jwt,argon2' >/dev/null 2>&1; then
   "$VENV_PYTHON" -m pip install -r requirements.txt
 fi
 
 if [ "$MODE" = "all" ]; then ensure_web; fi
 echo "使用项目 Python：$($VENV_PYTHON -c 'import platform; print(platform.python_version())')"
-if [ "$MODE" = "all" ] || [ "$MODE" = "ui" ] || [ "$MODE" = "api" ]; then
+if [ "$MODE" = "all" ] || [ "$MODE" = "api" ]; then
   "$VENV_PYTHON" scripts/bootstrap_demo.py --if-empty
 fi
 
 case "$MODE" in
   all) exec "$VENV_PYTHON" scripts/run_all.py ;;
-  ui) exec "$VENV_PYTHON" -m streamlit run app.py ;;
   api) exec "$VENV_PYTHON" -m uvicorn api:app --host 127.0.0.1 --port 8000 ;;
   worker) exec "$VENV_PYTHON" scripts/run_ingestion_worker.py ;;
   test) exec "$VENV_PYTHON" -m pytest -q ;;

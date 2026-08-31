@@ -4,20 +4,16 @@ import time
 
 import pytest
 
-from study_room_service import StudyRoomBusy, StudyRoomService, StudyRoomUnavailable
+from browser_study_room_service import BrowserStudyRoomService, StudyRoomUnavailable
 
 
-def test_timer_fallback_is_persisted_per_student(tmp_path, monkeypatch):
-    service = StudyRoomService(tmp_path / "study-room.db")
-    monkeypatch.setattr(service, "_try_open_camera", lambda: False)
+def test_browser_sessions_are_persisted_and_allow_multiple_students(tmp_path):
+    service = BrowserStudyRoomService(tmp_path / "study-room.db")
 
     started = service.start("student-a")
     assert started["learning"] is True
-    assert started["mode"] == "timer"
-    assert started["camera_available"] is False
-    assert service.status("student-b")["busy"] is True
-    with pytest.raises(StudyRoomBusy):
-        service.start("student-b")
+    assert started["mode"] == "browser"
+    assert service.start("student-b")["learning"] is True
 
     time.sleep(0.02)
     finished = service.finish("student-a")
@@ -27,12 +23,12 @@ def test_timer_fallback_is_persisted_per_student(tmp_path, monkeypatch):
     assert service.records("student-b") == []
     assert service.statistics("student-a")["total_sessions"] == 1
     with pytest.raises(StudyRoomUnavailable):
-        service.finish("student-b")
+        service.finish("student-a")
+    service.finish("student-b")
 
 
-def test_clear_records_only_clears_the_current_student(tmp_path, monkeypatch):
-    service = StudyRoomService(tmp_path / "study-room.db")
-    monkeypatch.setattr(service, "_try_open_camera", lambda: False)
+def test_clear_records_only_clears_the_current_student(tmp_path):
+    service = BrowserStudyRoomService(tmp_path / "study-room.db")
     service.start("student-a")
     service.finish("student-a")
     service.start("student-b")

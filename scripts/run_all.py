@@ -274,7 +274,7 @@ def main() -> int:
             return 1
 
         print("\n系统已就绪：", flush=True)
-        print("  教师端：http://127.0.0.1:5173", flush=True)
+        print("  统一入口：http://127.0.0.1:5173", flush=True)
         print("  API 文档：http://127.0.0.1:8000/docs", flush=True)
         if reused:
             print(f"  已复用外部进程：{', '.join(reused)}", flush=True)

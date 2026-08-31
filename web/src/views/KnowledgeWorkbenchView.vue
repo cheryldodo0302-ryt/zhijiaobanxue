@@ -82,7 +82,7 @@ async function upload() {
 async function openReview(job: any) {
   try {
     const [blockResult, previewResult] = await Promise.all([
-      api.get(`/teacher/documents/${job.document_id}/blocks`),
+      api.get(`/teacher/documents/${job.document_id}/blocks`, { params: { limit: 100 } }),
       api.post(`/documents/${job.document_id}/preview-token`),
     ])
     blocks.value = blockResult.data
@@ -94,9 +94,15 @@ async function openReview(job: any) {
   } catch (error) { fail(error, '审核资料加载失败') }
 }
 
-function goPage(value = pageInput.value) {
+async function goPage(value = pageInput.value) {
   selectedPage.value = clampPage(value, totalPages.value, selectedPage.value)
   pageInput.value = selectedPage.value
+  if (!selectedDocument.value) return
+  try {
+    blocks.value = (await api.get(`/teacher/documents/${selectedDocument.value.document_id}/blocks`, {
+      params: { page_number: selectedPage.value, limit: 200 },
+    })).data
+  } catch (error) { fail(error, '当前页知识块加载失败') }
 }
 
 async function routeBlock(block: any, destination: string) {
