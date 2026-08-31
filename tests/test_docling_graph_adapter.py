@@ -171,7 +171,7 @@ def test_shared_course_pipeline_uses_native_evidence_tree_without_docling(tmp_pa
     service.process_semantic_analysis(analysis["analysis_job_id"])
     completed = service.get_analysis_job(teacher, analysis["analysis_job_id"])
     assert completed["status"] == "review_required", completed["error_message"]
-    assert completed["analyzer_version"] == "evidence-map-reduce-v4"
+    assert completed["analyzer_version"] == "evidence-map-reduce-v5"
     assert json.loads(completed["result_json"])["extractor"] == "evidence-map-reduce"
     points = db.fetch_all(
         "SELECT * FROM knowledge_nodes WHERE document_id=? AND node_type='knowledge_point'",

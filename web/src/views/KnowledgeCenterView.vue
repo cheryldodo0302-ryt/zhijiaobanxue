@@ -7,13 +7,15 @@ import {clampPage} from '../review-utils'
 const courses=ref<any[]>([]),jobs=ref<any[]>([]),courseId=ref(''),selectedDoc=ref<any>(null),analysis=ref<any>(null),readiness=ref<any>(null)
 const outlineMode=ref<'document'|'course'>('document'),nodes=ref<any[]>([]),relations=ref<any[]>([]),selectedNode=ref<any>(null),treeRef=ref<any>(null)
 const previewUrl=ref(''),downloadUrl=ref(''),previewKind=ref('unavailable'),previewError=ref(''),previewText=ref(''),parserStatus=ref<any>(null)
-const page=ref(1),pageInput=ref(1),file=ref<File|null>(null),uploading=ref(false);let timer:number|undefined
+const page=ref(1),pageInput=ref(1),file=ref<File|null>(null),uploading=ref(false);let timer:number|undefined,parserTimer:number|undefined
 const fail=(e:any,m:string)=>ElMessage.error(e.response?.data?.detail||m)
 const totalPages=computed(()=>Math.max(1,Number(selectedDoc.value?.total_pages||1)))
 const pdfUrl=computed(()=>previewUrl.value?`${previewUrl.value}#page=${page.value}&view=FitH`:'')
 const treeData=computed(()=>{const map=new Map(nodes.value.map(x=>[x.node_id,{...x,label:x.title,children:[]}])) as Map<string,any>;const roots:any[]=[];for(const item of map.values()){if(item.parent_id&&map.has(item.parent_id))map.get(item.parent_id).children.push(item);else roots.push(item)}return roots})
 const sections=computed(()=>nodes.value.filter(x=>x.node_type==='section'))
 
+async function refreshParserStatus(){try{parserStatus.value=(await api.get('/system/parser-status')).data}catch{const previous=parserStatus.value||{};parserStatus.value={...previous,mineru:{...(previous.mineru||{}),status:'unreachable'},pix2text:{...(previous.pix2text||{}),status:'unreachable'}}}}
+function onParserVisibilityChange(){if(document.visibilityState==='visible')void refreshParserStatus()}
 async function load(){const[c,p]=await Promise.all([api.get('/teacher/courses'),api.get('/system/parser-status')]);courses.value=c.data;parserStatus.value=p.data;if(!courseId.value&&courses.value.length)courseId.value=courses.value[0].course_id;await loadJobs()}
 async function loadJobs(){if(!courseId.value)return;const[j,r]=await Promise.all([api.get(`/teacher/courses/${courseId.value}/ingestion-jobs`),api.get(`/teacher/courses/${courseId.value}/publish-readiness`)]);jobs.value=j.data;readiness.value=r.data;if(selectedDoc.value)selectedDoc.value=jobs.value.find(x=>x.document_id===selectedDoc.value.document_id)||selectedDoc.value}
 function choose(x:UploadFile){file.value=x.raw||null}
@@ -31,8 +33,8 @@ async function splitSelected(){const x=selectedNode.value;if(!x||x.node_type!=='
 async function reviewRelation(r:any,status:string){await api.patch(`/teacher/courses/${courseId.value}/knowledge-relations`,{relation_id:r.relation_id,status});await loadOutline()}
 async function publish(){try{const x=(await api.post(`/teacher/courses/${courseId.value}/knowledge-versions/publish`)).data;ElMessage.success(`结构化知识库 v${x.version_number} 已发布`);await loadJobs()}catch(e){fail(e,'发布失败')}}
 function go(v:any=pageInput.value){page.value=pageInput.value=clampPage(v,totalPages.value,page.value)}
-onMounted(async()=>{await load();timer=window.setInterval(async()=>{await loadJobs();if(analysis.value&&['queued','running','retry_wait'].includes(analysis.value.status)){analysis.value=(await api.get(`/teacher/analysis-jobs/${analysis.value.analysis_job_id}`)).data;if(analysis.value.status==='review_required')await loadOutline()}},4000)})
-onUnmounted(()=>timer&&clearInterval(timer))
+onMounted(async()=>{await load();timer=window.setInterval(async()=>{await loadJobs();if(analysis.value&&['queued','running','retry_wait'].includes(analysis.value.status)){analysis.value=(await api.get(`/teacher/analysis-jobs/${analysis.value.analysis_job_id}`)).data;if(analysis.value.status==='review_required')await loadOutline()}},4000);parserTimer=window.setInterval(()=>void refreshParserStatus(),15000);document.addEventListener('visibilitychange',onParserVisibilityChange)})
+onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(parserTimer);document.removeEventListener('visibilitychange',onParserVisibilityChange)})
 </script>
 
 <template><main class="content knowledge-center">

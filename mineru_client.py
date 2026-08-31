@@ -45,7 +45,8 @@ class MinerUClient:
         payload = response.json()
         return {"enabled": True, "status": "ok", **payload}
 
-    def parse(self, path: Path, *, method: str = "auto", asset_dir: Path | None = None) -> dict[str, Any]:
+    def parse(self, path: Path, *, method: str = "auto", asset_dir: Path | None = None,
+              raw_dir: Path | None = None) -> dict[str, Any]:
         if not self.enabled:
             raise MinerUError("MinerU worker is not configured")
         with path.open("rb") as stream:
@@ -76,6 +77,15 @@ class MinerUClient:
         except zipfile.BadZipFile as exc:
             raise MinerUError("MinerU did not return a ZIP result") from exc
         names = archive.namelist()
+        if raw_dir is not None:
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            for name in names:
+                if name.endswith("/"):
+                    continue
+                destination = (raw_dir / Path(name).name).resolve()
+                if raw_dir.resolve() not in destination.parents:
+                    continue
+                destination.write_bytes(archive.read(name))
         middle = next((name for name in names if name.endswith("_middle.json") or name.endswith("middle.json")), None)
         if not middle:
             raise MinerUError(f"MinerU result has no middle.json: {names[:20]}")

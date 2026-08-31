@@ -12,6 +12,8 @@ class Evidence:
     section: str
     text: str
     score: float
+    material_type: str = ""
+    material_label: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

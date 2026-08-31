@@ -14,9 +14,13 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from runtime_contract import source_fingerprint
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = PROJECT_DIR / "web"
+WORKER_LOCK_PORT = 17654
 
 
 @dataclass
@@ -31,12 +35,39 @@ def port_is_open(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def port_is_bound(port: int) -> bool:
+    """Check whether a port is occupied without queuing a connection."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return True
+        return False
+
+
+def worker_supports_current_contract() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", WORKER_LOCK_PORT), timeout=1) as connection:
+            connection.settimeout(1)
+            loaded_fingerprint = connection.recv(128).decode("ascii").strip()
+        return loaded_fingerprint == source_fingerprint()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def api_supports_current_contract() -> bool:
     """Reject a stale API instead of pairing it with the current Vue app."""
     try:
-        with urllib.request.urlopen(
-            "http://127.0.0.1:8000/openapi.json", timeout=3
-        ) as response:
+        # Local readiness checks must never be sent through a machine proxy.
+        # A proxy may return 502 for 127.0.0.1 even when the local API is healthy.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open("http://127.0.0.1:8000/health", timeout=3) as response:
+            health = json.load(response)
+        if health.get("runtime_source_fingerprint") != source_fingerprint():
+            return False
+        with opener.open("http://127.0.0.1:8000/openapi.json", timeout=3) as response:
             spec = json.load(response)
         paths = spec.get("paths") or {}
         folders = paths.get(
@@ -53,7 +84,10 @@ def api_supports_current_contract() -> bool:
 def stream_output(name: str, process: subprocess.Popen[str]) -> None:
     assert process.stdout is not None
     for line in process.stdout:
-        print(f"[{name}] {line.rstrip()}", flush=True)
+        message = f"[{name}] {line.rstrip()}"
+        output_encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_message = message.encode(output_encoding, errors="replace").decode(output_encoding)
+        print(safe_message, flush=True)
 
 
 def start_process(
@@ -84,6 +118,53 @@ def start_process(
     ).start()
     print(f"[{name}] 已启动，PID={process.pid}", flush=True)
     return ManagedProcess(name=name, process=process)
+
+
+def start_worker_or_reuse(
+    managed: list[ManagedProcess],
+    reused: list[str],
+    env: dict[str, str],
+) -> None:
+    """Start one Worker, tolerating a concurrent launcher owning the lock first."""
+    if port_is_bound(WORKER_LOCK_PORT):
+        if not worker_supports_current_contract():
+            raise RuntimeError(
+                "端口 17654 正在运行旧版或非本项目 Worker；请先关闭旧启动窗口后再启动。"
+            )
+        reused.append(f"WORKER({WORKER_LOCK_PORT})")
+        print(f"[WORKER] 端口 {WORKER_LOCK_PORT} 已有 Worker，直接复用。", flush=True)
+        return
+
+    worker = start_process(
+        "WORKER",
+        [sys.executable, "scripts/run_ingestion_worker.py"],
+        PROJECT_DIR,
+        env,
+    )
+    managed.append(worker)
+
+    # run_ingestion_worker binds its single-instance socket before opening the
+    # database. Give it a moment to acquire the lock so a simultaneous
+    # launcher does not make the whole API/Web startup look failed.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        return_code = worker.process.poll()
+        if return_code is not None:
+            if port_is_bound(WORKER_LOCK_PORT):
+                managed.remove(worker)
+                reused.append(f"WORKER({WORKER_LOCK_PORT})")
+                print(
+                    f"[WORKER] 已有 Worker 持有 {WORKER_LOCK_PORT}，本次直接复用。",
+                    flush=True,
+                )
+                return
+            raise RuntimeError(f"Worker 启动失败，退出码 {return_code}。")
+        if port_is_bound(WORKER_LOCK_PORT):
+            return
+        time.sleep(0.1)
+
+    if worker.process.poll() is None and not port_is_bound(WORKER_LOCK_PORT):
+        raise RuntimeError("Worker 启动超时，未能占用单实例锁端口 17654。")
 
 
 def stop_process(item: ManagedProcess) -> None:
@@ -151,14 +232,7 @@ def main() -> int:
                 )
             )
 
-        managed.append(
-            start_process(
-                "WORKER",
-                [sys.executable, "scripts/run_ingestion_worker.py"],
-                PROJECT_DIR,
-                env,
-            )
-        )
+        start_worker_or_reuse(managed, reused, env)
 
         if port_is_open(5173):
             reused.append("Vue(5173)")

@@ -84,20 +84,26 @@ class QuestionBankService:
         return folder
 
     def create_folder(self, actor: dict[str, Any], course_id: str, name: str,
-                      folder_type: str) -> dict[str, Any]:
+                      folder_type: str, *, parent_folder_id: str | None = None,
+                      relative_path: str = "") -> dict[str, Any]:
         self._teacher_course(actor, course_id)
         name = _text(name)
         if not name:
             raise ValidationError("文件夹名称不能为空")
         if folder_type not in {"exam", "homework", "chapter"}:
             raise ValidationError("文件夹类型必须是试卷、作业或章节练习")
+        if parent_folder_id:
+            self._folder(actor, course_id, parent_folder_id)
+        clean_path = "/".join(part for part in str(relative_path or "").replace("\\", "/").split("/") if part)
+        if any(part in {".", ".."} for part in clean_path.split("/") if part) or len(clean_path) > 500:
+            raise ValidationError("题库目录路径不安全")
         folder_id = f"qbf_{uuid.uuid4().hex}"
         try:
             self.db.execute(
                 """INSERT INTO question_bank_folders(
-                       folder_id,course_id,folder_name,folder_type,created_by
-                   ) VALUES(?,?,?,?,?)""",
-                (folder_id, course_id, name[:120], folder_type, actor["user_id"]),
+                       folder_id,course_id,folder_name,folder_type,created_by,parent_folder_id,relative_path
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (folder_id, course_id, name[:120], folder_type, actor["user_id"], parent_folder_id, clean_path),
             )
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():

@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: document_ingestion_skill
+summary: 校验并解析课程资料，按课程和上传者保存。
+roles: [student, teacher]
+input_schema: skills.document_ingestion_skill.service.DocumentIngestionInput
+output_schema: skills.contracts.DictOutput

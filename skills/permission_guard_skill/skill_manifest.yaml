@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: permission_guard_skill
+summary: 在业务 Skill 执行前确认角色和课程访问权。
+roles: [student, teacher]
+input_schema: skills.permission_guard_skill.service.PermissionGuardInput
+output_schema: skills.contracts.DictOutput

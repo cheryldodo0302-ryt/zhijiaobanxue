@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,6 +19,7 @@ _AI_NAMES = {
     "ZHIJIAO_CUSTOM_API_KEY",
     "ZHIJIAO_CUSTOM_MODEL",
     "ZHIJIAO_CUSTOM_PROVIDER",
+    "ZHIJIAO_ALLOW_PRIVATE_AI_ENDPOINTS",
     "DASHSCOPE_API_KEY",
     "ZHIJIAO_AI_PROVIDER",
     "ZHIJIAO_AI_BASE_URL",
@@ -39,6 +42,7 @@ _AI_NAMES = {
     "ZHIJIAO_DOCLING_GRAPH_PARALLEL_WORKERS",
     "ZHIJIAO_DOCLING_GRAPH_CONTEXT_LIMIT",
     "ZHIJIAO_DOCLING_GRAPH_MAX_OUTPUT_TOKENS",
+    "ZHIJIAO_INGESTION_BATCH_SIZE",
 }
 
 
@@ -71,8 +75,8 @@ def get_ai_settings() -> dict[str, str | bool]:
     server_values = _read_env_file(SERVER_ENV)
     user_values = _read_env_file(USER_AI_ENV)
     values: dict[str, str] = {}
-    # A deployed relay is the safe default. Legacy server.env and the user's local
-    # selection may override it; process environment variables have final priority.
+    # No configuration intentionally falls back to deterministic Mock. A bundled
+    # relay, local selection, server.env, or process environment may override it.
     for source in (bundled_values, server_values, user_values):
         values.update(source)
     for name in _AI_NAMES:
@@ -94,9 +98,14 @@ def get_ai_settings() -> dict[str, str | bool]:
         elif values.get("DASHSCOPE_API_KEY"):
             mode = "qwen"
         else:
-            mode = "relay"
+            mode = "mock"
 
-    if mode == "custom":
+    if mode == "mock":
+        provider = "mock"
+        base_url = ""
+        api_key = ""
+        model = "mock-course-assistant"
+    elif mode == "custom":
         provider = values.get("ZHIJIAO_CUSTOM_PROVIDER", "auto").lower()
         base_url = values.get("ZHIJIAO_CUSTOM_BASE_URL", "")
         if provider == "auto":
@@ -107,16 +116,22 @@ def get_ai_settings() -> dict[str, str | bool]:
         provider = values.get("ZHIJIAO_AI_PROVIDER", "qwen").lower()
         base_url = values.get(
             "ZHIJIAO_AI_BASE_URL",
-            "https://ws-c4qflt1k6x8xwd4f.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
         )
         api_key = values.get("DASHSCOPE_API_KEY", "")
         model = values.get("ZHIJIAO_AI_MODEL", "qwen-plus")
-    else:
+    elif mode == "relay":
         mode = "relay"
         provider = "relay"
         base_url = values.get("ZHIJIAO_RELAY_URL", "")
         api_key = values.get("ZHIJIAO_RELAY_TOKEN", "")
         model = "server-managed"
+    else:
+        mode = "mock"
+        provider = "mock"
+        base_url = ""
+        api_key = ""
+        model = "mock-course-assistant"
 
     # Be forgiving when a URL was copied from a quoted command or web page.
     base_url = base_url.strip().strip("\"'").rstrip("/")
@@ -126,7 +141,7 @@ def get_ai_settings() -> dict[str, str | bool]:
         "base_url": base_url,
         "api_key": api_key,
         "model": model,
-        "configured": bool(base_url and api_key and model),
+        "configured": provider == "mock" or bool(base_url and model and (api_key or provider == "ollama")),
         "read_timeout": _positive_int_setting("ZHIJIAO_AI_READ_TIMEOUT", 115),
     }
 
@@ -170,6 +185,13 @@ def get_knowledge_extractor_settings() -> dict[str, str | int | bool]:
     }
 
 
+def get_document_ingestion_settings() -> dict[str, int]:
+    """Runtime settings for the local, resumable document ingestion pipeline."""
+    return {
+        "batch_size": _positive_int_setting("ZHIJIAO_INGESTION_BATCH_SIZE", 40),
+    }
+
+
 def student_import_config_status() -> dict[str, str | bool | int]:
     environment_value = os.environ.get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
     file_value = _read_env_file(SERVER_ENV).get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
@@ -193,7 +215,7 @@ def save_user_ai_settings(
     provider: str = "auto",
 ) -> None:
     """Save an optional per-computer override. This file is excluded from Git."""
-    if mode not in {"relay", "custom"}:
+    if mode not in {"mock", "relay", "custom"}:
         raise ValueError("AI 配置模式无效")
     if any("\r" in value or "\n" in value for value in (base_url, api_key, model)):
         raise ValueError("AI 配置不能包含换行符")
@@ -201,13 +223,11 @@ def save_user_ai_settings(
     if mode == "custom":
         clean_base_url = base_url.strip().strip("\"'").rstrip("/")
         provider = provider.strip().lower()
-        if provider not in {"auto", "openai_compatible", "gemini"}:
+        if provider not in {"auto", "openai_compatible", "gemini", "ollama"}:
             raise ValueError("自定义接口类型无效")
-        parsed = urlparse(clean_base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise ValueError("Base URL 必须是有效的 http:// 或 https:// 地址")
-        if not api_key.strip() or not model.strip():
-            raise ValueError("自定义 API Key 和模型名称不能为空")
+        validate_ai_base_url(clean_base_url, allow_private=provider == "ollama")
+        if (provider != "ollama" and not api_key.strip()) or not model.strip():
+            raise ValueError("自定义模型名称不能为空，非 Ollama 接口还必须填写 API Key")
         lines.extend([
             f"ZHIJIAO_CUSTOM_PROVIDER={provider}",
             f"ZHIJIAO_CUSTOM_BASE_URL={clean_base_url}",
@@ -221,6 +241,43 @@ def save_user_ai_settings(
         pass
 
 
+def validate_ai_base_url(base_url: str, *, allow_private: bool = False) -> None:
+    """Reject credentials and internal-network destinations unless explicitly allowed.
+
+    This is a local deployment guard, not a complete network egress sandbox. Production
+    deployments should also restrict outbound traffic at the host or container layer.
+    """
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Base URL 必须是有效的 http:// 或 https:// 地址")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("Base URL 不能包含账号、密码或片段标识")
+    private_allowed = allow_private or get_runtime_setting(
+        "ZHIJIAO_ALLOW_PRIVATE_AI_ENDPOINTS", "0"
+    ).lower() in {"1", "true", "yes"}
+    if private_allowed:
+        return
+    if parsed.hostname.lower() in {"localhost", "localhost.localdomain"}:
+        raise ValueError("自定义接口不能指向本机或内网地址")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443)}
+    except OSError:
+        addresses = {parsed.hostname}
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+        except ValueError:
+            continue
+        # Clash and similar system proxies intentionally return benchmark-range
+        # Fake-IP addresses while preserving the original public hostname for
+        # the actual proxied request. Treat that documented range as a proxy
+        # transport detail; literal private/loopback destinations remain blocked.
+        if ip in ipaddress.ip_network("198.18.0.0/15"):
+            continue
+        if not ip.is_global:
+            raise ValueError("自定义接口不能指向本机、内网或链路本地地址")
+
+
 MATERIALS_DIR = BASE_DIR / "course_materials"
 DATA_DIR = Path(os.environ.get("ZHIJIAO_DATA_DIR", BASE_DIR / "data")).resolve()
 DB_PATH = DATA_DIR / "learning.db"
@@ -230,7 +287,7 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 TOP_K = 4
 MIN_EVIDENCE_SCORE = 0.12
 MAX_EVIDENCE_CHARS = 800
-TEACHER_PORTAL_ENABLED = False
+TEACHER_PORTAL_ENABLED = get_runtime_setting("ZHIJIAO_TEACHER_AGENT_ENABLED", "1").lower() in {"1", "true", "yes"}
 
 # Compatibility constants for existing imports. Provider construction reads the
 # dynamic settings above on every call.

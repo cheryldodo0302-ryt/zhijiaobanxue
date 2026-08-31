@@ -8,6 +8,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from agent_service import CampusAgentService
+from auth_service import AuthService
 from campus_service import CampusError, CampusService
 from config import (
     DB_PATH,
@@ -25,14 +26,14 @@ inject_theme()
 
 
 @st.cache_resource
-def resources() -> tuple[LearningDatabase, CampusService, CampusAgentService]:
+def resources() -> tuple[LearningDatabase, CampusService, CampusAgentService, AuthService]:
     database = LearningDatabase(DB_PATH)
     service = CampusService(database)
     service.seed_demo(MATERIALS_DIR)
-    return database, service, CampusAgentService(service)
+    return database, service, CampusAgentService(service), AuthService(database)
 
 
-db, campus, agents = resources()
+db, campus, agents, auth = resources()
 
 
 def run(action, success: str | None = None):
@@ -61,14 +62,20 @@ def invoke(action: str, course_id: str | None = None, input_data: dict | None = 
     return response.data
 
 
-def hero() -> None:
-    st.markdown("""
-    <section class="app-hero"><div class="hero-copy">
-      <div class="eyebrow"><span></span> STUDENT MEMORY COPILOT</div>
-      <h1>智教<span>伴学</span></h1>
-    </div><div class="hero-meta"><div class="meta-dot"></div>
-      <div><strong>学生端</strong><small>教师端暂未开发</small></div>
-    </div></section>
+def hero(display_name: str, course_count: int) -> None:
+    safe_name = html.escape(display_name or "同学")
+    st.markdown(f"""
+    <section class="app-hero student-hero">
+      <div class="hero-copy">
+        <div class="eyebrow"><span></span> 课程学习空间</div>
+        <h1>今天从哪一个问题开始？</h1>
+        <p>嗨，{safe_name}。我们只根据课程资料一起思考，证据不足时会坦诚告诉你。</p>
+      </div>
+      <div class="hero-meta">
+        <div class="meta-dot"></div>
+        <div><strong>{course_count}</strong><small>门可学习课程</small></div>
+      </div>
+    </section>
     """, unsafe_allow_html=True)
 
 
@@ -80,10 +87,10 @@ def flashcard(block: dict) -> None:
     <style>
       .scene{{perspective:900px;height:205px;margin:4px}} .card{{width:100%;height:100%;position:relative;
       transform-style:preserve-3d;transition:.5s;cursor:pointer}} .card.flip{{transform:rotateY(180deg)}}
-      .face{{position:absolute;inset:0;backface-visibility:hidden;border:1px solid #acc3e5;border-radius:18px;
-      padding:22px;box-sizing:border-box;background:#ffffff;color:#355aa4;overflow:auto}}
-      .back{{transform:rotateY(180deg);background:#d9ebf2}} h3{{margin:0 0 14px;color:#355aa4}}
-      .keys{{color:#7a939f;font-size:13px}} .hint{{position:absolute;bottom:12px;right:16px;color:#7a939f;font-size:11px}}
+      .face{{position:absolute;inset:0;backface-visibility:hidden;border:1px solid #b8cec5;border-radius:18px;
+      padding:22px;box-sizing:border-box;background:#ffffff;color:#245c4f;overflow:auto}}
+      .back{{transform:rotateY(180deg);background:#eef2ee}} h3{{margin:0 0 14px;color:#245c4f}}
+      .keys{{color:#64736e;font-size:13px}} .hint{{position:absolute;bottom:12px;right:16px;color:#64736e;font-size:11px}}
     </style><div class="scene"><div class="card" onclick="this.classList.toggle('flip')">
       <div class="face"><h3>{title}</h3><div class="keys">{keywords}</div><div class="hint">点击翻转</div></div>
       <div class="face back">{content}<div class="hint">点击返回</div></div>
@@ -93,7 +100,7 @@ def flashcard(block: dict) -> None:
 def speech_player(text: str, speed: float, key: str) -> None:
     safe_text = json.dumps(text, ensure_ascii=False)
     components.html(f"""
-    <button id="play_{key}" style="border:0;border-radius:10px;padding:9px 16px;background:#355aa4;color:#ece3ef;cursor:pointer">
+    <button id="play_{key}" style="border:0;border-radius:10px;padding:9px 16px;background:#245c4f;color:#f6f7f5;cursor:pointer">
       ▶ 真人发音朗读（{speed}×）</button>
     <button id="stop_{key}" style="border:0;border-radius:10px;padding:9px 16px;margin-left:8px;cursor:pointer">停止</button>
     <script>
@@ -106,7 +113,7 @@ def speech_player(text: str, speed: float, key: str) -> None:
 def live_monitor() -> None:
     components.html("""
     <div style="font-family:sans-serif;color:#4f5652">
-      <button id="start" style="border:0;border-radius:10px;padding:9px 16px;background:#a2d1e6;color:#355aa4;cursor:pointer">🎧 开启耳返</button>
+      <button id="start" style="border:0;border-radius:10px;padding:9px 16px;background:#c9ddd5;color:#245c4f;cursor:pointer">🎧 开启耳返</button>
       <button id="stop" style="border:0;border-radius:10px;padding:9px 16px;margin-left:8px;cursor:pointer">停止耳返</button>
       <span id="status" style="margin-left:10px;font-size:12px">请佩戴耳机，避免啸叫</span>
     </div><script>
@@ -118,72 +125,121 @@ def live_monitor() -> None:
       document.getElementById('status').innerText='耳返已停止';};</script>""", height=55)
 
 
+def require_student_login() -> dict:
+    user_id = st.session_state.get("student_user_id")
+    if user_id:
+        try:
+            user = auth.get_user(str(user_id))
+            if user.get("status") == "active" and user.get("role") == "student":
+                return user
+        except CampusError:
+            pass
+        st.session_state.pop("student_user_id", None)
+
+    st.title("智教伴学")
+    st.caption("请使用教师已导入的学生账号登录")
+    with st.form("student_login"):
+        username = st.text_input("学号或用户名")
+        password = st.text_input("密码", type="password")
+        submitted = st.form_submit_button("登录", type="primary", width="stretch")
+    if submitted:
+        try:
+            user, _access, _refresh = auth.login(username, password, "streamlit")
+            if user.get("role") != "student":
+                st.error("该入口仅供学生使用，教师请打开教师端")
+            else:
+                st.session_state["student_user_id"] = user["user_id"]
+                st.rerun()
+        except CampusError as exc:
+            st.error(str(exc))
+    st.stop()
+
+
+student_user = require_student_login()
+user_id = str(student_user["user_id"])
+if student_user.get("must_change_password"):
+    st.warning("首次登录需要先修改初始密码")
+    with st.form("student_change_password"):
+        old_password = st.text_input("当前密码", type="password")
+        new_password = st.text_input("新密码（至少 10 个字符）", type="password")
+        change = st.form_submit_button("修改密码", type="primary")
+    if change:
+        try:
+            auth.change_password(student_user, old_password, new_password)
+            st.success("密码已修改，请继续学习")
+            st.rerun()
+        except CampusError as exc:
+            st.error(str(exc))
+    st.stop()
+
+
 with st.sidebar:
-    st.markdown('<div class="side-brand"><span>STUDENT ONLY</span><h3>学生学习空间</h3><p>轻量 Skill · 千问智能体 · 私有课程</p></div>', unsafe_allow_html=True)
-    user_id = st.text_input("学生 ID", value="demo_student_001").strip() or "demo_student_001"
+    display_name = html.escape(str(student_user.get("display_name") or "同学"))
+    username = html.escape(str(student_user.get("username") or ""))
+    st.markdown(f'''<div class="side-brand"><span>课程学习</span><h3>学生学习空间</h3><p>按自己的节奏学习，答案回到课程资料核对。</p></div>
+    <div class="student-account-card"><div class="account-avatar">{display_name[:1]}</div><div><strong>{display_name}</strong><small>{username}</small></div></div>''', unsafe_allow_html=True)
+    if st.button("退出登录", icon=":material/logout:", width="stretch"):
+        st.session_state.clear()
+        st.rerun()
     ai_status = backend_provider_status()
-    if ai_status["configured"]:
-        mode_label = {
-            "relay": "默认云端服务",
-            "custom": "自定义接口",
-            "qwen": "本机管理员配置",
-        }.get(str(ai_status["mode"]), "智能接口")
-        st.success(f"智能服务已配置：{mode_label}")
-    else:
-        st.error("智能服务尚未完成配置")
+    mode_label = {
+        "mock": "确定性 Mock（无需配置）", "relay": "内置云中转",
+        "custom": "自定义接口", "qwen": "管理员接口",
+    }.get(str(ai_status["mode"]), "智能服务")
+    st.success(f"当前 AI：{mode_label}")
     st.caption(f"{ai_status['provider']} · {ai_status['model']}")
     with st.expander("AI 服务设置"):
         current_ai = get_ai_settings()
+        mode_options = ["确定性 Mock（无需配置）", "默认云端服务", "使用我自己的接口"]
+        mode_indexes = {"mock": 0, "relay": 1, "custom": 2, "qwen": 2}
         selected_mode = st.radio(
             "调用方式",
-            ["默认云端服务", "使用我自己的接口"],
-            index=0 if current_ai["mode"] == "relay" else 1,
-            help="默认云端服务不会把千问 API Key 下载到本机。",
+            mode_options,
+            index=mode_indexes.get(str(current_ai["mode"]), 0),
         )
-        if selected_mode == "默认云端服务":
-            st.caption("调用项目维护者部署的中转服务；真实千问 Key 只保存在云服务器。")
-            if st.button("切换到默认云端服务", use_container_width=True):
-                if run(lambda: (save_user_ai_settings("relay"), True)[1],
-                       "已切换到默认云端服务"):
+        if selected_mode == "确定性 Mock（无需配置）":
+            st.caption("不联网、不需要 Key；相同输入得到稳定结果，适合开箱运行、演示和测试。")
+            if st.button("切换到确定性 Mock", width="stretch", disabled=current_ai["mode"] == "mock"):
+                if run(lambda: (save_user_ai_settings("mock"), True)[1], "已切换到确定性 Mock"):
+                    st.rerun()
+        elif selected_mode == "默认云端服务":
+            st.caption("使用项目提供的云端中转服务，真实模型 Key 不会下载到本机。")
+            if st.button("切换并使用默认云端服务", width="stretch", disabled=current_ai["mode"] == "relay"):
+                if run(lambda: (save_user_ai_settings("relay"), True)[1], "已切换到默认云端服务"):
                     st.rerun()
         else:
-            with st.form("custom_ai_settings"):
-                provider_labels = {
-                    "自动识别（推荐）": "auto",
-                    "OpenAI 兼容接口": "openai_compatible",
-                    "Google Gemini 原生接口": "gemini",
-                }
-                current_provider = str(current_ai["provider"])
-                default_provider_label = next(
-                    (label for label, value in provider_labels.items() if value == current_provider),
-                    "自动识别（推荐）",
-                )
-                custom_provider_label = st.selectbox(
-                    "接口协议",
-                    list(provider_labels),
-                    index=list(provider_labels).index(default_provider_label),
-                )
-                custom_base_url = st.text_input(
-                    "API Base URL 或完整请求地址",
-                    value=str(current_ai["base_url"]) if current_ai["mode"] == "custom" else "",
-                    placeholder="OpenAI: https://example.com/v1；Gemini: https://generativelanguage.googleapis.com/v1beta",
-                    help="可填写根地址，也可粘贴以 /chat/completions 或 :generateContent 结尾的完整地址。",
-                )
-                custom_model = st.text_input(
-                    "模型名称",
-                    value=str(current_ai["model"]) if current_ai["mode"] == "custom" else "qwen-plus",
-                )
-                custom_api_key = st.text_input(
-                    "API Key",
-                    type="password",
-                    help=(
-                        "仅保存到本机 user_ai.env，该文件已被 Git 排除。"
-                        "Gemini 原生接口必须使用 Google AI Studio 创建且可调用 Gemini API 的 Key，"
-                        "不能使用千问、OpenAI 或其他平台的 Key。"
-                    ),
-                )
-                save_custom = st.form_submit_button("保存并使用自定义接口")
-            if save_custom:
+            provider_labels = {
+                "自动识别（推荐）": "auto",
+                "OpenAI 兼容接口": "openai_compatible",
+                "Google Gemini 原生接口": "gemini",
+                "本机 Ollama": "ollama",
+            }
+            current_provider = str(current_ai["provider"])
+            default_provider_label = next(
+                (label for label, value in provider_labels.items() if value == current_provider),
+                "自动识别（推荐）",
+            )
+            custom_provider_label = st.selectbox(
+                "接口协议",
+                list(provider_labels),
+                index=list(provider_labels).index(default_provider_label),
+            )
+            custom_base_url = st.text_input(
+                "API Base URL",
+                value=str(current_ai["base_url"]) if current_ai["mode"] == "custom" else "",
+                placeholder="https://example.com/v1 或 http://127.0.0.1:11434/v1",
+                help="可填写 OpenAI 兼容、Gemini 或 Ollama 地址；Ollama 允许使用本机内网地址。",
+            )
+            custom_model = st.text_input(
+                "模型名称",
+                value=str(current_ai["model"]) if current_ai["mode"] == "custom" else "qwen-plus",
+            )
+            custom_api_key = st.text_input(
+                "API Key",
+                type="password",
+                help="仅保存到本机 user_ai.env；Ollama 可留空，其他接口必须填写。",
+            )
+            if st.button("保存并使用自定义接口", width="stretch"):
                 if run(lambda: (
                     save_user_ai_settings(
                         "custom",
@@ -193,19 +249,36 @@ with st.sidebar:
                         provider=provider_labels[custom_provider_label],
                     ),
                     True,
-                )[1], "自定义接口已保存"):
+                )[1], "自定义 API 已保存"):
                     st.rerun()
-        st.caption("公共部署场景不要开放本机 Key 配置；此入口用于用户自行下载运行。")
-    st.caption("教师端已按当前阶段要求禁用")
+    st.caption("公共部署场景不要开放本机 Key 配置；教师端接口配置请在教师工作台中完成。")
+    st.caption("教师端使用独立登录入口和教师知识中心。")
 
-hero()
 courses = run(lambda: campus.list_courses(user_id, "student")) or []
+hero(str(student_user.get("display_name") or student_user.get("username") or "同学"), len(courses))
 if courses:
     labels = {x["course_id"]: f"{x['course_name']} · {'个人' if x['course_type']=='personal_course' else '共享'}" for x in courses}
-    selected_id = st.selectbox("当前学习课程", list(labels), format_func=labels.get)
-    course = next(x for x in courses if x["course_id"] == selected_id)
+    with st.container(border=True):
+        st.markdown('<div class="course-strip-heading"><span class="section-kicker">当前课程</span><strong>选择今天要继续的学习空间</strong></div>', unsafe_allow_html=True)
+        selected_id = st.selectbox("当前课程", list(labels), format_func=labels.get, label_visibility="collapsed")
+        course = next(x for x in courses if x["course_id"] == selected_id)
+        st.caption(course.get("description") or ("个人课程，资料只属于你。" if course["course_type"] == "personal_course" else "教师共享课程，学生可以使用资料但不能修改源文件。"))
 else:
     selected_id = None; course = None
+    with st.container(border=True):
+        st.markdown('<div class="empty-learning"><span class="empty-icon">:material/menu_book:</span><strong>还没有已授权课程</strong><p>请联系任课教师导入名单，或者先创建一个属于自己的个人课程。</p></div>', unsafe_allow_html=True)
+
+if course:
+    summary_documents = invoke("document_status", selected_id) or []
+    summary_blocks = invoke("knowledge_blocks_list", selected_id) or []
+    with st.container(border=True):
+        st.markdown('<div class="workspace-summary-heading"><span class="section-kicker">学习概览</span><span class="muted">数据仅来自当前课程</span></div>', unsafe_allow_html=True)
+        summary_cols = st.columns(4)
+        summary_cols[0].metric("课程资料", len(summary_documents))
+        summary_cols[1].metric("知识卡片", len(summary_blocks))
+        summary_cols[2].metric("学习方式", "按需")
+        summary_cols[3].metric("证据原则", "可核对")
+        st.caption("你可以先问一个问题，也可以先整理一段材料；每一步都可以暂停，学习不必一次完成。")
 
 guided_sessions = st.session_state.setdefault("guided_qa_sessions", {})
 previous_qa_course = st.session_state.get("guided_qa_active_course")
@@ -213,9 +286,9 @@ if previous_qa_course is not None and previous_qa_course != selected_id:
     guided_sessions.pop(previous_qa_course, None)
 st.session_state["guided_qa_active_course"] = selected_id
 
-tab_course, tab_blocks, tab_train, tab_check, tab_profile, tab_qa = st.tabs([
-    "① 我的课程与材料", "② 智能知识块", "③ 多模式训练", "④ AI 智能出题",
-    "⑤ 个人画像与统计", "个性化答疑"
+tab_qa, tab_profile, tab_course, tab_blocks, tab_train, tab_check = st.tabs([
+    ":material/forum: 先问一个问题", ":material/insights: 我的学习", ":material/menu_book: 课程与材料",
+    ":material/auto_stories: 知识卡片", ":material/psychology: 训练巩固", ":material/task_alt: 作答与测验"
 ])
 
 with tab_course:
@@ -412,7 +485,7 @@ with tab_check:
         bank_key = f"published_question_bank_{selected_id}"
         grade_key = f"published_question_grade_{selected_id}"
         folders_key = f"published_question_folders_{selected_id}"
-        if st.button("刷新已发布试卷与作业", use_container_width=True):
+        if st.button("刷新已发布试卷与作业", width="stretch"):
             st.session_state[folders_key] = invoke("quiz_generate", selected_id, {
                 "source": "published_question_folders",
             }) or []
@@ -436,7 +509,7 @@ with tab_check:
             selected_publication = next(
                 item for item in publications if item["folder_id"] == selected_folder_id
             )
-        if st.button("载入整份任务", type="primary", use_container_width=True,
+        if st.button("载入整份任务", type="primary", width="stretch",
                      disabled=not selected_publication):
             bank = invoke("quiz_generate", selected_id, {
                 "source": "published_question_bank", "count": 100,
@@ -523,7 +596,7 @@ with tab_check:
             question_count = st.slider("题目数量", 3, 12, 6)
             if not blocks:
                 st.caption("生成练习题前，请先在“智能知识块”中完成材料分块。")
-            if st.button("根据知识块生成练习题", disabled=not blocks, use_container_width=True):
+            if st.button("根据知识块生成练习题", disabled=not blocks, width="stretch"):
                 questions = invoke("memory_questions_generate", selected_id, {"count": question_count})
                 if questions:
                     st.session_state.memory_questions = questions
@@ -536,7 +609,7 @@ with tab_check:
                 key="question_bank_file",
                 help="支持 PDF、Word、TXT 和 Excel（XLSX）。旧版 XLS 请先另存为 XLSX。",
             )
-            if bank_file and st.button("解析并载入题库", type="primary", use_container_width=True):
+            if bank_file and st.button("解析并载入题库", type="primary", width="stretch"):
                 imported = invoke("question_bank_import", selected_id, {
                     "file_name":bank_file.name,
                     "mime_type":bank_file.type or "application/octet-stream",
@@ -550,7 +623,7 @@ with tab_check:
 
         questions = st.session_state.get("memory_questions", [])
         if questions:
-            st.divider()
+            st.space("small")
             st.caption(f"当前题组共 {len(questions)} 题。标记“AI 判题”的题目表示原题库未提供答案。")
             with st.form("ai_practice_form"):
                 responses = []
@@ -655,6 +728,27 @@ with tab_qa:
     else:
         st.caption("引导式答疑只使用当前课程资料。AI 会逐步追问，只有你明确请求时才给出答案。")
         session = guided_sessions.get(selected_id)
+        material_partitions = course.get("material_partitions") or []
+        retrieval_options = [("all", None, "全部资料"), *[
+            ("material", item["material_type"], item.get("label") or item["material_type"])
+            for item in material_partitions
+        ]]
+        session_choice = next((
+            option for option in retrieval_options
+            if session and option[0] == session.get("retrieval_scope", "all")
+            and option[1] == session.get("material_type")
+        ), retrieval_options[0])
+        retrieval_choice = st.selectbox(
+            "资料范围", retrieval_options,
+            index=retrieval_options.index(session_choice),
+            format_func=lambda option: option[2],
+            disabled=session is not None,
+            key=f"guided_qa_material_scope_{selected_id}",
+            help="选择“全部资料”会跨已发布材料检索；选择课件或教材时只使用对应分区。",
+        )
+        retrieval_scope, selected_material_type, retrieval_label = retrieval_choice
+        if session:
+            st.caption(f"本轮固定检索范围：{session.get('retrieval_label', '全部资料')}")
 
         if session is None:
             with st.form(f"guided_qa_start_{selected_id}"):
@@ -673,17 +767,22 @@ with tab_qa:
                     "question": question.strip(),
                     "student_message": "",
                     "intent": "start",
-                    "phase": "initial",
-                    "history": [],
+                    "retrieval_scope": retrieval_scope,
+                    "material_type": selected_material_type,
                 })
                 if result:
                     guided_sessions[selected_id] = {
                         "question": question.strip(),
+                        "session_id": result.get("session_id"),
                         "phase": result["phase"],
+                        "can_reveal": result.get("can_reveal", False),
                         "completed": result["completed"],
                         "refused": result["refused"],
                         "question_id": result.get("question_id"),
                         "sources": result.get("sources", []),
+                        "retrieval_scope": retrieval_scope,
+                        "material_type": selected_material_type,
+                        "retrieval_label": retrieval_label,
                         "messages": [
                             {"role": "user", "content": question.strip()},
                             {"role": "assistant", "content": result["reply"]},
@@ -713,8 +812,9 @@ with tab_qa:
                         key=f"guided_qa_hint_{selected_id}",
                     )
                     reveal_answer = st.button(
-                        "给出答案", icon=":material/visibility:",
+                        "查看课程答案", icon=":material/visibility:",
                         key=f"guided_qa_reveal_{selected_id}",
+                        disabled=not session.get("can_reveal", False),
                     )
                     end_question = st.button(
                         "结束本题", icon=":material/stop_circle:",
@@ -739,9 +839,7 @@ with tab_qa:
                         "question": session["question"],
                         "student_message": current_message,
                         "intent": intent,
-                        "phase": session["phase"],
-                        "history": session["messages"][-8:],
-                        "evidence_refs": session["sources"],
+                        "session_id": session.get("session_id"),
                     })
                     if result:
                         session["messages"].extend([
@@ -750,6 +848,7 @@ with tab_qa:
                         ])
                         session.update({
                             "phase": result["phase"],
+                            "can_reveal": result.get("can_reveal", False),
                             "completed": result["completed"],
                             "refused": result["refused"],
                             "question_id": result.get("question_id"),

@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: knowledge_retrieval_skill
+summary: 在当前课程内检索并去重证据片段。
+roles: [student, teacher]
+input_schema: skills.knowledge_retrieval_skill.service.KnowledgeRetrievalInput
+output_schema: skills.contracts.DictOutput

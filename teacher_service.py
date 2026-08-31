@@ -48,19 +48,30 @@ class TeacherService:
         return self.db.fetch_all("SELECT * FROM terms WHERE owner_id=? ORDER BY created_at DESC", (teacher_id,))
 
     def create_term(self, actor: dict[str, Any], name: str, starts_on: date | None = None,
-                    ends_on: date | None = None) -> dict[str, Any]:
+                    ends_on: date | None = None, academic_year: str = "",
+                    teaching_period: str = "") -> dict[str, Any]:
         teacher_id = self.require_teacher(actor)
         name = name.strip()
         if not name:
             raise ValidationError("学期名称不能为空")
         if starts_on and ends_on and starts_on > ends_on:
             raise ValidationError("学期结束日期不能早于开始日期")
+        academic_year = academic_year.strip()[:32]
+        teaching_period = teaching_period.strip()[:64] or name
+        if not academic_year:
+            match = re.search(r"(20\d{2})(?:\s*[-—至/]\s*(20\d{2}))?", name)
+            if match:
+                academic_year = (
+                    f"{match.group(1)}-{match.group(2)}" if match.group(2) else match.group(1)
+                )
         term_id = f"term_{uuid.uuid4().hex[:12]}"
         try:
             self.db.execute(
-                "INSERT INTO terms(term_id,term_name,owner_id,starts_on,ends_on) VALUES(?,?,?,?,?)",
+                """INSERT INTO terms(
+                       term_id,term_name,owner_id,starts_on,ends_on,academic_year,teaching_period
+                   ) VALUES(?,?,?,?,?,?,?)""",
                 (term_id, name, teacher_id, starts_on.isoformat() if starts_on else None,
-                 ends_on.isoformat() if ends_on else None),
+                 ends_on.isoformat() if ends_on else None, academic_year, teaching_period),
             )
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():
@@ -80,12 +91,16 @@ class TeacherService:
                        (SELECT COUNT(*) FROM class_memberships m WHERE m.class_id=cl.class_id AND m.status='active') member_count
                 FROM classes cl JOIN courses c ON c.course_id=cl.course_id
                 JOIN terms t ON t.term_id=cl.term_id WHERE {condition}
-                ORDER BY cl.updated_at DESC""",
+                ORDER BY COALESCE(NULLIF(t.academic_year,''),t.term_name) DESC,
+                         t.teaching_period,cl.class_variant,cl.teaching_time_slot,cl.class_name""",
             params,
         )
 
     def create_class(self, actor: dict[str, Any], course_id: str, term_id: str,
-                     class_name: str) -> dict[str, Any]:
+                     class_name: str, class_variant: str = "",
+                     teaching_time_slot: str = "", campus: str = "",
+                     cohort_year: str = "", major: str = "",
+                     teaching_level: str = "") -> dict[str, Any]:
         teacher_id = self.require_teacher(actor)
         course = self.campus.require_access(course_id, teacher_id, "teacher")
         if course["course_type"] != "shared_course" or course["owner_id"] != teacher_id:
@@ -96,10 +111,20 @@ class TeacherService:
         class_name = class_name.strip()
         if not class_name:
             raise ValidationError("教学班名称不能为空")
+        class_variant = class_variant.strip()[:100]
+        teaching_time_slot = teaching_time_slot.strip()[:120]
+        campus = campus.strip()[:100]
+        cohort_year = cohort_year.strip()[:32]
+        major = major.strip()[:120]
+        teaching_level = teaching_level.strip()[:100]
         class_id = f"class_{uuid.uuid4().hex[:12]}"
         self.db.execute(
-            "INSERT INTO classes(class_id,course_id,term_id,class_name,teacher_id) VALUES(?,?,?,?,?)",
-            (class_id, course_id, term_id, class_name, teacher_id),
+            """INSERT INTO classes(
+                   class_id,course_id,term_id,class_name,teacher_id,class_variant,teaching_time_slot,
+                   campus,cohort_year,major,teaching_level
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (class_id, course_id, term_id, class_name, teacher_id,
+             class_variant, teaching_time_slot, campus, cohort_year, major, teaching_level),
         )
         rows = self.list_classes(actor, course_id)
         return next(row for row in rows if row["class_id"] == class_id)
@@ -115,11 +140,39 @@ class TeacherService:
         self.require_class(actor, class_id)
         return self.db.fetch_all(
             """SELECT m.student_id AS user_id,u.student_number,u.username,u.display_name,
+                      u.must_change_password,u.password_changed_at,
                       m.anonymous_id,m.status,m.created_at
                FROM class_memberships m LEFT JOIN users u ON u.user_id=m.student_id
                WHERE m.class_id=? ORDER BY m.created_at""",
             (class_id,),
         )
+
+    def reset_student_password(self, actor: dict[str, Any], class_id: str,
+                               student_id: str, new_password: str) -> dict[str, Any]:
+        self.require_class(actor, class_id)
+        if len(new_password) < 10:
+            raise ValidationError("新密码至少需要 10 个字符")
+        member = self.db.fetch_one(
+            """SELECT u.user_id,u.role,u.username,u.student_number,u.display_name
+                 FROM class_memberships m JOIN users u ON u.user_id=m.student_id
+                WHERE m.class_id=? AND m.student_id=? AND m.status='active'""",
+            (class_id, student_id),
+        )
+        if not member or member["role"] != "student":
+            raise PermissionDenied("只能重置当前教学班在册学生的密码")
+        with self.db.connect() as conn:
+            conn.execute(
+                """UPDATE users SET password_hash=?,must_change_password=1,
+                       password_changed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE user_id=?""",
+                (self.passwords.hash(new_password), student_id),
+            )
+            conn.execute("DELETE FROM refresh_tokens WHERE user_id=?", (student_id,))
+        return {
+            "user_id": student_id,
+            "student_number": member.get("student_number") or member.get("username"),
+            "display_name": member.get("display_name") or "",
+            "must_change_password": 1,
+        }
 
     def add_members(self, actor: dict[str, Any], class_id: str, student_ids: list[str]) -> dict[str, Any]:
         return self.import_members(actor, class_id, [

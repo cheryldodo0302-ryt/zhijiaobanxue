@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: learning_profile_skill
+summary: 汇总本人在当前课程中的问答、练习和薄弱点。
+roles: [student]
+input_schema: skills.learning_profile_skill.service.LearningProfileInput
+output_schema: skills.contracts.DictOutput

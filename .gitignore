@@ -11,6 +11,8 @@ htmlcov/
 
 # Virtual environments and packaging output
 .venv/
+.venv-windows/
+.venv-posix/
 venv/
 env/
 build/

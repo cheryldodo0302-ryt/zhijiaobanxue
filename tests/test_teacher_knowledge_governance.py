@@ -263,6 +263,186 @@ def test_truncated_json_uses_original_text_fallback_instead_of_failing(
     assert any("关系模型" in node["markdown"] for node in nodes)
 
 
+def test_syllabus_truncated_json_fails_without_safe_fallback(governance, monkeypatch):
+    db, _, service, teacher, _, course = governance
+    job = service.queue_document(
+        teacher,
+        course["course_id"],
+        "教学大纲.txt",
+        "text/plain",
+        "实验九 信息系统分析与设计\n教学内容\n完成信息系统建模".encode(),
+    )
+    service.process_job(job["job_id"])
+    db.execute(
+        """UPDATE document_material_metadata
+           SET material_type='syllabus',classification_status='confirmed'
+           WHERE document_id=?""",
+        (job["document_id"],),
+    )
+    analysis = db.fetch_one(
+        "SELECT * FROM semantic_analysis_jobs WHERE document_id=?",
+        (job["document_id"],),
+    )
+    monkeypatch.setattr(service.semantic, "preflight", lambda: None)
+    monkeypatch.setattr(
+        service.semantic,
+        "analyze_document_batch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValidationError('智能服务未返回有效 JSON：{"classifications": [')
+        ),
+    )
+
+    service.process_semantic_analysis(analysis["analysis_job_id"])
+
+    completed = service.get_analysis_job(teacher, analysis["analysis_job_id"])
+    assert completed["status"] == "failed"
+    assert completed["analysis_summary"]["fallback_batches"] == 0
+    assert "未采用安全降级" in completed["error_message"]
+    assert service.document_outline(teacher, job["document_id"])["nodes"] == []
+
+
+def test_publish_readiness_blocks_fallback_for_syllabus_only(governance):
+    db, _, service, teacher, _, course = governance
+    job = service.queue_document(
+        teacher, course["course_id"], "outline.txt", "text/plain", "课程目标".encode()
+    )
+    service.process_job(job["job_id"])
+    analysis = db.fetch_one(
+        "SELECT * FROM semantic_analysis_jobs WHERE document_id=?",
+        (job["document_id"],),
+    )
+    db.execute(
+        "UPDATE document_material_metadata SET material_type='syllabus' WHERE document_id=?",
+        (job["document_id"],),
+    )
+    db.execute(
+        """UPDATE semantic_analysis_jobs SET status='review_required',
+           result_json=? WHERE analysis_job_id=?""",
+        ('{"fallback_batches":[{"batch":1}]}', analysis["analysis_job_id"]),
+    )
+    readiness = service.publish_readiness(teacher, course["course_id"])
+    assert "syllabus_safe_fallback" in {item["code"] for item in readiness["blockers"]}
+
+    db.execute(
+        "UPDATE document_material_metadata SET material_type='slides' WHERE document_id=?",
+        (job["document_id"],),
+    )
+    readiness = service.publish_readiness(teacher, course["course_id"])
+    assert "syllabus_safe_fallback" not in {item["code"] for item in readiness["blockers"]}
+
+
+def test_safe_fallback_groups_outline_fields_under_their_experiment(governance):
+    _, _, service, _, _, _ = governance
+    blocks = [
+        {"block_id": "b1", "block_type": "title", "markdown": "## 实验九 信息系统分析与设计"},
+        {"block_id": "b2", "block_type": "title", "markdown": "### 教学内容"},
+        {"block_id": "b3", "block_type": "text", "markdown": "完成信息系统建模"},
+        {"block_id": "b4", "block_type": "title", "markdown": "### 目标与要求"},
+        {"block_id": "b5", "block_type": "text", "markdown": "掌握业务流程分析"},
+    ]
+    result = service._safe_batch_result(blocks)
+    assert [point["title"] for point in result["knowledge_points"]] == [
+        "实验九 信息系统分析与设计"
+    ]
+    assert result["knowledge_points"][0]["block_ids"] == ["b1", "b2", "b3", "b4", "b5"]
+
+    repeated = []
+    for index in range(1, 8):
+        repeated.extend([
+            {"block_id": f"e{index}", "block_type": "title", "markdown": f"## 实验{index} 数据处理"},
+            {"block_id": f"f{index}", "block_type": "title", "markdown": "### 教学内容"},
+            {"block_id": f"t{index}", "block_type": "text", "markdown": "完成实验任务"},
+        ])
+    batches = service._evidence_batches(repeated, max_blocks=5, max_tokens=100)
+    assert all("实验" in batch[0]["markdown"] for batch in batches)
+    assert all(len(batch) == 3 for batch in batches)
+
+
+def test_syllabus_experiment_units_are_complete_and_cannot_be_excluded(governance):
+    _, _, service, _, _, _ = governance
+    blocks = [
+        {"block_id": "h4", "block_type": "title", "markdown": "# 四、实验教学内容纲要"},
+        {"block_id": "e3", "block_type": "title", "markdown": "# 实验三 SQL程序设计（二）"},
+        {"block_id": "e3a", "block_type": "title", "markdown": "# 目标与要求"},
+        {"block_id": "e3b", "block_type": "paragraph", "markdown": "子查询与DML"},
+        {"block_id": "e4", "block_type": "title", "markdown": "# 实验四 SQL程序设计（三）"},
+        {"block_id": "e4a", "block_type": "title", "markdown": "# 目标与要求"},
+        {"block_id": "e4b", "block_type": "paragraph", "markdown": "视图、触发器与索引"},
+        {"block_id": "e4c", "block_type": "title", "markdown": "# 教学内容"},
+        {"block_id": "e4d", "block_type": "paragraph", "markdown": "DDL与DML编程"},
+        {"block_id": "h5", "block_type": "title", "markdown": "# 五、课程考核大纲"},
+        {"block_id": "exam", "block_type": "paragraph", "markdown": "期末考核"},
+    ]
+
+    points, covered = service._syllabus_experiment_points(blocks)
+
+    assert [point["title"] for point in points] == [
+        "实验三 SQL程序设计（二）", "实验四 SQL程序设计（三）"
+    ]
+    assert points[1]["chapter"] == "四、实验教学内容纲要"
+    assert points[1]["section"] == "实验四"
+    assert points[1]["block_ids"] == ["e4", "e4a", "e4b", "e4c", "e4d"]
+    assert "h5" not in covered
+    assert "exam" not in covered
+
+
+def test_large_document_and_course_reductions_are_chunked():
+    class ChunkProvider:
+        sizes: list[int] = []
+
+        def generate_json(self, _system, prompt):
+            payload = __import__("json").loads(prompt)
+            if "candidates" in payload:
+                self.sizes.append(len(payload["candidates"]))
+                return {"points": [{
+                    "point_key": item["candidate_id"], "chapter": item["chapter"],
+                    "section": item["section"], "title": item["title"], "keywords": [],
+                    "source_candidate_ids": [item["candidate_id"]],
+                } for item in payload["candidates"]]}
+            self.sizes.append(len(payload["source_points"]))
+            return {"points": [{
+                "course_key": item["source_node_id"], "chapter": item["chapter"],
+                "section": item["section"], "title": item["title"], "keywords": [],
+                "source_node_ids": [item["source_node_id"]],
+            } for item in payload["source_points"]], "relations": []}
+
+    provider = ChunkProvider()
+    semantic = SemanticKnowledgeService(lambda: provider)
+    candidates = [{
+        "candidate_id": f"c{i}", "chapter": "章", "section": "节", "title": f"点{i}",
+        "keywords": [], "pages": [1], "block_ids": [f"b{i}"], "evidence_quotes": [],
+    } for i in range(50)]
+    reduced = semantic.reduce_document_outline(candidates)
+    points = [{
+        "node_id": f"n{i}", "document_id": "doc", "material_type": "syllabus",
+        "chapter_title": "章", "section_title": "节", "title": f"点{i}", "keywords": [],
+    } for i in range(50)]
+    unified = semantic.unify_course_outline(points)
+    assert len(reduced["knowledge_points"]) == 50
+    assert len(unified["points"]) == 50
+    assert provider.sizes == [24, 24, 2, 24, 24, 2]
+
+
+def test_top_level_folder_can_move_as_a_branch_into_secondary_folder(governance):
+    db, _, service, teacher, _, course = governance
+    with db.connect() as conn:
+        conn.executemany(
+            """INSERT INTO knowledge_nodes(
+                   node_id,course_id,node_scope,parent_id,node_type,title,sort_order,material_type
+               ) VALUES(?,?,'course',?,?,?,?,'other')""",
+            [
+                ("chapter-a", course["course_id"], None, "chapter", "第一章", 10),
+                ("chapter-b", course["course_id"], None, "chapter", "第二章", 20),
+                ("section-b", course["course_id"], "chapter-b", "section", "第二节", 10),
+            ],
+        )
+
+    moved = service.move_nodes(teacher, ["chapter-a"], "section-b", 0)
+    assert moved[0]["parent_id"] == "section-b"
+    with pytest.raises(ValidationError, match="子目录"):
+        service.move_nodes(teacher, ["chapter-b"], "section-b", 0)
+
+
 def test_image_only_material_is_skipped_without_ai_call(governance, monkeypatch):
     db, _, service, teacher, _, course = governance
     job = service.queue_document(
