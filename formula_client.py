@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -16,6 +17,9 @@ class Pix2TextClient:
         self.verify_tls = get_runtime_setting("ZHIJIAO_FORMULA_VERIFY_TLS", "1").lower() not in {
             "0", "false", "no", "off",
         }
+        self.session = requests.Session()
+        if urlparse(self.base_url).hostname in {"127.0.0.1", "localhost", "::1"}:
+            self.session.trust_env = False
 
     @property
     def headers(self) -> dict[str, str]:
@@ -27,7 +31,7 @@ class Pix2TextClient:
 
     def recognize(self, image_path: Path) -> dict[str, Any]:
         with image_path.open("rb") as stream:
-            response = requests.post(
+            response = self.session.post(
                 f"{self.base_url}/v1/formula",
                 files={"file": (image_path.name, stream, "image/jpeg")},
                 headers=self.headers,
@@ -40,7 +44,7 @@ class Pix2TextClient:
     def health(self) -> dict[str, Any]:
         if not self.enabled:
             return {"enabled": False, "status": "disabled"}
-        response = requests.get(
+        response = self.session.get(
             f"{self.base_url}/health", headers=self.headers, timeout=10, verify=self.verify_tls,
         )
         response.raise_for_status()

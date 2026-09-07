@@ -7,6 +7,7 @@ from adaptive_ingestion import (
     PageInspection,
     PageRouter,
     ParseManifest,
+    recover_textual_formula_blocks,
 )
 
 
@@ -121,3 +122,161 @@ def test_partial_parse_with_source_blocks_requires_review_not_hard_failure(tmp_p
     assert result.blocks
     assert result.job_status == "review_required"
     assert result.manifest.summary()["failed_pages"] == 1
+
+
+def test_chinese_word_equation_uses_native_text_instead_of_formula_hallucination():
+    blocks = [
+        {"block_type": "paragraph", "markdown": "可简单表示为：", "plain_text": "可简单表示为：", "latex": ""},
+        {
+            "block_type": "formula",
+            "markdown": r"17-5=3 \times 5=3 \times 5",
+            "plain_text": r"17-5=3 \times 5=3 \times 5",
+            "latex": r"17-5=3 \times 5=3 \times 5",
+            "raw": {},
+        },
+    ]
+
+    recover_textual_formula_blocks(
+        blocks,
+        "可简单地用下列式子表示信息、数据与数据处理的关系：\n信息＝数据＋数据处理",
+    )
+
+    assert blocks[1]["block_type"] == "paragraph"
+    assert blocks[1]["plain_text"] == "信息＝数据＋数据处理"
+    assert blocks[1]["latex"] == ""
+    assert blocks[1]["raw"]["formula_ocr_original"].startswith("17-5")
+
+
+def test_mixed_batch_does_not_force_ocr_on_native_pages(tmp_path: Path):
+    from pypdf import PdfWriter
+
+    class RecordingMinerU:
+        enabled = True
+
+        def __init__(self):
+            self.methods = []
+
+        def parse(self, _path, *, method, **_kwargs):
+            self.methods.append(method)
+            return {
+                "_image_paths": {},
+                "pdf_info": [
+                    {"page_idx": 0, "para_blocks": [{"type": "text", "content": "原生文字页"}]},
+                    {"page_idx": 1, "para_blocks": [{"type": "text", "content": "OCR 页"}]},
+                ],
+            }
+
+    source = tmp_path / "mixed.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.add_blank_page(width=100, height=100)
+    with source.open("wb") as stream:
+        writer.write(stream)
+    pages = [
+        PageInspection(page_index=0, native_text="原生文字页", native_text_chars=120,
+                       page_type="CONTENT", parse_level="NORMAL"),
+        PageInspection(page_index=1, image_count=1, page_type="CONTENT", parse_level="DEEP"),
+    ]
+    mineru = RecordingMinerU()
+
+    BatchParser(mineru, batch_size=2).run(
+        source, "doc_mixed", DocumentInspection(2, "hybrid", pages), tmp_path / "ingestion",
+    )
+
+    assert mineru.methods == ["auto"]
+
+
+def test_scanned_chinese_word_equation_gets_general_ocr_second_pass(tmp_path: Path):
+    image = tmp_path / "formula.jpg"
+    image.write_bytes(b"image")
+
+    class TextOcrMinerU:
+        enabled = True
+
+        def parse(self, path, *, formula_enable=True, **_kwargs):
+            assert Path(path) == image
+            assert formula_enable is False
+            return {
+                "_image_paths": {},
+                "pdf_info": [{"page_idx": 0, "para_blocks": [
+                    {"type": "text", "content": "信息＝数据＋数据处理"},
+                ]}],
+            }
+
+    block = {
+        "block_type": "formula",
+        "markdown": r"1 7 - 5 = 3 \times 5 = 3 \times 5 = 5 \times 5",
+        "plain_text": r"1 7 - 5 = 3 \times 5 = 3 \times 5 = 5 \times 5",
+        "latex": r"1 7 - 5 = 3 \times 5 = 3 \times 5 = 5 \times 5",
+        "source_image_path": str(image),
+        "raw": {},
+    }
+
+    BatchParser(TextOcrMinerU())._verify_formulas([block])
+
+    assert block["block_type"] == "paragraph"
+    assert block["plain_text"] == "信息＝数据＋数据处理"
+    assert block["raw"]["textual_formula_recovered"] is True
+
+
+def test_old_manifest_is_invalidated_when_normalization_changes(tmp_path: Path):
+    from pypdf import PdfWriter
+
+    class MinerU:
+        enabled = True
+
+        def __init__(self):
+            self.calls = 0
+
+        def parse(self, *_args, **_kwargs):
+            self.calls += 1
+            return {"_image_paths": {}, "pdf_info": [{"page_idx": 0, "para_blocks": [
+                {"type": "text", "content": "重新标准化"},
+            ]}]}
+
+    source = tmp_path / "versioned.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    with source.open("wb") as stream:
+        writer.write(stream)
+    output = tmp_path / "ingestion"
+    output.mkdir()
+    (output / "manifest.json").write_text(
+        '{"manifest_version":1,"total_pages":1,"batch_size":40,"pages":{},"batches":{}}',
+        encoding="utf-8",
+    )
+    page = PageInspection(page_index=0, image_count=1, page_type="CONTENT", parse_level="DEEP")
+    mineru = MinerU()
+
+    result = BatchParser(mineru).run(
+        source, "doc_versioned", DocumentInspection(1, "scanned", [page]), output,
+    )
+
+    assert mineru.calls == 1
+    assert result.blocks[0]["plain_text"] == "重新标准化"
+
+
+def test_optional_formula_reviewer_outage_does_not_fail_batch(tmp_path: Path):
+    image = tmp_path / "equation.jpg"
+    image.write_bytes(b"image")
+
+    class MinerU:
+        enabled = True
+
+    class OfflineFormula:
+        enabled = True
+
+        def recognize(self, _path):
+            raise RuntimeError("formula worker unavailable")
+
+    block = {
+        "block_type": "formula", "markdown": "E=mc^2", "plain_text": "E=mc^2",
+        "latex": "E=mc^2", "source_image_path": str(image), "raw": {},
+        "verification_status": "review_required",
+    }
+
+    BatchParser(MinerU(), OfflineFormula())._verify_formulas([block])
+
+    assert block["latex"] == "E=mc^2"
+    assert block["verification_status"] == "review_required"
+    assert "unavailable" in block["raw"]["formula_secondary_error"]

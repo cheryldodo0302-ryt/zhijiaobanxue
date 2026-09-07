@@ -232,6 +232,20 @@ def main() -> int:
                 )
             )
 
+        # Both API and worker initialize/upgrade the same SQLite schema.
+        # Wait until API startup has completed so they never race for the
+        # database write lock during bootstrap.
+        api_deadline = time.monotonic() + 60
+        while not port_is_open(8000):
+            api_process = next((item for item in managed if item.name == "API"), None)
+            if api_process and api_process.process.poll() is not None:
+                print("[API] 启动失败，无法继续启动 Worker。", file=sys.stderr, flush=True)
+                return api_process.process.returncode or 1
+            if time.monotonic() >= api_deadline:
+                print("[API] 启动超时，无法继续启动 Worker。", file=sys.stderr, flush=True)
+                return 1
+            time.sleep(0.25)
+
         start_worker_or_reuse(managed, reused, env)
 
         if port_is_open(5173):

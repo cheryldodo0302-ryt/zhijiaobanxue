@@ -94,6 +94,11 @@ const materialPartitions = computed(
 const trainingBlock = computed(() =>
   blocks.value.find((item) => item.block_id === trainingBlockId.value),
 );
+const splitAt = computed(() =>
+  Math.max(0, Math.min(editContent.value.length, Number(splitPosition.value || 0))),
+);
+const splitBefore = computed(() => editContent.value.slice(0, splitAt.value));
+const splitAfter = computed(() => editContent.value.slice(splitAt.value));
 
 function actionScope(id = courseId.value) {
   return id ? { course_id: id } : {};
@@ -1419,7 +1424,25 @@ onUnmounted(async () => {
               :min="20"
               :max="Math.max(20, editContent.length - 20)"
               placeholder="拆分位置"
-            /><el-button @click="splitBlock">从此处拆分</el-button>
+            /><el-button @click="splitBlock">按预览位置拆分</el-button>
+          </div>
+          <div class="split-visual">
+            <div class="split-heading">
+              <b>拆分位置可视化</b>
+              <span>第 {{ splitAt }} / {{ editContent.length }} 个字符</span>
+            </div>
+            <el-slider
+              v-model="splitPosition"
+              :min="20"
+              :max="Math.max(20, editContent.length - 20)"
+              :disabled="editContent.length < 40"
+              show-input
+            />
+            <div class="split-preview">
+              <article><b>前一张卡片</b><pre>{{ splitBefore || "（暂无内容）" }}</pre></article>
+              <i>拆分线</i>
+              <article><b>后一张卡片</b><pre>{{ splitAfter || "（暂无内容）" }}</pre></article>
+            </div>
           </div>
           <template #footer
             ><el-button @click="closeBlock">取消</el-button
@@ -1867,3 +1890,7 @@ onUnmounted(async () => {
     <AiSettingsDialog v-model="aiSettingsOpen" @changed="updateAiStatus" />
   </main>
 </template>
+
+<style scoped>
+.split-visual{display:grid;gap:10px;margin-top:14px;padding:14px;border:1px solid #dce8e5;border-radius:12px;background:#f7fbfa}.split-heading{display:flex;justify-content:space-between;gap:16px;color:#315b55}.split-heading span{font-size:12px;color:#718580}.split-preview{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:12px;align-items:stretch}.split-preview article{min-width:0;padding:12px;border:1px solid #dfe9e6;border-radius:9px;background:#fff}.split-preview pre{max-height:180px;margin:9px 0 0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;line-height:1.6;color:#45645f}.split-preview>i{display:grid;place-items:center;padding:0 4px;border-left:2px dashed #e69b48;color:#a75d16;font-size:12px;font-style:normal;writing-mode:vertical-rl}@media(max-width:700px){.split-preview{grid-template-columns:1fr}.split-preview>i{border-left:0;border-top:2px dashed #e69b48;writing-mode:horizontal-tb;padding:7px}}
+</style>

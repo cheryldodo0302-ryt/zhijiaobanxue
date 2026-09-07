@@ -177,6 +177,38 @@ def test_agent_uploads_and_extracts_pdf_docx_pptx(campus):
     assert all(row["text_preview"] for row in documents)
 
 
+def test_textless_student_pdf_uses_local_ocr(monkeypatch, campus):
+    from pypdf import PdfWriter
+
+    course = campus.create_course("扫描资料", "personal_course", "student_1", "student")
+    stream = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=595, height=842)
+    writer.write(stream)
+
+    class LocalMinerU:
+        base_url = "http://127.0.0.1:18000"
+        enabled = True
+
+        def parse(self, _path, **_kwargs):
+            return {"pdf_info": [{"page_idx": 0, "para_blocks": [{
+                "type": "text", "lines": [{"spans": [{
+                    "content": "数据库系统由数据、数据库管理系统和用户组成。",
+                }]}],
+            }]}]}
+
+    monkeypatch.setattr("campus_service.MinerUClient", LocalMinerU)
+    uploaded = campus.upload_document(
+        course["course_id"], "student_1", "student", "扫描教材.pdf",
+        "application/pdf", stream.getvalue(),
+    )
+    assert uploaded["parser_method"] == "ocr"
+    rows = campus.db.fetch_all(
+        "SELECT content FROM document_chunks WHERE document_id=?", (uploaded["document_id"],),
+    )
+    assert "数据库管理系统" in rows[0]["content"]
+
+
 def test_qwen_provider_uses_real_compatible_endpoint_contract():
     class FakeResponse:
         status_code = 200

@@ -3993,14 +3993,15 @@ class IngestionService:
                 )] = row
 
         def preserved_values(prior: dict[str, Any] | None, *, title: str,
-                             markdown: str = "", keywords_json: str = "[]") -> tuple[Any, ...]:
+                             markdown: str = "", keywords_json: str = "[]",
+                             default_status: str = "draft") -> tuple[Any, ...]:
             preserve = bool(prior and (prior.get("reviewed_by") or prior.get("status") == "approved"))
             if preserve:
                 return (
                     prior["title"], prior["markdown"], prior["keywords_json"],
                     prior["status"], prior.get("reviewed_by"), prior.get("reviewed_at"),
                 )
-            return title, markdown, keywords_json, "draft", None, None
+            return title, markdown, keywords_json, default_status, None, None
 
         generation_id = f"kog_{uuid.uuid4().hex}"
         with self.db.connect() as conn:
@@ -4102,6 +4103,11 @@ class IngestionService:
                     previous_by_fingerprint.get(point_fingerprint),
                     title=self._clean_title(suggestion.get("title"), "知识点"),
                     markdown=markdown, keywords_json=keywords_json,
+                    default_status=(
+                        "approved" if source_rows and all(
+                            row.get("status") == "approved" for row in source_rows
+                        ) else "draft"
+                    ),
                 )
                 order += 1
                 conn.execute(
@@ -4569,6 +4575,96 @@ class IngestionService:
             )
         return candidate_ids
 
+    def _refresh_document_review_state(self, document_id: str, actor_id: str) -> None:
+        """Close teacher review and mirror approved evidence into the current course tree."""
+        document = self.db.fetch_one(
+            "SELECT course_id FROM course_documents WHERE document_id=?", (document_id,)
+        )
+        if not document:
+            return
+        reviewable = 0
+        pending = 0
+        leaves = self.db.fetch_all(
+            """SELECT node_id,title,markdown,status FROM knowledge_nodes
+               WHERE document_id=? AND node_scope='document'
+                 AND node_type='knowledge_point' AND content_domain='knowledge'""",
+            (document_id,),
+        )
+        for leaf in leaves:
+            if not self._has_substantive_node_markdown(leaf["title"], leaf["markdown"]):
+                continue
+            reviewable += 1
+            pending += int(leaf["status"] == "draft")
+        if not reviewable:
+            candidates = self.db.fetch_all(
+                "SELECT review_status FROM knowledge_candidates WHERE document_id=?",
+                (document_id,),
+            )
+            reviewable = len(candidates)
+            pending = sum(
+                row["review_status"] not in {"APPROVED", "REJECTED"} for row in candidates
+            )
+
+        course_nodes = self.db.fetch_all(
+            """SELECT n.node_id,n.status FROM knowledge_nodes n
+               WHERE n.course_id=? AND n.node_scope='course'
+                 AND n.node_type='knowledge_point' AND n.status='draft'
+                 AND (n.generation_id IN (
+                        SELECT generation_id FROM course_outline_generations
+                        WHERE course_id=? AND status='current'
+                     ) OR (n.generation_id IS NULL AND NOT EXISTS (
+                        SELECT 1 FROM course_outline_generations
+                        WHERE course_id=? AND status='current'
+                     )))
+                 AND EXISTS (
+                     SELECT 1 FROM knowledge_node_sources s
+                     WHERE s.node_id=n.node_id AND s.document_id=?
+                 )""",
+            (document["course_id"], document["course_id"], document["course_id"], document_id),
+        )
+        approved_course_ids: list[str] = []
+        for node in course_nodes:
+            source_states = self.db.fetch_all(
+                """SELECT DISTINCT b.verification_status FROM knowledge_node_sources s
+                   JOIN document_blocks b ON b.block_id=s.block_id
+                   WHERE s.node_id=?""",
+                (node["node_id"],),
+            )
+            if source_states and all(
+                row["verification_status"] in {"auto_verified", "teacher_verified"}
+                for row in source_states
+            ):
+                approved_course_ids.append(str(node["node_id"]))
+        if approved_course_ids:
+            placeholders = ",".join("?" for _ in approved_course_ids)
+            self.db.execute(
+                f"""UPDATE knowledge_nodes SET status='approved',reviewed_by=?,
+                    reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                    WHERE node_id IN ({placeholders})""",
+                (actor_id, *approved_course_ids),
+            )
+        if reviewable and not pending:
+            self.db.execute(
+                "UPDATE ingestion_jobs SET status='ready',updated_at=CURRENT_TIMESTAMP WHERE document_id=? AND status='review_required'",
+                (document_id,),
+            )
+            self.db.execute(
+                "UPDATE course_documents SET status='ready' WHERE document_id=? AND status='review_required'",
+                (document_id,),
+            )
+            latest = self.db.fetch_one(
+                """SELECT analysis_job_id,status FROM semantic_analysis_jobs
+                   WHERE document_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1""",
+                (document_id,),
+            )
+            if latest and latest["status"] == "review_required":
+                self.db.execute(
+                    """UPDATE semantic_analysis_jobs SET status='completed',
+                       current_stage='completed',updated_at=CURRENT_TIMESTAMP
+                       WHERE analysis_job_id=?""",
+                    (latest["analysis_job_id"],),
+                )
+
     def list_knowledge_candidates(self, actor: dict[str, Any], document_id: str) -> list[dict[str, Any]]:
         document = self.require_document_access(actor, document_id)
         self._refresh_teaching_archive_domains(str(document["course_id"]), document_id)
@@ -4694,6 +4790,7 @@ class IngestionService:
                 )
                 conn.execute("DELETE FROM knowledge_node_trash WHERE node_id=?", (node["node_id"],))
         self._sync_approved_source_blocks(candidate["document_id"])
+        self._refresh_document_review_state(candidate["document_id"], str(actor["user_id"]))
         return self._candidate_response(self.db.fetch_one(
             "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
         ) or candidate)
@@ -4727,6 +4824,7 @@ class IngestionService:
                     reason="知识点候选审核未通过", action_type="candidate_rejected",
                 )
         self._sync_approved_source_blocks(candidate["document_id"])
+        self._refresh_document_review_state(candidate["document_id"], str(actor["user_id"]))
         return self._candidate_response(self.db.fetch_one(
             "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
         ) or candidate)
@@ -5839,6 +5937,9 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             self._sync_candidates_for_nodes(affected_ids, status, str(actor["user_id"]))
             if node.get("document_id"):
                 self._sync_approved_source_blocks(str(node["document_id"]))
+                self._refresh_document_review_state(
+                    str(node["document_id"]), str(actor["user_id"])
+                )
         updated.pop("summary", None)
         return updated
 
@@ -5903,6 +6004,9 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             leaf_ids, "approved", str(actor["user_id"]),
         )
         self._sync_approved_source_blocks(str(first["document_id"]))
+        self._refresh_document_review_state(
+            str(first["document_id"]), str(actor["user_id"])
+        )
         return {
             "document_id": first["document_id"],
             "approved_node_ids": all_ids,

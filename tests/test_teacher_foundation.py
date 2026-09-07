@@ -1,3 +1,4 @@
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -94,6 +95,48 @@ def test_teaching_year_period_and_class_variant_are_independent_dimensions(servi
     assert {row["teaching_time_slot"] for row in teachers.list_classes(teacher)} == {
         "周一 1-2 节", "周三 3-4 节",
     }
+
+
+def test_institution_profile_merges_configuration_and_history(services, monkeypatch):
+    _, auth, teachers = services
+    teacher = auth.create_user("profile-teacher", "safe-password-123", "teacher")
+    course = teachers.create_course(teacher, "数据库原理")
+    term = teachers.create_term(teacher, "2026-2027 第一学期")
+    teachers.create_class(
+        teacher, course["course_id"], term["term_id"], "滨海班", campus="滨海",
+        major="医学信息工程",
+    )
+    monkeypatch.setenv("ZHIJIAO_SCHOOL_NAME", "测试大学")
+    monkeypatch.setenv("ZHIJIAO_SCHOOL_CAMPUSES", "本部,仁济")
+    monkeypatch.setenv("ZHIJIAO_SCHOOL_MAJORS", "信息管理与信息系统")
+    profile = teachers.institution_profile(teacher)
+    assert profile["school_name"] == "测试大学"
+    assert profile["campuses"] == ["本部", "仁济", "滨海"]
+    assert profile["majors"] == ["信息管理与信息系统", "医学信息工程"]
+
+
+def test_term_start_date_generates_real_weekly_class_dates(services):
+    _, auth, teachers = services
+    teacher = auth.create_user("calendar-teacher", "safe-password-123", "teacher")
+    course = teachers.create_course(teacher, "数据库原理")
+    term = teachers.create_term(teacher, "2026 秋季")
+    term = teachers.update_term(teacher, term["term_id"], {
+        "starts_on": date(2026, 9, 1), "ends_on": date(2026, 9, 30),
+    })
+    class_row = teachers.create_class(
+        teacher, course["course_id"], term["term_id"], "信管一班"
+    )
+    teachers.replace_weekly_schedules(teacher, class_row["class_id"], [{
+        "weekday": 3, "start_time": "08:00", "end_time": "09:40",
+        "location": "教学楼 101", "starts_week": 1, "ends_week": 3,
+    }])
+
+    calendar = teachers.course_calendar(teacher, course["course_id"], term["term_id"])
+
+    assert [event["date"] for event in calendar["events"]] == [
+        "2026-09-02", "2026-09-09", "2026-09-16",
+    ]
+    assert calendar["events"][0]["location"] == "教学楼 101"
 
 
 def test_legacy_shared_course_is_backfilled(tmp_path: Path):

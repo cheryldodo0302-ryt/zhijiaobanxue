@@ -18,6 +18,7 @@ from document_ir import formula_anomalies, mineru_to_blocks, normalize_latex
 
 
 DEFAULT_BATCH_SIZE = 40
+NORMALIZATION_VERSION = 2
 PAGE_STATUSES = {
     "PENDING", "PROCESSING", "PARSED_OK", "PARSED_PARTIAL", "TEXT_ONLY", "SUSPECT", "FAILED",
 }
@@ -61,6 +62,53 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         if line.strip():
             rows.append(json.loads(line))
     return rows
+
+
+def recover_textual_formula_blocks(blocks: list[dict[str, Any]], native_text: str) -> None:
+    """Restore a text-layer equation that a formula OCR model hallucinated.
+
+    Textbooks often center short Chinese "word equations" such as
+    ``信息＝数据＋数据处理``. A layout parser can label the region as an
+    equation, while formula-only OCR cannot read the Chinese glyphs and emits
+    plausible-looking numeric LaTeX instead. When both sides are unambiguous,
+    the PDF native text layer is the more faithful source.
+    """
+    textual_equations = [
+        line.strip()
+        for line in native_text.splitlines()
+        if re.search(r"[\u3400-\u9fff]", line)
+        and re.search(r"[=＝≈≠≤≥]", line)
+        and len(line.strip()) <= 180
+    ]
+    suspicious = [
+        block for block in blocks
+        if block.get("block_type") == "formula"
+        and not re.search(r"[\u3400-\u9fff]", BatchParser._block_text(block))
+        and re.search(r"(?:\\[A-Za-z]+|\d\s*[+\-*/=])", BatchParser._block_text(block))
+    ]
+    if len(textual_equations) != 1 or len(suspicious) != 1:
+        return
+    restored = textual_equations[0]
+    parsed_non_formulas = "\n".join(
+        BatchParser._block_text(block) for block in blocks if block.get("block_type") != "formula"
+    )
+    if restored in parsed_non_formulas:
+        return
+    block = suspicious[0]
+    original = BatchParser._block_text(block)
+    block.update({
+        "block_type": "paragraph",
+        "markdown": restored,
+        "plain_text": restored,
+        "latex": "",
+        "source_method": "native_text_formula_recovery",
+        "verification_status": "review_required",
+        "search_aliases": [],
+    })
+    block.setdefault("raw", {}).update({
+        "formula_ocr_original": original,
+        "textual_formula_recovered": True,
+    })
 
 
 @dataclass
@@ -280,7 +328,8 @@ class ParseManifest:
                 "error_message": "", "completed_pages": 0,
             }
         return cls({
-            "manifest_version": 1, "document_id": document_id,
+            "manifest_version": 1, "normalization_version": NORMALIZATION_VERSION,
+            "document_id": document_id,
             "total_pages": inspection.total_pages, "document_kind": inspection.document_kind,
             "batch_size": batch_size, "page_index_base": 0, "page_number_base": 1,
             "pages": {str(page.page_index): page.as_manifest_page() for page in inspection.pages},
@@ -439,13 +488,57 @@ class BatchParser:
         return payload
 
     def _verify_formulas(self, blocks: list[dict[str, Any]]) -> None:
-        if not self.formula or not getattr(self.formula, "enabled", False):
-            return
         for block in blocks:
             source_image = block.get("source_image_path")
             if block.get("block_type") != "formula" or not source_image:
                 continue
-            secondary = self.formula.recognize(Path(source_image))
+            latex = str(block.get("latex") or block.get("markdown") or "")
+            # Formula OCR sometimes converts a centered Chinese word equation
+            # into a long chain of digits and \times tokens. Re-run only this
+            # strongly suspicious crop through ordinary OCR with formula
+            # recognition disabled.
+            looks_like_text_hallucination = (
+                not re.search(r"[\u3400-\u9fff]", latex)
+                and latex.count(r"\times") >= 2
+                and latex.count("=") >= 2
+            )
+            if looks_like_text_hallucination:
+                try:
+                    text_payload = self.mineru.parse(
+                        Path(source_image), method="ocr", formula_enable=False,
+                        table_enable=False,
+                    )
+                    text_blocks = mineru_to_blocks(text_payload)
+                    recovered = " ".join(
+                        self._block_text(value) for value in text_blocks if self._block_text(value)
+                    ).strip().strip("$")
+                except Exception as exc:
+                    block.setdefault("raw", {})["text_ocr_recovery_error"] = str(exc)[:500]
+                else:
+                    if (re.search(r"[\u3400-\u9fff]", recovered)
+                            and re.search(r"[=＝≈≠≤≥]", recovered)):
+                        block.update({
+                            "block_type": "paragraph", "markdown": recovered,
+                            "plain_text": recovered, "latex": "",
+                            "source_method": "mineru_text_ocr_formula_recovery",
+                            "verification_status": "review_required",
+                            "search_aliases": [],
+                        })
+                        block.setdefault("raw", {}).update({
+                            "formula_ocr_original": latex,
+                            "textual_formula_recovered": True,
+                        })
+                        continue
+            if not self.formula or not getattr(self.formula, "enabled", False):
+                continue
+            try:
+                secondary = self.formula.recognize(Path(source_image))
+            except Exception as exc:
+                # Secondary formula review is optional. Its outage must not
+                # discard an otherwise valid MinerU batch.
+                block.setdefault("raw", {})["formula_secondary_error"] = str(exc)[:500]
+                block["verification_status"] = "review_required"
+                continue
             secondary_latex = str(secondary.get("latex") or "")
             block.setdefault("raw", {}).update({
                 "formula_secondary_latex": secondary_latex,
@@ -464,7 +557,8 @@ class BatchParser:
         if manifest_path.is_file():
             manifest = ParseManifest.load(manifest_path)
             if (manifest.payload.get("total_pages") != inspection.total_pages
-                    or manifest.payload.get("batch_size") != self.batch_size):
+                    or manifest.payload.get("batch_size") != self.batch_size
+                    or manifest.payload.get("normalization_version") != NORMALIZATION_VERSION):
                 manifest = ParseManifest.create(document_id, inspection, self.batch_size)
         else:
             manifest = ParseManifest.create(document_id, inspection, self.batch_size)
@@ -498,7 +592,15 @@ class BatchParser:
                     batch_path = self._materialize_batch(
                         source, output_root / "batches" / f"batch_{batch_number:03d}" / source.name, start, end,
                     )
-                    method = "ocr" if any(inspection.pages[index].parse_level == "DEEP" for index in range(start, end + 1)) else "auto"
+                    parseable_pages = [
+                        inspection.pages[index] for index in range(start, end + 1)
+                        if inspection.pages[index].parse_level != "SKIP"
+                    ]
+                    # One difficult page must not force OCR over every native
+                    # text page in its batch. Auto mode can decide per page.
+                    method = "ocr" if parseable_pages and all(
+                        page.parse_level == "DEEP" for page in parseable_pages
+                    ) else "auto"
                     payload = self._mineru_parse(
                         batch_path, method=method,
                         asset_dir=output_root / "assets" / f"batch_{batch_number:03d}",
@@ -510,6 +612,11 @@ class BatchParser:
                         local_page = int(block.get("page_number") or 1) - 1
                         block["page_index"] = start + local_page
                         block["page_number"] = block["page_index"] + 1
+                    for page_index in range(start, end + 1):
+                        recover_textual_formula_blocks(
+                            [block for block in batch_blocks if int(block.get("page_index", -1)) == page_index],
+                            inspection.pages[page_index].native_text,
+                        )
                     self._verify_formulas(batch_blocks)
             except Exception as exc:
                 parse_error = str(exc)[:1000]

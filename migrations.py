@@ -1288,6 +1288,26 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
             ON teaching_archive_documents(sha256,lifecycle);
         """,
     ),
+    (
+        "030_class_weekly_calendar",
+        """
+        CREATE TABLE IF NOT EXISTS class_weekly_schedules (
+            schedule_id TEXT PRIMARY KEY,
+            class_id TEXT NOT NULL,
+            weekday INTEGER NOT NULL CHECK(weekday BETWEEN 1 AND 7),
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            location TEXT NOT NULL DEFAULT '',
+            starts_week INTEGER NOT NULL DEFAULT 1 CHECK(starts_week >= 1),
+            ends_week INTEGER NOT NULL DEFAULT 18 CHECK(ends_week >= starts_week),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(class_id) REFERENCES classes(class_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_class_weekly_schedule
+            ON class_weekly_schedules(class_id,weekday,start_time);
+        """,
+    ),
 )
 
 

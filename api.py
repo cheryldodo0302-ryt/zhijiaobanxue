@@ -102,6 +102,14 @@ class TermCreatePayload(BaseModel):
     teaching_period: str = ""
 
 
+class TermUpdatePayload(BaseModel):
+    term_name: str | None = None
+    starts_on: date | None = None
+    ends_on: date | None = None
+    academic_year: str | None = None
+    teaching_period: str | None = None
+
+
 class ClassCreatePayload(BaseModel):
     course_id: str
     term_id: str
@@ -112,6 +120,19 @@ class ClassCreatePayload(BaseModel):
     cohort_year: str = ""
     major: str = ""
     teaching_level: str = ""
+
+
+class WeeklyScheduleEntry(BaseModel):
+    weekday: int = Field(ge=1, le=7)
+    start_time: str
+    end_time: str
+    location: str = ""
+    starts_week: int = Field(default=1, ge=1, le=30)
+    ends_week: int = Field(default=18, ge=1, le=30)
+
+
+class WeeklySchedulesPayload(BaseModel):
+    schedules: list[WeeklyScheduleEntry] = Field(default_factory=list, max_length=20)
 
 
 class TeachingArchiveBatchPayload(BaseModel):
@@ -468,6 +489,11 @@ def teacher_terms(user: dict = Depends(current_teacher)) -> list[dict]:
     return teachers.list_terms(user)
 
 
+@app.get("/api/v1/teacher/institution-profile")
+def teacher_institution_profile(user: dict = Depends(current_teacher)) -> dict:
+    return teachers.institution_profile(user)
+
+
 @app.post("/api/v1/teacher/terms", status_code=201)
 def teacher_term_create(payload: TermCreatePayload, user: dict = Depends(current_teacher)) -> dict:
     try:
@@ -475,6 +501,15 @@ def teacher_term_create(payload: TermCreatePayload, user: dict = Depends(current
             user, payload.term_name, payload.starts_on, payload.ends_on,
             payload.academic_year, payload.teaching_period,
         )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/terms/{term_id}")
+def teacher_term_update(term_id: str, payload: TermUpdatePayload,
+                        user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return teachers.update_term(user, term_id, payload.model_dump(exclude_unset=True))
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -494,6 +529,26 @@ def teacher_class_create(payload: ClassCreatePayload, user: dict = Depends(curre
         )
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/v1/teacher/classes/{class_id}/weekly-schedules")
+def teacher_class_weekly_schedules(class_id: str, payload: WeeklySchedulesPayload,
+                                   user: dict = Depends(current_teacher)) -> list[dict]:
+    try:
+        return teachers.replace_weekly_schedules(
+            user, class_id, [row.model_dump() for row in payload.schedules]
+        )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/courses/{course_id}/calendar")
+def teacher_course_calendar(course_id: str, term_id: str | None = None,
+                            user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return teachers.course_calendar(user, course_id, term_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/teacher/courses/{course_id}/teaching-archive")

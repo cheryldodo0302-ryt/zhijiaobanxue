@@ -7,10 +7,12 @@ import json
 import mimetypes
 import re
 import shutil
+import tempfile
 import uuid
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import TruncatedSVD
@@ -20,6 +22,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from config import DATA_DIR, MAX_EVIDENCE_CHARS, MAX_UPLOAD_BYTES, MIN_EVIDENCE_SCORE, TOP_K
 from database import LearningDatabase
 from llm_provider import LLMProvider, build_backend_provider
+from mineru_client import MinerUClient, MinerUError
+from document_ir import mineru_to_blocks
 from security_utils import UnsafeUpload, validate_document_bytes
 from skills.exercise import ExerciseItem, generate_exercises, grade_exercises
 from skills.qa import answer_question, guide_question
@@ -156,6 +160,36 @@ def parse_document(data: bytes, suffix: str) -> list[dict]:
                 chunks += _split_text("\n".join(texts), f"第 {index} 页", index)
         return chunks
     raise ValidationError("不支持的文件类型")
+
+
+def parse_scanned_pdf_with_local_ocr(data: bytes, file_name: str) -> list[dict]:
+    """OCR a textless PDF without allowing student documents to leave this computer."""
+    configured = MinerUClient()
+    configured_host = (urlparse(configured.base_url).hostname or "").lower()
+    client = configured if configured_host in {"127.0.0.1", "localhost", "::1"} else MinerUClient(
+        "http://127.0.0.1:18000"
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="zhijiao_student_pdf_") as directory:
+            source = Path(directory) / _safe_name(file_name)
+            source.write_bytes(data)
+            payload = client.parse(source, method="ocr", formula_enable=False, table_enable=True)
+    except MinerUError as exc:
+        raise ValidationError(f"PDF 没有文字层，本机 OCR 解析失败：{exc}") from exc
+    except Exception as exc:
+        raise ValidationError("PDF 没有文字层，本机 OCR 解析服务暂时不可用") from exc
+    chunks: list[dict] = []
+    for block in mineru_to_blocks(payload):
+        text = str(block.get("plain_text") or block.get("markdown") or "").strip()
+        if not text:
+            continue
+        page_number = int(block.get("page_number") or 1)
+        chunks.extend(_split_text(text, f"第 {page_number} 页", page_number))
+    if not chunks and str(payload.get("_markdown") or "").strip():
+        chunks = _split_text(str(payload["_markdown"]), "OCR 识别结果")
+    if not chunks:
+        raise ValidationError("PDF 经本机 OCR 仍未识别出有效文字，请确认页面清晰且不是加密文件")
+    return chunks
 
 
 class ChunkRetriever:
@@ -385,6 +419,10 @@ class CampusService:
             raise ValidationError("文件路径不安全")
         try:
             chunks = parse_document(data, suffix)
+            parser_method = "native"
+            if suffix == ".pdf" and not chunks:
+                chunks = parse_scanned_pdf_with_local_ocr(data, safe_name)
+                parser_method = "ocr"
         except ValidationError:
             raise
         except Exception as exc:
@@ -399,7 +437,8 @@ class CampusService:
                          (document_id, course_id, user_id, safe_name, str(destination), mime_type, len(data), digest, "ready"))
             conn.executemany("INSERT INTO document_chunks(document_id,course_id,section,page_number,content) VALUES(?,?,?,?,?)",
                              [(document_id, course_id, x["section"], x["page_number"], x["content"]) for x in chunks])
-        return {"document_id": document_id, "file_name": safe_name, "status": "ready", "chunk_count": len(chunks)}
+        return {"document_id": document_id, "file_name": safe_name, "status": "ready",
+                "chunk_count": len(chunks), "parser_method": parser_method}
 
     def list_documents(self, course_id: str, user_id: str, role: str) -> list[dict]:
         self.require_access(course_id, user_id, role)

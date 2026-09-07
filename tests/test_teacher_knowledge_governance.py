@@ -331,6 +331,67 @@ def test_publish_readiness_blocks_fallback_for_syllabus_only(governance):
     assert "syllabus_safe_fallback" not in {item["code"] for item in readiness["blockers"]}
 
 
+def test_finished_document_review_syncs_course_tree_and_job_status(governance):
+    db, _, service, teacher, _, course = governance
+    job = service.queue_document(
+        teacher, course["course_id"], "review.txt", "text/plain", "关系模型是二维表结构".encode()
+    )
+    service.process_job(job["job_id"])
+    block = db.fetch_one(
+        "SELECT block_id FROM document_blocks WHERE document_id=? LIMIT 1", (job["document_id"],)
+    )
+    analysis = db.fetch_one(
+        "SELECT analysis_job_id FROM semantic_analysis_jobs WHERE document_id=?", (job["document_id"],)
+    )
+    with db.connect() as conn:
+        conn.execute(
+            """INSERT INTO course_outline_generations(
+                   generation_id,course_id,material_type,analysis_job_id,status
+               ) VALUES('gen_review',?,'other',?,'current')""",
+            (course["course_id"], analysis["analysis_job_id"]),
+        )
+        conn.execute(
+            """INSERT INTO knowledge_nodes(
+                   node_id,course_id,document_id,node_scope,node_type,title,markdown,status,
+                   analysis_job_id,material_type
+               ) VALUES('doc_point',?,?,'document','knowledge_point','关系模型',
+                        '关系模型是二维表结构','approved',?,'other')""",
+            (course["course_id"], job["document_id"], analysis["analysis_job_id"]),
+        )
+        conn.execute(
+            """INSERT INTO knowledge_nodes(
+                   node_id,course_id,node_scope,node_type,title,markdown,status,
+                   analysis_job_id,material_type,generation_id
+               ) VALUES('course_point',?,'course','knowledge_point','关系模型',
+                        '关系模型是二维表结构','draft',?,'other','gen_review')""",
+            (course["course_id"], analysis["analysis_job_id"]),
+        )
+        conn.executemany(
+            """INSERT INTO knowledge_node_sources(node_id,block_id,document_id,page_number)
+               VALUES(?,?,?,1)""",
+            [("doc_point", block["block_id"], job["document_id"]),
+             ("course_point", block["block_id"], job["document_id"])],
+        )
+        conn.execute(
+            """UPDATE document_blocks SET content_destination='knowledge',
+               verification_status='teacher_verified' WHERE block_id=?""", (block["block_id"],)
+        )
+        conn.execute(
+            """UPDATE semantic_analysis_jobs SET status='review_required',current_stage='teacher_review'
+               WHERE analysis_job_id=?""", (analysis["analysis_job_id"],)
+        )
+
+    service._refresh_document_review_state(job["document_id"], teacher["user_id"])
+
+    assert db.fetch_one("SELECT status FROM knowledge_nodes WHERE node_id='course_point'")["status"] == "approved"
+    assert db.fetch_one(
+        "SELECT status FROM semantic_analysis_jobs WHERE analysis_job_id=?", (analysis["analysis_job_id"],)
+    )["status"] == "completed"
+    assert db.fetch_one(
+        "SELECT status FROM ingestion_jobs WHERE document_id=?", (job["document_id"],)
+    )["status"] == "ready"
+
+
 def test_safe_fallback_groups_outline_fields_under_their_experiment(governance):
     _, _, service, _, _, _ = governance
     blocks = [

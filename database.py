@@ -24,7 +24,7 @@ class LearningDatabase:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(
             URL.create("sqlite+pysqlite", database=str(self.db_path.resolve())),
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 60},
             pool_pre_ping=True,
         )
         self.init_schema()
@@ -34,6 +34,7 @@ class LearningDatabase:
         pooled = self.engine.raw_connection()
         conn = getattr(pooled, "driver_connection", pooled)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=60000")
         conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn

@@ -5,7 +5,7 @@ import hashlib
 import io
 import re
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from argon2 import PasswordHasher
@@ -13,7 +13,7 @@ from openpyxl import load_workbook
 
 from campus_service import CampusService, PermissionDenied, ValidationError
 from database import LearningDatabase
-from config import get_student_default_password
+from config import get_runtime_setting, get_student_default_password
 
 
 class TeacherService:
@@ -47,6 +47,32 @@ class TeacherService:
         teacher_id = self.require_teacher(actor)
         return self.db.fetch_all("SELECT * FROM terms WHERE owner_id=? ORDER BY created_at DESC", (teacher_id,))
 
+    def institution_profile(self, actor: dict[str, Any]) -> dict[str, Any]:
+        """Return deployment-level school choices plus this teacher's used values."""
+        teacher_id = self.require_teacher(actor)
+        rows = self.db.fetch_all(
+            "SELECT campus,major FROM classes WHERE teacher_id=?", (teacher_id,),
+        )
+
+        def choices(env_name: str, historical: list[str], fallback: str = "") -> list[str]:
+            configured = get_runtime_setting(env_name, fallback)
+            values = [part.strip() for part in configured.split(",") if part.strip()]
+            return list(dict.fromkeys([*values, *historical]))
+
+        return {
+            "school_name": get_runtime_setting("ZHIJIAO_SCHOOL_NAME", "温州医科大学"),
+            "campuses": choices(
+                "ZHIJIAO_SCHOOL_CAMPUSES",
+                [str(row.get("campus") or "").strip() for row in rows if row.get("campus")],
+                "本部,仁济",
+            ),
+            "majors": choices(
+                "ZHIJIAO_SCHOOL_MAJORS",
+                [str(row.get("major") or "").strip() for row in rows if row.get("major")],
+                "信息管理与信息系统",
+            ),
+        }
+
     def create_term(self, actor: dict[str, Any], name: str, starts_on: date | None = None,
                     ends_on: date | None = None, academic_year: str = "",
                     teaching_period: str = "") -> dict[str, Any]:
@@ -77,6 +103,32 @@ class TeacherService:
             if "UNIQUE" in str(exc).upper():
                 raise ValidationError("该学期名称已存在") from exc
             raise
+        return self.db.fetch_one("SELECT * FROM terms WHERE term_id=?", (term_id,)) or {}
+
+    def update_term(self, actor: dict[str, Any], term_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        teacher_id = self.require_teacher(actor)
+        term = self.db.fetch_one(
+            "SELECT * FROM terms WHERE term_id=? AND owner_id=?", (term_id, teacher_id)
+        )
+        if not term:
+            raise PermissionDenied("无权修改该学期")
+        starts_on = updates.get("starts_on", term.get("starts_on"))
+        ends_on = updates.get("ends_on", term.get("ends_on"))
+        starts_text = starts_on.isoformat() if isinstance(starts_on, date) else (str(starts_on) if starts_on else None)
+        ends_text = ends_on.isoformat() if isinstance(ends_on, date) else (str(ends_on) if ends_on else None)
+        if starts_text and ends_text and date.fromisoformat(starts_text) > date.fromisoformat(ends_text):
+            raise ValidationError("学期结束日期不能早于开学第一天")
+        name = str(updates.get("term_name", term["term_name"])).strip()
+        if not name:
+            raise ValidationError("学期名称不能为空")
+        self.db.execute(
+            """UPDATE terms SET term_name=?,starts_on=?,ends_on=?,academic_year=?,teaching_period=?
+               WHERE term_id=? AND owner_id=?""",
+            (name[:120], starts_text, ends_text,
+             str(updates.get("academic_year", term.get("academic_year") or "")).strip()[:32],
+             str(updates.get("teaching_period", term.get("teaching_period") or "")).strip()[:64],
+             term_id, teacher_id),
+        )
         return self.db.fetch_one("SELECT * FROM terms WHERE term_id=?", (term_id,)) or {}
 
     def list_classes(self, actor: dict[str, Any], course_id: str | None = None) -> list[dict[str, Any]]:
@@ -135,6 +187,97 @@ class TeacherService:
         if not row:
             raise PermissionDenied("无权访问该教学班")
         return row
+
+    @staticmethod
+    def _validate_clock(value: str, label: str) -> str:
+        value = str(value or "").strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            raise ValidationError(f"{label}必须使用 HH:MM 格式")
+        return value
+
+    def replace_weekly_schedules(self, actor: dict[str, Any], class_id: str,
+                                 schedules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.require_class(actor, class_id)
+        normalized: list[dict[str, Any]] = []
+        for entry in schedules:
+            weekday = int(entry.get("weekday") or 0)
+            starts_week = int(entry.get("starts_week") or 1)
+            ends_week = int(entry.get("ends_week") or 18)
+            if weekday not in range(1, 8):
+                raise ValidationError("上课星期必须在星期一到星期日之间")
+            if starts_week < 1 or ends_week < starts_week or ends_week > 30:
+                raise ValidationError("课程周次范围无效")
+            start_time = self._validate_clock(str(entry.get("start_time") or ""), "开始时间")
+            end_time = self._validate_clock(str(entry.get("end_time") or ""), "结束时间")
+            if end_time <= start_time:
+                raise ValidationError("下课时间必须晚于上课时间")
+            normalized.append({
+                "schedule_id": f"cws_{uuid.uuid4().hex[:16]}",
+                "weekday": weekday, "start_time": start_time, "end_time": end_time,
+                "location": str(entry.get("location") or "").strip()[:120],
+                "starts_week": starts_week, "ends_week": ends_week,
+            })
+        with self.db.connect() as conn:
+            conn.execute("DELETE FROM class_weekly_schedules WHERE class_id=?", (class_id,))
+            conn.executemany(
+                """INSERT INTO class_weekly_schedules(
+                       schedule_id,class_id,weekday,start_time,end_time,location,starts_week,ends_week
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                [(row["schedule_id"], class_id, row["weekday"], row["start_time"],
+                  row["end_time"], row["location"], row["starts_week"], row["ends_week"])
+                 for row in normalized],
+            )
+        return self.db.fetch_all(
+            "SELECT * FROM class_weekly_schedules WHERE class_id=? ORDER BY weekday,start_time",
+            (class_id,),
+        )
+
+    def course_calendar(self, actor: dict[str, Any], course_id: str,
+                        term_id: str | None = None) -> dict[str, Any]:
+        teacher_id = self.require_teacher(actor)
+        course = self.campus.require_access(course_id, teacher_id, "teacher")
+        if course["owner_id"] != teacher_id:
+            raise PermissionDenied("无权查看该课程日历")
+        condition = "cl.course_id=? AND cl.teacher_id=?"
+        params: list[Any] = [course_id, teacher_id]
+        if term_id:
+            condition += " AND cl.term_id=?"
+            params.append(term_id)
+        classes = self.db.fetch_all(
+            f"""SELECT cl.class_id,cl.class_name,cl.term_id,t.term_name,t.starts_on,t.ends_on
+                FROM classes cl JOIN terms t USING(term_id) WHERE {condition}
+                ORDER BY t.starts_on,cl.class_name""",
+            tuple(params),
+        )
+        events: list[dict[str, Any]] = []
+        schedules: list[dict[str, Any]] = []
+        for class_row in classes:
+            rows = self.db.fetch_all(
+                """SELECT * FROM class_weekly_schedules WHERE class_id=?
+                   ORDER BY weekday,start_time""", (class_row["class_id"],),
+            )
+            for row in rows:
+                schedules.append({**row, "class_name": class_row["class_name"],
+                                  "term_id": class_row["term_id"]})
+                if not class_row.get("starts_on"):
+                    continue
+                first_day = date.fromisoformat(class_row["starts_on"])
+                term_end = date.fromisoformat(class_row["ends_on"]) if class_row.get("ends_on") else first_day + timedelta(weeks=30)
+                first_occurrence = first_day + timedelta(days=(int(row["weekday"]) - first_day.isoweekday()) % 7)
+                for week in range(int(row["starts_week"]), int(row["ends_week"]) + 1):
+                    event_date = first_occurrence + timedelta(weeks=week - 1)
+                    if event_date > term_end:
+                        break
+                    events.append({
+                        "schedule_id": row["schedule_id"], "class_id": class_row["class_id"],
+                        "class_name": class_row["class_name"], "term_id": class_row["term_id"],
+                        "term_name": class_row["term_name"], "week": week,
+                        "date": event_date.isoformat(), "weekday": row["weekday"],
+                        "start_time": row["start_time"], "end_time": row["end_time"],
+                        "location": row["location"],
+                    })
+        events.sort(key=lambda row: (row["date"], row["start_time"], row["class_name"]))
+        return {"course_id": course_id, "schedules": schedules, "events": events}
 
     def list_members(self, actor: dict[str, Any], class_id: str) -> list[dict[str, Any]]:
         self.require_class(actor, class_id)
