@@ -1,0 +1,14 @@
+.practice-source-button {
+  display: inline-flex;
+  width: 154px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 15px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 4px;
+}

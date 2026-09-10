@@ -1,0 +1,13 @@
+.git
+.venv
+.audit-venv
+__pycache__
+.pytest_cache
+web/node_modules
+web/dist
+data
+logs
+user_ai.env
+server.env
+relay_client.env
+*.db

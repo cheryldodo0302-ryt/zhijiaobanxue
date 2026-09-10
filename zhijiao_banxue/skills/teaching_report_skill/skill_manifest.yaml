@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: teaching_report_skill
+summary: 基于匿名聚合学情生成教学建议和可选 Word 报告。
+roles: [teacher]
+input_schema: skills.teaching_report_skill.service.TeachingReportInput
+output_schema: skills.contracts.DictOutput

@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: class_analysis_skill
+summary: 生成教师本人课程的匿名聚合学情。
+roles: [teacher]
+input_schema: skills.class_analysis_skill.service.ClassAnalysisInput
+output_schema: skills.contracts.DictOutput

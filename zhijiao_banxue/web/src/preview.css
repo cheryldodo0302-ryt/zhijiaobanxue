@@ -1,0 +1,11 @@
+.source-review .text-preview {
+  height: calc(100% - 70px);
+  margin: 0;
+  padding: 20px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #fff;
+  color: #26324b;
+  font: 14px/1.75 ui-monospace, SFMono-Regular, Consolas, monospace;
+}

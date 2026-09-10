@@ -1,0 +1,43 @@
+services:
+  mineru-api:
+    image: ${MINERU_IMAGE:-mineru:latest}
+    container_name: zhijiao-mineru
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18000:8000"
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}
+      MINERU_API_TASK_RETENTION_SECONDS: 604800
+      MINERU_API_MAX_CONCURRENT_REQUESTS: 1
+    entrypoint: mineru-api
+    command: ["--host", "0.0.0.0", "--port", "8000"]
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+  formula-worker:
+    profiles: ["formula-review"]
+    build: ./workers/formula_worker
+    container_name: zhijiao-formula-worker
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18100:8100"
+    environment:
+      PIX2TEXT_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]

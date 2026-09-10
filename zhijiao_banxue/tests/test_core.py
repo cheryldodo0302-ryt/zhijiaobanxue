@@ -1,16 +1,24 @@
 from pathlib import Path
 
 from database import LearningDatabase
-from llm_provider import MockProvider
+from llm_provider import LLMProvider
 from skills.exercise import generate_exercises, grade_exercises
 from skills.profile import get_learning_profile, recommend_practice
 from skills.qa import answer_question
 from skills.retrieval import CourseRetriever
 
 
+class StubProvider(LLMProvider):
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        evidence = user_prompt.split("【课程证据】", 1)[-1]
+        lines = [line.strip() for line in evidence.splitlines()
+                 if line.strip() and not line.startswith("来源")]
+        return "根据测试课程资料，" + " ".join(lines[:3])[:500]
+
+
 def test_retrieval_and_grounded_answer():
     materials = Path(__file__).parents[1] / "course_materials"
-    result = answer_question("监督学习是什么？", CourseRetriever(materials), MockProvider())
+    result = answer_question("监督学习是什么？", CourseRetriever(materials), StubProvider())
     assert not result.refused
     assert result.evidence
     assert result.evidence[0].source_file.endswith(".md")
@@ -18,7 +26,7 @@ def test_retrieval_and_grounded_answer():
 
 def test_refusal_for_unrelated_question():
     materials = Path(__file__).parents[1] / "course_materials"
-    result = answer_question("火星旅游票价是多少？", CourseRetriever(materials), MockProvider())
+    result = answer_question("火星旅游票价是多少？", CourseRetriever(materials), StubProvider())
     assert result.refused
 
 

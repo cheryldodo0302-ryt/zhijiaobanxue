@@ -1,0 +1,7 @@
+format: zhijiao-internal-skill/v1
+official_openclaw_format: false
+id: quiz_generation_skill
+summary: 根据已完成且有证据的课程问答生成练习。
+roles: [student]
+input_schema: skills.quiz_generation_skill.service.QuizGenerationInput
+output_schema: skills.contracts.DictOutput
