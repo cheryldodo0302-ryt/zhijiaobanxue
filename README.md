@@ -1,6 +1,8 @@
 # 智教伴学
 
-一个可本地运行和部署的学生智能学习 MVP。当前阶段教师端已禁用且不在主页面显示，优先稳定学生端“材料导入—智能分块—记忆训练—AI 检测—个性化答疑”闭环。所有访问、写入和删除权限都在服务层校验。
+这是智教伴学当前发布仓库。正式的学生端 + 教师端统一系统位于 [`zhijiao_banxue/`](zhijiao_banxue/)，请以其中的 README、启动脚本和源码为准；仓库根目录保留早期版本文件用于兼容已有部署记录，不代表当前产品入口。
+
+当前版本已覆盖学生学习辅助与教师教学辅助：个人/共享课程、文档解析、知识中心审核发布、知识卡片 AI 语义拆分、课程练习、错题与学习画像、AI 自习室、教学班与教学档案、知识图谱、题库和匿名班级学情分析。项目不包含行政办公端。
 
 ## 已实现功能
 
@@ -21,7 +23,7 @@
 
 ### 教师端状态
 
-教师端当前在页面和统一 Agent 层均处于 `disabled`，保留后端代码但不继续修改、不在主页面展示。待学生端最小闭环稳定验收后再开放。
+教师端已包含共享课程、教学班、资料解析、知识中心、知识图谱、题库、教学诊断和报告导出。统一 Agent 是否开放由 `ZHIJIAO_TEACHER_AGENT_ENABLED` 控制；本地默认关闭，Docker 示例默认开启。关闭时服务返回 `disabled`，不能通过其他适配器绕过。
 
 ### 接口
 
@@ -33,23 +35,28 @@
 
 ## 快速启动
 
-需要 Python 3.10 或更高版本。
+请进入当前版本目录，要求 Python 3.10+、Node.js 20+。
 
 ```powershell
 cd zhijiao_banxue
-python -m pip install -r requirements.txt
-python -m streamlit run app.py
+.\start.ps1 -Mode all
 ```
 
-也可以使用启动脚本：
+常用模式：
 
 ```powershell
-.\start.ps1 ui
+.\start.ps1 -Mode api
+.\start.ps1 -Mode worker
+.\start.ps1 -Mode web-dev
+.\start.ps1 -Mode test
+.\start.ps1 -Mode ai-check
 ```
 
-`cloud` 分支已内置云端中转连接。GitHub 下载者不需要填写千问 API Key，系统默认通过阿里云函数计算中转调用北京地域业务空间中的模型。学生演示账号是 `demo_student_001`，教师演示账号是 `demo_teacher_001`；首次启动会创建公开虚拟课程“人工智能基础（虚拟课程）”并导入两份演示资料。
+访问 `http://127.0.0.1:5173`；API 文档为 `http://127.0.0.1:8000/docs`。完整启动、AI 配置、教师资料审核、权限和测试说明见 [`zhijiao_banxue/README.md`](zhijiao_banxue/README.md) 与 [`zhijiao_banxue/SYSTEM_USER_GUIDE.md`](zhijiao_banxue/SYSTEM_USER_GUIDE.md)。
 
-学生端所有智能能力统一经过 `student_assistant` 编排轻量化 Skill：课程检索与课后答疑、课堂互动练习、作答评价、错题与薄弱点研判。共享课程中的学习反馈只以匿名聚合形式交给 `teacher_assistant`，用于资料覆盖分析和课程内容迭代建议；个人课程数据不会进入教师端。
+默认 AI 模式是离线确定性 Mock，不需要 API Key；也可以在 `zhijiao_banxue` 中配置云中转、OpenAI 兼容接口、Gemini 或 Ollama。空数据库首次启动时生成的演示凭据写入本机 `zhijiao_banxue/data/demo_credentials.txt`，不会提交到 Git。
+
+学生端所有智能能力统一经过 `student_assistant` 编排轻量化 Skill；教师端能力统一经过 `teacher_assistant` 和服务层权限校验。共享课程中的学习反馈只以匿名聚合形式交给教师端，个人课程数据不会进入教师端。
 
 下载后可先执行以下命令验证云端模型：
 
@@ -57,11 +64,11 @@ python -m streamlit run app.py
 .\start.ps1 ai-check
 ```
 
-正常会显示 `SUCCESS: 智能服务连接成功`。真实 `DASHSCOPE_API_KEY` 只保存在阿里云函数计算环境变量中，不会下载到本机、写入 SQLite 或提交到仓库。学生也可在侧栏“AI 服务设置”中选择自己的 OpenAI 兼容 Base URL、API Key 和模型；自定义配置仅保存在本机且不会被 Git 跟踪。
+Mock 模式会显示离线检查成功；其他模式会检查网络、模型配置和响应。真实密钥只能放在未提交的环境文件或部署环境变量中。学生可以选择自己的 OpenAI 兼容 Base URL、API Key 和模型；自定义配置仅保存在本机且不会被 Git 跟踪。
 
 如果是系统管理员需要绕过中转进行本机直连，仍可执行 `.\configure_qwen.ps1`，该模式会把 Key 保存到已被 Git 排除的 `server.env`。
 
-启动 FastAPI：
+单独启动 FastAPI：
 
 ```powershell
 .\start.ps1 api
@@ -71,6 +78,7 @@ python -m streamlit run app.py
 ## 测试
 
 ```powershell
+cd zhijiao_banxue
 python -m pytest -q
 ```
 
@@ -84,7 +92,7 @@ python -m pytest -q
 
 如需把运行数据放到其他位置，可设置环境变量 `ZHIJIAO_DATA_DIR`。
 
-个人课程不会进入教师统计；教师端的班级分析只读取共享课程数据且不返回学生 ID。Streamlit、FastAPI 和统一 Agent 接口均复用 `CampusService`，不能绕过这些规则。
+个人课程不会进入教师统计；教师端的班级分析只读取共享课程数据且不返回学生 ID。Vue、FastAPI 和统一 Agent 接口均复用服务层，不能绕过这些规则。
 
 ## GitHub 下载者共享云端 AI
 
