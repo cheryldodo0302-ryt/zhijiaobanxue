@@ -1,0 +1,57 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and packaging output
+.venv/
+venv/
+env/
+build/
+dist/
+relay_build_*/
+relay_deploy/
+relay-deploy.zip
+relay-deploy-ready.zip
+relay-deploy-linux-x64.zip
+*.egg-info/
+
+# Runtime data and local logs
+data/
+exports/
+tmp/
+temp/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.tmp
+*.bak
+
+# Secrets and environment overrides
+.env
+.env.*
+!.env.example
+server.env
+server.env.*
+!server.env.example
+user_ai.env
+.streamlit/secrets.toml
+
+# Editors and operating-system files
+.idea/
+.vscode/
+.codex/
+*.swp
+*.swo
+*~
+~$*
+.DS_Store
+Thumbs.db
+Desktop.ini
