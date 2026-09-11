@@ -219,10 +219,14 @@ class LearningDatabase:
     @staticmethod
     def _backfill_class_scope(conn: sqlite3.Connection) -> None:
         """Give legacy shared courses a deterministic default term and class."""
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE migration_id='legacy_class_backfill_once'").fetchone():
+            return
         courses = conn.execute(
             "SELECT course_id,course_name,owner_id FROM courses WHERE course_type='shared_course'"
         ).fetchall()
         for course in courses:
+            if conn.execute('SELECT 1 FROM classes WHERE course_id=?', (course['course_id'],)).fetchone():
+                continue
             owner_key = hashlib.sha256(str(course["owner_id"]).encode()).hexdigest()[:12]
             course_key = hashlib.sha256(str(course["course_id"]).encode()).hexdigest()[:12]
             term_id = f"term_legacy_{owner_key}"
@@ -246,6 +250,7 @@ class LearningDatabase:
                        VALUES(?,?,?)""",
                     (class_id, enrollment["student_id"], anon),
                 )
+        conn.execute("INSERT INTO schema_migrations(migration_id) VALUES('legacy_class_backfill_once')")
 
     def execute(self, query: str, params: tuple = ()) -> int:
         with self.connect() as conn:

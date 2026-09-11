@@ -181,6 +181,8 @@ def test_legacy_shared_course_is_backfilled(tmp_path: Path):
     campus = CampusService(db, tmp_path / "uploads", provider_factory=lambda: None)
     course = campus.create_course("共享课", "shared_course", "legacy_teacher", "teacher")
     campus.enroll_student(course["course_id"], "legacy_teacher", "legacy_student")
+    # Simulate a pre-upgrade database; new courses must not grow default classes on every restart.
+    db.execute("DELETE FROM schema_migrations WHERE migration_id='legacy_class_backfill_once'")
     LearningDatabase(db_path)
     class_row = db.fetch_one("SELECT * FROM classes WHERE course_id=?", (course["course_id"],))
     assert class_row is not None

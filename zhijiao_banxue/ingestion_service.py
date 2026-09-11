@@ -151,9 +151,10 @@ class IngestionService:
             "" if provider == "ollama" else
             encrypt_job_secret(api_key) if api_key else
             str((existing or {}).get("api_key_encrypted") or "")
+            if existing and existing["provider"] == provider and existing["base_url"] == base_url else ""
         )
         if provider != "ollama" and not encrypted:
-            raise ValidationError("首次保存时必须填写 API Key")
+            raise ValidationError("首次保存或更换接口地址时必须填写 API Key")
         changed = not existing or any((
             str((existing or {}).get("provider") or "") != provider,
             str((existing or {}).get("base_url") or "") != base_url,
@@ -233,13 +234,15 @@ class IngestionService:
             if not saved:
                 raise ValidationError("尚未保存教师自有 API 配置")
         custom_key = str(settings.get("api_key") or "").strip()
-        if not custom_key and saved:
-            custom_key = decrypt_job_secret(str(saved.get("api_key_encrypted") or ""))
         custom_base = str(settings.get("base_url") or (saved or {}).get("base_url") or "").strip().rstrip("/")
         custom_model = str(settings.get("model") or (saved or {}).get("model") or "").strip()
         custom_provider = str(
             settings.get("provider") or (saved or {}).get("provider") or "openai_compatible"
         ).strip()
+        if not custom_key and saved:
+            if custom_provider != saved["provider"] or custom_base != saved["base_url"]:
+                raise ValidationError("更换接口地址时请填写该接口的 API Key，不能沿用原接口密钥")
+            custom_key = decrypt_job_secret(str(saved.get("api_key_encrypted") or ""))
         if custom_key or custom_base or custom_model or use_saved:
             self._validate_custom_ai_fields(custom_provider, custom_base, custom_model)
             if custom_provider != "ollama" and not custom_key:
@@ -5258,6 +5261,9 @@ class IngestionService:
             )
             if not published:
                 raise PermissionDenied("该资料尚未随知识库发布")
+            from published_knowledge import document_allowed
+            if not document_allowed(self.db, document['course_id'], document_id, user_id):
+                raise PermissionDenied('该原始资料包含未授权教学班的内容')
         else:
             raise PermissionDenied("用户角色不合法")
         return document
@@ -5619,19 +5625,7 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         course = self.campus.require_access(course_id, str(actor["user_id"]), "student")
         if course["course_type"] != "shared_course":
             return []
-        return self.db.fetch_all(
-            """SELECT d.document_id,d.original_name,d.mime_type,d.size_bytes,d.created_at
-               FROM course_documents d
-               WHERE d.course_id=? AND d.student_file_visible=1
-                 AND EXISTS (
-                   SELECT 1 FROM document_blocks b
-                   JOIN knowledge_version_blocks vb USING(block_id)
-                   JOIN knowledge_versions v USING(version_id)
-                   WHERE b.document_id=d.document_id AND v.course_id=d.course_id AND v.status='published'
-                 )
-               ORDER BY d.created_at DESC""",
-            (course_id,),
-        )
+        return self.campus.list_documents(course_id, str(actor["user_id"]), "student")
 
     def cancel_job(self, actor: dict[str, Any], job_id: str) -> dict[str, Any]:
         job = self.get_job(actor, job_id)
@@ -6071,6 +6065,8 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             )
             conn.executemany("INSERT INTO question_bank_version_items(version_id,item_id) VALUES(?,?)",
                              [(version_id, row["item_id"]) for row in items])
+            from published_knowledge import capture_question_publication
+            capture_question_publication(conn,version_id)
             conn.execute(
                 """UPDATE question_bank_imports SET status='published',updated_at=CURRENT_TIMESTAMP
                    WHERE course_id=? AND import_id IN (
@@ -7224,21 +7220,11 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             )
             if not class_scope:
                 raise PermissionDenied("无权查看该教学班")
-        analysis = self.campus.class_analysis(course_id, str(actor["user_id"]))
+        analysis = self.campus.class_analysis(course_id, str(actor["user_id"]), class_id)
         readiness = self.publish_readiness(actor, course_id)
         health = self.course_health(actor, course_id)
-        people = self.db.fetch_one(
-            """SELECT COUNT(DISTINCT user_id) active_students FROM (
-                   SELECT user_id FROM course_questions WHERE course_id=?
-                   UNION ALL SELECT user_id FROM course_attempts WHERE course_id=?
-               )""", (course_id, course_id),
-        ) or {"active_students": 0}
-        attempts = self.db.fetch_all("SELECT score,total FROM course_attempts WHERE course_id=?", (course_id,))
-        buckets = {"0-59": 0, "60-69": 0, "70-79": 0, "80-89": 0, "90-100": 0}
-        for attempt in attempts:
-            score = 100 * float(attempt["score"]) / max(1.0, float(attempt["total"]))
-            key = "0-59" if score < 60 else "60-69" if score < 70 else "70-79" if score < 80 else "80-89" if score < 90 else "90-100"
-            buckets[key] += 1
+        people = {"active_students":analysis["active_students"]}
+        buckets = analysis["score_buckets"]
         priorities: list[dict[str, Any]] = []
         for blocker in readiness["blockers"]:
             priorities.append({"severity": "high", "type": blocker["code"], "title": blocker["message"],
@@ -7253,19 +7239,26 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         return {
             "course": {"course_id": course_id, "course_name": course["course_name"]},
             "requested_class": class_scope,
-            "data_scope": "course_only" if class_id else "course",
-            "scope_note": ("历史学习事件没有 class_id，已安全回退为课程匿名聚合，未猜测班级归属"
-                           if class_id else "共享课程匿名聚合"),
+            "data_scope": analysis['data_scope'],
+            "scope_note": analysis['scope_note'],
             "knowledge": {"readiness": readiness, "health": health},
             "learning": {**analysis, "active_students": int(people["active_students"]),
                          "score_buckets": buckets},
             "priorities": priorities,
         }
 
-    def publish(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
+    def publish(self, actor: dict[str, Any], course_id: str, request_id: str | None = None) -> dict[str, Any]:
         course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
         if course["owner_id"] != actor["user_id"]:
             raise PermissionDenied("无权发布该课程知识库")
+        if request_id is not None and (not isinstance(request_id,str) or not 1<=len(request_id)<=100):
+            raise ValidationError('发布操作标识无效')
+        if request_id:
+            previous = self.db.fetch_one("SELECT course_id,result_json FROM submission_receipts WHERE user_id=? AND kind='knowledge_publish' AND request_id=?", (actor['user_id'],request_id))
+            if previous:
+                if previous['course_id'] != course_id:
+                    raise ValidationError('发布操作标识已用于其他课程')
+                return json.loads(previous['result_json'])
         readiness = self.publish_readiness(actor, course_id)
         if not readiness["can_publish"]:
             messages = "；".join(item["message"] for item in readiness["blockers"])
@@ -7384,6 +7377,14 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             current = self.db.fetch_one("SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?", (course_id,))
             version_id = f"kv_{uuid.uuid4().hex}"
             with self.db.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if request_id:
+                    previous = conn.execute("SELECT course_id,result_json FROM submission_receipts WHERE user_id=? AND kind='knowledge_publish' AND request_id=?", (actor['user_id'],request_id)).fetchone()
+                    if previous:
+                        if previous['course_id'] != course_id:
+                            raise ValidationError('发布操作标识已用于其他课程')
+                        return json.loads(previous['result_json'])
+                current = conn.execute('SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?',(course_id,)).fetchone()
                 conn.execute("UPDATE knowledge_versions SET status='superseded' WHERE course_id=? AND status='published'", (course_id,))
                 conn.execute(
                     """INSERT INTO knowledge_versions(version_id,course_id,version_number,status,created_by,published_at,markdown_snapshot)
@@ -7396,6 +7397,11 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                                  [(version_id, row["block_id"]) for row in blocks])
                 conn.executemany("INSERT INTO knowledge_version_relations(version_id,relation_id) VALUES(?,?)",
                                  [(version_id, row["relation_id"]) for row in relations])
+                from published_knowledge import capture_publication
+                capture_publication(conn, version_id)
+                if request_id:
+                    result = dict(conn.execute('SELECT * FROM knowledge_versions WHERE version_id=?',(version_id,)).fetchone())
+                    conn.execute('INSERT INTO submission_receipts VALUES(?,?,?,?,?,?)',(actor['user_id'],'knowledge_publish',request_id,course_id,'{}',json.dumps(result,ensure_ascii=False)))
             return self.db.fetch_one("SELECT * FROM knowledge_versions WHERE version_id=?", (version_id,)) or {}
 
         pending = self.db.fetch_one(
@@ -7415,6 +7421,14 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         current = self.db.fetch_one("SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?", (course_id,))
         version_id = f"kv_{uuid.uuid4().hex}"
         with self.db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if request_id:
+                previous = conn.execute("SELECT course_id,result_json FROM submission_receipts WHERE user_id=? AND kind='knowledge_publish' AND request_id=?", (actor['user_id'],request_id)).fetchone()
+                if previous:
+                    if previous['course_id'] != course_id:
+                        raise ValidationError('发布操作标识已用于其他课程')
+                    return json.loads(previous['result_json'])
+            current = conn.execute('SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?',(course_id,)).fetchone()
             conn.execute("UPDATE knowledge_versions SET status='superseded' WHERE course_id=? AND status='published'", (course_id,))
             conn.execute(
                 """INSERT INTO knowledge_versions(version_id,course_id,version_number,status,created_by,published_at)
@@ -7423,4 +7437,9 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             )
             conn.executemany("INSERT INTO knowledge_version_blocks(version_id,block_id) VALUES(?,?)",
                              [(version_id, row["block_id"]) for row in blocks])
+            from published_knowledge import capture_publication
+            capture_publication(conn, version_id)
+            if request_id:
+                result = dict(conn.execute('SELECT * FROM knowledge_versions WHERE version_id=?',(version_id,)).fetchone())
+                conn.execute('INSERT INTO submission_receipts VALUES(?,?,?,?,?,?)',(actor['user_id'],'knowledge_publish',request_id,course_id,'{}',json.dumps(result,ensure_ascii=False)))
         return self.db.fetch_one("SELECT * FROM knowledge_versions WHERE version_id=?", (version_id,)) or {}

@@ -75,7 +75,7 @@ class AuthService:
     def get_user(self, user_id: str) -> dict[str, Any]:
         user = self.db.fetch_one(
             """SELECT user_id,username,role,display_name,status,student_number,
-                      must_change_password,password_changed_at,created_at
+                      must_change_password,password_changed_at,created_at,session_version
                FROM users WHERE user_id=?""", (user_id,)
         )
         if not user:
@@ -119,6 +119,7 @@ class AuthService:
         claims: dict[str, Any] = {
             "sub": user["user_id"], "role": user["role"], "type": token_type, "jti": token_id,
             "iss": self.issuer, "iat": now,
+            "sv": user.get('session_version',0),
         }
         if session_expires_at is not None:
             session_exp = int(session_expires_at.timestamp())
@@ -150,6 +151,11 @@ class AuthService:
             raise PermissionDenied("登录状态无效或已过期") from exc
         if payload.get("type") != expected_type:
             raise PermissionDenied("令牌类型不合法")
+        user = self.get_user(str(payload.get('sub','')))
+        if user['status'] != 'active':
+            raise PermissionDenied('账号已停用')
+        if payload.get('sv',0) != user['session_version']:
+            raise PermissionDenied('登录状态已撤销，请重新登录')
         return payload
 
     def _validate_session_expiry(self, payload: dict[str, Any]) -> datetime | None:
@@ -178,6 +184,7 @@ class AuthService:
             {
                 "sub": user["user_id"], "role": user["role"], "type": "document_source",
                 "document_id": document_id, "jti": uuid.uuid4().hex, "iss": self.issuer,
+                "sv": user.get('session_version',0),
                 "iat": now, "exp": now + timedelta(minutes=self.document_token_minutes),
             },
             self.secret,
@@ -203,7 +210,10 @@ class AuthService:
         )
         if not stored:
             raise PermissionDenied("刷新令牌已失效")
-        self.db.execute("UPDATE refresh_tokens SET revoked_at=CURRENT_TIMESTAMP WHERE token_id=?", (payload["jti"],))
+        with self.db.connect() as conn:
+            updated = conn.execute("UPDATE refresh_tokens SET revoked_at=CURRENT_TIMESTAMP WHERE token_id=? AND revoked_at IS NULL", (payload['jti'],))
+            if updated.rowcount != 1:
+                raise PermissionDenied('刷新令牌已失效')
         user = self.get_user(str(payload["sub"]))
         if user.get("status") != "active":
             raise PermissionDenied("账号已停用")
@@ -224,7 +234,7 @@ class AuthService:
             raise PermissionDenied("原密码错误") from exc
         with self.db.connect() as conn:
             conn.execute(
-                """UPDATE users SET password_hash=?,must_change_password=0,
+                """UPDATE users SET password_hash=?,must_change_password=0,session_version=session_version+1,
                    password_changed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE user_id=?""",
                 (self.passwords.hash(new_password), user["user_id"]),
             )
@@ -240,4 +250,6 @@ class AuthService:
             payload = self.decode(token, "refresh")
         except PermissionDenied:
             return
-        self.db.execute("UPDATE refresh_tokens SET revoked_at=CURRENT_TIMESTAMP WHERE token_id=?", (payload["jti"],))
+        with self.db.connect() as conn:
+            conn.execute('UPDATE users SET session_version=session_version+1 WHERE user_id=?', (payload['sub'],))
+            conn.execute('UPDATE refresh_tokens SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=? AND revoked_at IS NULL', (payload['sub'],))

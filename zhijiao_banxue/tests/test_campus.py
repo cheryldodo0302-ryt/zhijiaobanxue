@@ -49,10 +49,19 @@ def campus(tmp_path):
 
 
 def add_shared(campus):
+    from ingestion_service import IngestionService
     course = campus.create_course("共享课", "shared_course", "teacher_1", "teacher", visibility="enrolled")
     campus.enroll_student(course["course_id"], "teacher_1", "student_1")
-    campus.upload_document(course["course_id"], "teacher_1", "teacher", "lesson.md", "text/markdown",
-                           "# 监督学习\n监督学习使用带标签样本训练模型。".encode())
+    ingestion = IngestionService(campus.db, campus)
+    teacher = {"user_id":"teacher_1", "role":"teacher"}
+    job = ingestion.queue_document(teacher, course["course_id"], "lesson.md", "text/markdown",
+                                    "# 监督学习\n监督学习使用带标签样本训练模型。".encode(), analysis_mode="local")
+    ingestion.process_job(job["job_id"])
+    analysis = campus.db.fetch_one("SELECT analysis_job_id FROM semantic_analysis_jobs WHERE document_id=?", (job["document_id"],))
+    if analysis:
+        ingestion.process_semantic_analysis(analysis["analysis_job_id"])
+    ingestion.approve_document_knowledge(teacher, job["document_id"])
+    ingestion.publish(teacher, course["course_id"])
     return course
 
 
@@ -254,6 +263,11 @@ def test_student_memory_minimum_loop_and_teacher_disabled(campus):
                            "actor":{"user_id":"student_1","role":"student"},"scope":{"course_id":course["course_id"]},
                            "input":{"questions":questions.data,"responses":["带标签样本"]}})
     assert graded.status == "success" and graded.data["score"] == 100
+    repeated = agent.invoke({"request_id":"repeat","agent":"student_assistant","action":"memory_questions_submit",
+        "actor":{"user_id":"student_1","role":"student"},"scope":{"course_id":course['course_id']},
+        "input":{"questions":questions.data,"responses":["different"]}})
+    assert repeated.status == 'error'
+    questions.data = agent.memory.generate_questions(course['course_id'],'student_1',3)
     wrong_grade = agent.invoke({"request_id":"m5b","agent":"student_assistant","action":"memory_questions_submit",
                                  "actor":{"user_id":"student_1","role":"student"},"scope":{"course_id":course["course_id"]},
                                  "input":{"questions":questions.data,"responses":["错误答案"]}})
@@ -410,6 +424,9 @@ def test_student_can_import_published_shared_course_knowledge(campus):
         "INSERT INTO knowledge_version_nodes(version_id,node_id) VALUES(?,?)",
         (version_id, node_id),
     )
+    from published_knowledge import capture_publication
+    with campus.db.connect() as conn:
+        capture_publication(conn,version_id)
 
     available = agent.invoke({
         "request_id": "published-list", "agent": "student_assistant",

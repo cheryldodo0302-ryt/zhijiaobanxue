@@ -248,10 +248,9 @@ class ChunkRetriever:
         seen: set[str] = set()
         for score, row in ranked:
             normalized = re.sub(r"\s+", "", row["content"]).lower()
-            fingerprint = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-            if score <= 0 or fingerprint in seen:
+            if score <= 0 or normalized in seen:
                 continue
-            seen.add(fingerprint)
+            seen.add(normalized)
             results.append(Evidence(
                 row["original_name"], row["section"] or "正文", row["content"], round(score, 4),
                 str(row.get("material_type") or ""), str(row.get("material_label") or ""),
@@ -283,8 +282,11 @@ class CampusService:
         if role == "student":
             if course["visibility"] == "public":
                 return True
-            return self.db.fetch_one("SELECT 1 ok FROM course_enrollments WHERE course_id=? AND student_id=?",
-                                     (course["course_id"], user_id)) is not None
+            return self.db.fetch_one("""SELECT 1 ok WHERE EXISTS(SELECT 1 FROM course_enrollments
+                WHERE course_id=? AND student_id=? AND direct_grant=1) OR EXISTS(
+                SELECT 1 FROM classes c JOIN class_memberships m USING(class_id) WHERE c.course_id=?
+                  AND m.student_id=? AND c.status='active' AND m.status='active')""",
+                (course['course_id'],user_id,course['course_id'],user_id)) is not None
         return False
 
     def require_access(self, course_id: str, user_id: str, role: str) -> dict:
@@ -385,7 +387,8 @@ class CampusService:
             raise PermissionDenied("只能为自己创建的共享课程授权")
         if not student_id.strip():
             raise ValidationError("学生 ID 不能为空")
-        self.db.execute("INSERT OR IGNORE INTO course_enrollments(course_id,student_id) VALUES(?,?)",
+        self.db.execute("""INSERT INTO course_enrollments(course_id,student_id,direct_grant) VALUES(?,?,1)
+            ON CONFLICT(course_id,student_id) DO UPDATE SET direct_grant=1""",
                         (course_id, student_id.strip()))
 
     def list_enrollments(self, course_id: str, teacher_id: str) -> list[dict]:
@@ -441,7 +444,25 @@ class CampusService:
                 "chunk_count": len(chunks), "parser_method": parser_method}
 
     def list_documents(self, course_id: str, user_id: str, role: str) -> list[dict]:
-        self.require_access(course_id, user_id, role)
+        course = self.require_access(course_id, user_id, role)
+        if role == "student" and course["course_type"] == "shared_course":
+            # Source-file permission is separate from permission to use published
+            # knowledge. Never expose raw chunk previews through Agent status.
+            documents = self.db.fetch_all(
+                """SELECT d.document_id,d.original_name,d.mime_type,d.size_bytes,d.status,d.created_at
+                   FROM course_documents d
+                   WHERE d.course_id=? AND d.student_file_visible=1
+                     AND EXISTS (
+                       SELECT 1 FROM document_blocks b
+                       JOIN knowledge_version_blocks vb USING(block_id)
+                       JOIN knowledge_versions v USING(version_id)
+                       WHERE b.document_id=d.document_id AND v.course_id=d.course_id
+                         AND v.status='published'
+                     )
+                   ORDER BY d.created_at DESC""", (course_id,),
+            )
+            from published_knowledge import document_allowed
+            return [d for d in documents if document_allowed(self.db,course_id,d['document_id'],user_id)]
         return self.db.fetch_all("""SELECT d.document_id,d.original_name,d.mime_type,d.size_bytes,d.status,d.error_message,d.created_at,
                                    COUNT(c.chunk_id) chunk_count,
                                    (SELECT dc.content FROM document_chunks dc WHERE dc.document_id=d.document_id ORDER BY dc.chunk_id LIMIT 1) text_preview
@@ -467,66 +488,29 @@ class CampusService:
                                   FROM course_documents d LEFT JOIN document_chunks c ON c.document_id=d.document_id WHERE d.course_id=?""", (course_id,))
         return {**(row or {}), "status": "ready" if row and row["chunk_count"] else "empty"}
 
-    def _retriever(self, course_id: str, material_type: str | None = None) -> ChunkRetriever:
+    def _retriever(self, course_id: str, material_type: str | None = None, user_id: str | None = None) -> ChunkRetriever:
         if material_type is not None and material_type not in COURSE_MATERIAL_LABELS:
             raise ValidationError("资料用途类型无效")
-        published = self.db.fetch_one(
-            "SELECT version_id FROM knowledge_versions WHERE course_id=? AND status='published' ORDER BY version_number DESC LIMIT 1",
-            (course_id,),
-        )
-        if published:
-            material_condition = ""
-            params: tuple[Any, ...] = (published["version_id"],)
-            if material_type:
-                material_condition = " AND n.material_type=?"
-                params += (material_type,)
-            semantic_rows = self.db.fetch_all(
-                """SELECT n.markdown content,
-                          CASE n.material_type
-                              WHEN 'slides' THEN '课件' WHEN 'textbook' THEN '教材'
-                              WHEN 'syllabus' THEN '教学大纲' WHEN 'lesson_plan' THEN '教案'
-                              WHEN 'experiment' THEN '实验资料' WHEN 'question_bank' THEN '题库'
-                              WHEN 'knowledge_graph' THEN '知识图谱'
-                              WHEN 'teaching_schedule' THEN '教学进度' ELSE '其他' END
-                          || ' · ' || COALESCE(c.title,'')
-                          || CASE WHEN s.title IS NOT NULL THEN ' / ' || s.title ELSE '' END section,
-                          (SELECT MIN(ns.page_number) FROM knowledge_node_sources ns WHERE ns.node_id=n.node_id) page_number,
-                          COALESCE((SELECT GROUP_CONCAT(DISTINCT d.original_name) FROM knowledge_node_sources ns
-                                    JOIN course_documents d USING(document_id) WHERE ns.node_id=n.node_id),'课程知识库') original_name,
-                          n.material_type,
-                          CASE n.material_type
-                              WHEN 'slides' THEN '课件' WHEN 'textbook' THEN '教材'
-                              WHEN 'syllabus' THEN '教学大纲' WHEN 'lesson_plan' THEN '教案'
-                              WHEN 'experiment' THEN '实验资料' WHEN 'question_bank' THEN '题库'
-                              WHEN 'knowledge_graph' THEN '知识图谱'
-                              WHEN 'teaching_schedule' THEN '教学进度' ELSE '其他' END material_label
-                   FROM knowledge_version_nodes vn JOIN knowledge_nodes n USING(node_id)
-                   LEFT JOIN knowledge_nodes s ON s.node_id=n.parent_id
-                   LEFT JOIN knowledge_nodes c ON c.node_id=s.parent_id
-                   WHERE vn.version_id=? AND n.status='approved' AND TRIM(n.markdown)<>''
-                """ + material_condition + " ORDER BY n.sort_order", params,
-            )
-            if semantic_rows:
-                return ChunkRetriever(semantic_rows)
-            block_condition = ""
-            block_params: tuple[Any, ...] = (published["version_id"],)
-            if material_type:
-                block_condition = " AND COALESCE(m.material_type,'other')=?"
-                block_params += (material_type,)
-            rows = self.db.fetch_all(
-                """SELECT b.plain_text content,'第 ' || COALESCE(b.page_number,1) || ' 页' section,b.page_number,d.original_name
-                          ,COALESCE(m.material_type,'other') material_type
-                   FROM knowledge_version_blocks vb JOIN document_blocks b USING(block_id)
-                   JOIN course_documents d USING(document_id)
-                   LEFT JOIN document_material_metadata m USING(document_id)
-                   WHERE vb.version_id=? AND b.visibility_level='PUBLIC'
-                     AND b.verification_status IN ('auto_verified','teacher_verified')"""
-                + block_condition, block_params,
-            )
-            for row in rows:
-                row["material_label"] = COURSE_MATERIAL_LABELS.get(row["material_type"], "其他")
-                row["section"] = f"{row['material_label']} · {row['section']}"
+        from published_knowledge import publication
+        version, nodes, blocks = publication(self.db, course_id, user_id)
+        if version:
+            points = [n for n in nodes if n["node_type"] == "knowledge_point"]
+            source = points if points else blocks
+            rows = []
+            for item in source:
+                if not item["_allowed"] or (material_type and item["material_type"] != material_type):
+                    continue
+                content = item.get("markdown") or item.get("summary") or item.get("plain_text") or ""
+                if not content.strip():
+                    continue
+                label = COURSE_MATERIAL_LABELS.get(item["material_type"], "其他")
+                rows.append({"content":content, "section":label + " · " + (item.get("section") or f"第 {item.get('page_number') or 1} 页"),
+                             "original_name":item["original_name"], "page_number":item.get("page_number"),
+                             "material_type":item["material_type"], "material_label":label})
             return ChunkRetriever(rows)
+        if self.get_course(course_id)["course_type"] == "shared_course":
+            # A missing publication is not permission to fall back to raw text.
+            return ChunkRetriever([])
         chunk_condition = ""
         chunk_params: tuple[Any, ...] = (course_id,)
         if material_type:
@@ -594,7 +578,7 @@ class CampusService:
                         "completed": False, "sources": evidence_refs,
                         "knowledge_points": [], "refused": False, "persisted": False,
                     }
-            retriever = self._retriever(course_id, selected_material)
+            retriever = self._retriever(course_id, selected_material, user_id if role == 'student' else None)
             result = guide_question(
                 clean_question, retriever, active_provider,
                 intent=intent, phase=phase, student_message=student_message,
@@ -644,6 +628,9 @@ class CampusService:
                         _json(result.knowledge_points), int(result.refused),
                     ),
                 )
+                from learning_events import record
+                with self.db.connect() as conn:
+                    record(conn,'question',question_id,course_id,user_id,question=clean_question,refused=result.refused)
             return {
                 "session_id": session_id,
                 "question_id": question_id,
@@ -658,13 +645,16 @@ class CampusService:
                 "refused": result.refused,
                 "persisted": should_persist,
             }
-        retriever = self._retriever(course_id, selected_material)
+        retriever = self._retriever(course_id, selected_material, user_id if role == 'student' else None)
         result = answer_question(clean_question, retriever, active_provider,
                                  MIN_EVIDENCE_SCORE, TOP_K)
         qid = self.db.execute("""INSERT INTO course_questions(course_id,user_id,question,answer,sources_json,knowledge_points_json,refused)
                                VALUES(?,?,?,?,?,?,?)""",
                               (course_id,user_id,clean_question,result.answer,_json([e.to_dict() for e in result.evidence]),
                                _json(result.knowledge_points),int(result.refused)))
+        from learning_events import record
+        with self.db.connect() as conn:
+            record(conn,'question',qid,course_id,user_id,question=clean_question,refused=result.refused)
         return {"question_id": qid, "answer": result.answer, "sources": [e.to_dict() for e in result.evidence],
                 "knowledge_points": result.knowledge_points, "refused": result.refused}
 
@@ -680,22 +670,39 @@ class CampusService:
             raise ValidationError("请先完成一次有资料证据支持的课程问答")
         weak = self.profile(course_id, user_id, role)["weak_points"]
         items = generate_exercises(row["answer"], _loads(row["knowledge_points_json"]), weak)
-        return {"question_id": row["question_id"], "items": [item.to_dict() for item in items]}
+        from assessment_store import AssessmentStore
+        saved = [item.to_dict() for item in items]
+        paper_id = AssessmentStore(self.db).create(course_id, user_id, "course", saved, {"question_id":row["question_id"]})
+        return {"question_id":row["question_id"], "paper_id":paper_id,
+                "items":[{**item,"paper_id":paper_id,"item_index":i} for i,item in enumerate(saved)]}
 
     def submit_quiz(self, course_id: str, user_id: str, role: str, question_id: int | None,
-                    items: list[dict], responses: list[str | None]) -> dict:
+                    items: list[dict], responses: list[str | None], paper_id: str | None = None) -> dict:
         self.require_access(course_id, user_id, role)
-        exercise_items = [ExerciseItem(**item) for item in items]
+        if role != "student":
+            raise PermissionDenied("仅学生可以提交练习")
+        from assessment_store import AssessmentStore
+        store = AssessmentStore(self.db)
+        paper = store.load(paper_id or (items[0].get("paper_id") if items else None), course_id, user_id, "course")
+        if question_id is not None and paper["metadata"].get("question_id") != question_id:
+            raise ValidationError("题目不属于本次试卷")
+        if len(responses) != len(paper["items"]):
+            raise ValidationError("答案数量与试卷不一致")
+        previous = store.previous(paper, responses)
+        if previous is not None:
+            return previous
+        exercise_items = [ExerciseItem(**item) for item in paper["items"]]
         grade = grade_exercises(exercise_items, responses)
         points = sorted({point for item in exercise_items for point in item.knowledge_points})
-        attempt_id = self.db.execute("""INSERT INTO course_attempts(course_id,user_id,question_id,score,total,wrong_items_json,records_json,knowledge_points_json)
-                                    VALUES(?,?,?,?,?,?,?,?)""",
-                                   (course_id,user_id,question_id,grade.score,grade.total,_json(grade.wrong_items),
-                                    _json(grade.records),_json(points)))
-        self.db.update_course_points(course_id, user_id, grade.records)
-        return {"attempt_id": attempt_id, "score": grade.score, "correct_count": grade.correct_count,
-                "total": grade.total, "records": grade.records, "wrong_items": grade.wrong_items,
-                "topic_stats": grade.topic_stats}
+        def save(conn):
+            cursor = conn.execute("""INSERT INTO course_attempts(course_id,user_id,question_id,score,total,wrong_items_json,records_json,knowledge_points_json)
+                VALUES(?,?,?,?,?,?,?,?)""", (course_id,user_id,paper["metadata"]["question_id"],grade.score,grade.total,
+                    _json(grade.wrong_items),_json(grade.records),_json(points)))
+            from learning_events import record
+            record(conn,'course',cursor.lastrowid,course_id,user_id,grade.score,grade.total,grade.records)
+            return {"attempt_id":cursor.lastrowid,"score":grade.score,"correct_count":grade.correct_count,
+                    "total":grade.total,"records":grade.records,"wrong_items":grade.wrong_items,"topic_stats":grade.topic_stats}
+        return store.finish(paper, responses, save)
 
     def profile(self, course_id: str, user_id: str, role: str) -> dict:
         self.require_access(course_id, user_id, role)
@@ -708,34 +715,37 @@ class CampusService:
             row["sources"] = _loads(row.pop("sources_json")); row["knowledge_points"] = _loads(row.pop("knowledge_points_json"))
         for row in attempts:
             row["wrong_items"] = _loads(row.pop("wrong_items_json")); row["records"] = _loads(row.pop("records_json")); row["knowledge_points"] = _loads(row.pop("knowledge_points_json"))
+        from learning_events import events, summarize
+        learning = events(self.db,course_id,user_id=user_id)
+        weak = summarize(learning)['weak_points']
+        for row in weak:
+            row['level'] = '薄弱' if row['accuracy'] < 60 else '待巩固' if row['accuracy'] < 80 else '掌握良好'
+        for event in learning:
+            if event['source'] in {'question','course'}:
+                continue
+            records = _loads(event['records_json'])
+            attempts.append({'attempt_id':event['event_id'],'source':event['source'],'score':event['score'],
+                'total':event['total'],'created_at':event['created_at'],'records':records,
+                'wrong_items':[r for r in records if not r.get('correct')],
+                'knowledge_points':list(dict.fromkeys(p for r in records for p in r.get('knowledge_points',[])))})
         return {"questions": questions, "attempts": attempts, "weak_points": weak,
                 "wrong_questions": [x for a in attempts for x in a["wrong_items"]]}
 
-    def class_analysis(self, course_id: str, teacher_id: str) -> dict:
+    def class_analysis(self, course_id: str, teacher_id: str, class_id: str | None = None) -> dict:
         course = self.require_access(course_id, teacher_id, "teacher")
         if course["course_type"] != "shared_course" or course["owner_id"] != teacher_id:
             raise PermissionDenied("教师只能分析自己的共享课程")
-        questions = self.db.fetch_all("SELECT question,refused,knowledge_points_json FROM course_questions WHERE course_id=?", (course_id,))
-        attempts = self.db.fetch_all("SELECT score,total,records_json FROM course_attempts WHERE course_id=?", (course_id,))
-        frequent = [{"question": q, "count": n} for q,n in Counter(x["question"] for x in questions).most_common(10)]
-        uncovered = [{"question": q, "count": n} for q,n in Counter(x["question"] for x in questions if x["refused"]).most_common(10)]
-        point_stats: dict[str, dict[str,int]] = defaultdict(lambda: {"answered":0,"correct":0})
-        for attempt in attempts:
-            for record in _loads(attempt["records_json"]):
-                for point in record.get("knowledge_points", []):
-                    point_stats[point]["answered"] += 1
-                    point_stats[point]["correct"] += int(bool(record.get("correct")))
-        weak = [{"knowledge_point": p, **s, "accuracy": round(100*s["correct"]/s["answered"],1) if s["answered"] else 0}
-                for p,s in point_stats.items()]
-        weak.sort(key=lambda x: (x["accuracy"], -x["answered"]))
-        avg = round(sum(x["score"] for x in attempts)/len(attempts),1) if attempts else 0
-        return {"question_count": len(questions), "quiz_count": len(attempts), "average_score": avg,
-                "frequent_questions": frequent, "uncovered_questions": uncovered, "weak_points": weak,
-                "privacy": "仅展示共享课程的匿名聚合结果"}
+        if class_id and not self.db.fetch_one("SELECT 1 ok FROM classes WHERE class_id=? AND course_id=? AND teacher_id=?", (class_id,course_id,teacher_id)):
+            raise PermissionDenied("无权查看该教学班")
+        from learning_events import events, summarize
+        result = summarize(events(self.db,course_id,class_id=class_id))
+        result["data_scope"] = "class_aggregate" if class_id else "course_aggregate"
+        result["scope_note"] = "班级统计仅包含记录了当时班级范围的新事件；历史未归属事件保留在课程统计中" if class_id else "共享课程匿名汇总，成绩统一为百分制"
+        return result
 
-    def teaching_report(self, course_id: str, teacher_id: str) -> dict:
+    def teaching_report(self, course_id: str, teacher_id: str, class_id: str | None = None) -> dict:
         course = self.get_course(course_id)
-        analysis = self.class_analysis(course_id, teacher_id)
+        analysis = self.class_analysis(course_id, teacher_id, class_id)
         phenomena, evidence, suggestions = [], [], []
         if analysis["weak_points"]:
             point = analysis["weak_points"][0]
@@ -763,8 +773,8 @@ class CampusService:
             writer.writerow(["练习",row["created_at"],f"错题 {len(row['wrong_items'])} 道",row["score"]])
         return ("\ufeff"+output.getvalue()).encode("utf-8")
 
-    def export_class_csv(self, course_id: str, teacher_id: str) -> bytes:
-        report = self.teaching_report(course_id, teacher_id)
+    def export_class_csv(self, course_id: str, teacher_id: str, class_id: str | None = None) -> bytes:
+        report = self.teaching_report(course_id, teacher_id, class_id)
         output = io.StringIO(); writer = csv.writer(output)
         writer.writerow(["现象","证据","建议"])
         for i in range(max(len(report["phenomena"]),len(report["evidence"]),len(report["suggestions"]))):
@@ -773,10 +783,10 @@ class CampusService:
                              report["suggestions"][i] if i < len(report["suggestions"]) else ""])
         return ("\ufeff"+output.getvalue()).encode("utf-8")
 
-    def export_class_excel(self, course_id: str, teacher_id: str) -> bytes:
+    def export_class_excel(self, course_id: str, teacher_id: str, class_id: str | None = None) -> bytes:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
-        report = self.teaching_report(course_id, teacher_id)
+        report = self.teaching_report(course_id, teacher_id, class_id)
         workbook = Workbook(); sheet = workbook.active; sheet.title = "教学改进"
         sheet.append(["现象", "证据", "建议"])
         for cell in sheet[1]:
@@ -793,10 +803,10 @@ class CampusService:
         analysis.append(["平均分", report["analysis"]["average_score"]])
         output = io.BytesIO(); workbook.save(output); return output.getvalue()
 
-    def export_class_word(self, course_id: str, teacher_id: str) -> bytes:
+    def export_class_word(self, course_id: str, teacher_id: str, class_id: str | None = None) -> bytes:
         from docx import Document
         from docx.shared import Pt
-        report = self.teaching_report(course_id, teacher_id)
+        report = self.teaching_report(course_id, teacher_id, class_id)
         document = Document(); document.add_heading(f"{report['course_name']} 学情报告", 0)
         document.add_paragraph("本报告仅使用共享课程中的匿名聚合数据。")
         for index, phenomenon in enumerate(report["phenomena"]):
@@ -900,3 +910,5 @@ class CampusService:
                 )
                 conn.execute("INSERT OR IGNORE INTO knowledge_version_nodes(version_id,node_id) VALUES(?,?)", (version_id, node_id))
                 conn.execute("INSERT OR IGNORE INTO knowledge_version_blocks(version_id,block_id) VALUES(?,?)", (version_id, block_id))
+            from published_knowledge import capture_publication
+            capture_publication(conn,version_id)

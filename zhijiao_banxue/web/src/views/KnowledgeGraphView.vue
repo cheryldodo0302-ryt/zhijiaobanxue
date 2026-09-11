@@ -3,9 +3,11 @@ import {computed,onMounted,reactive,ref} from 'vue'
 import {ElMessage,ElMessageBox} from 'element-plus'
 import {api} from '../api'
 import KnowledgeGraphCanvas from '../components/KnowledgeGraphCanvas.vue'
+import {useTeacherWorkspace} from '../teacher-workspace'
 
 type Row=Record<string,any>
 const courses=ref<Row[]>([]),courseId=ref(''),data=ref<Row|null>(null),loading=ref(false),activeTab=ref('graph')
+const {restoreCourse}=useTeacherWorkspace(courses,courseId)
 const search=ref(''),publishedSearch=ref(''),layout=ref<'force'|'circular'>('force'),relationKinds=ref<string[]>([])
 const drawer=ref(false),selected=ref<Row|null>(null),selectedType=ref<'node'|'relation'|'published'>('node')
 const importOpen=ref(false),importStep=ref(0),files=ref<File[]>([]),batch=ref<Row|null>(null),working=ref(false)
@@ -27,7 +29,7 @@ const fail=(e:any,text:string)=>ElMessage.error(e?.response?.data?.detail||e?.me
 const tag=(value:string)=>value==='approved'?'success':value==='rejected'?'danger':'warning'
 const materialLabel=(value:string)=>materialLabels[value]||value||'其他'
 
-async function init(){try{courses.value=(await api.get('/teacher/courses')).data;if(courses.value.length){courseId.value=courses.value[0].course_id;await load()}}catch(e){fail(e,'知识图谱初始化失败')}}
+async function init(){try{courses.value=(await api.get('/teacher/courses')).data;restoreCourse();await load()}catch(e){fail(e,'知识图谱初始化失败')}}
 async function load(){if(!courseId.value)return;loading.value=true;try{data.value=(await api.get(`/teacher/courses/${courseId.value}/knowledge-graph`)).data;syncRows.value=(await api.get(`/teacher/courses/${courseId.value}/knowledge-graph/source-diff`)).data}catch(e){fail(e,'知识图谱加载失败')}finally{loading.value=false}}
 function selectNode(row:Row){selectedType.value='node';selected.value={...row};drawer.value=true}
 function selectRelation(row:Row){selectedType.value='relation';selected.value={...row};drawer.value=true}

@@ -1325,10 +1325,65 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
             ON course_documents(course_id,knowledge_review_status,knowledge_review_mode);
         """,
     ),
+    (
+        "033_account_ai_settings",
+        """
+        CREATE TABLE IF NOT EXISTS account_ai_settings (
+            user_id TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            mode TEXT NOT NULL CHECK(mode IN ('mock','relay','custom')),
+            provider TEXT NOT NULL DEFAULT '',
+            base_url TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            api_key_encrypted TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+    ),
+    (
+        "034_review_followup",
+        """
+        ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE course_enrollments ADD COLUMN direct_grant INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE knowledge_versions ADD COLUMN snapshot_ready INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE published_knowledge_items (
+            version_id TEXT NOT NULL REFERENCES knowledge_versions(version_id) ON DELETE CASCADE,
+            item_id TEXT NOT NULL, kind TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+            PRIMARY KEY(version_id,kind,item_id)
+        );
+        ALTER TABLE knowledge_blocks ADD COLUMN source_node_id TEXT;
+        ALTER TABLE knowledge_blocks ADD COLUMN source_version_id TEXT;
+        CREATE TABLE assessment_papers (
+            paper_id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL, kind TEXT NOT NULL, items_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}', result_json TEXT,
+            responses_json TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_assessment_owner ON assessment_papers(course_id,user_id,kind);
+        CREATE TABLE learning_events (
+            event_id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL, source TEXT NOT NULL, score REAL, total INTEGER NOT NULL DEFAULT 0,
+            records_json TEXT NOT NULL DEFAULT '[]', question TEXT NOT NULL DEFAULT '',
+            refused INTEGER NOT NULL DEFAULT 0, class_ids_json TEXT NOT NULL DEFAULT '[]',
+            legacy INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_learning_event_scope ON learning_events(course_id,user_id,created_at);
+        CREATE TABLE submission_receipts (
+            user_id TEXT NOT NULL, kind TEXT NOT NULL, request_id TEXT NOT NULL,
+            course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+            input_json TEXT NOT NULL, result_json TEXT NOT NULL,
+            PRIMARY KEY(user_id,kind,request_id)
+        );
+        """,
+    ),
+    ('036_question_publication_snapshot', """
+        ALTER TABLE question_bank_version_items ADD COLUMN snapshot_json TEXT;
+    """),
 )
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS schema_migrations (
                migration_id TEXT PRIMARY KEY,
@@ -1339,5 +1394,10 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     for migration_id, sql in MIGRATIONS:
         if migration_id in applied:
             continue
-        conn.executescript(sql)
+        statement = ""
+        for char in sql:
+            statement += char
+            if char == ";" and sqlite3.complete_statement(statement):
+                conn.execute(statement)
+                statement = ""
         conn.execute("INSERT INTO schema_migrations(migration_id) VALUES(?)", (migration_id,))

@@ -6,6 +6,7 @@ import { api } from "../api";
 import { useAuthStore } from "../stores/auth";
 import KnowledgeGraphCanvas from "../components/KnowledgeGraphCanvas.vue";
 import AiSettingsDialog from "../components/AiSettingsDialog.vue";
+import { readWorkspace, writeWorkspace } from "../workspace-storage";
 import {
   learningModeLabel,
   questionAnswerLabel,
@@ -74,6 +75,7 @@ const cloze = ref<any>(null);
 const clozeResponses = ref<string[]>([]);
 const clozeResult = ref<any>(null);
 const recitedText = ref("");
+const recitationSubmission = ref({key:'',id:''});
 const recitationResult = ref<any>(null);
 const speechRate = ref(1);
 const recording = ref(false);
@@ -98,6 +100,35 @@ const publishedKnowledge = ref<any>(null);
 const publishedKnowledgeDialog = ref(false);
 const selectedPublishedNodeIds = ref<string[]>([]);
 const importingPublished = ref(false);
+const startingReview = ref(false);
+let preferencesReady = false;
+
+function restoreStudyPreferences() {
+  const value = readWorkspace<any>(auth.user?.user_id || "", `student:${courseId.value}`, {});
+  activeTab.value = normalizeStudentView(
+    !preferencesReady && route.query.view ? route.query.view : value?.view || activeTab.value,
+    selectedCourse.value?.course_type === "shared_course",
+  );
+  questionCount.value = Math.max(3, Math.min(12, Math.round(Number(value?.questionCount) || 6)));
+  speechRate.value = Math.max(0.75, Math.min(2, Number(value?.speechRate) || 1));
+  preferencesReady = true;
+}
+
+async function startReview() {
+  if (startingReview.value || !courseId.value) return;
+  startingReview.value = true;
+  const id = courseId.value;
+  try {
+    await invoke("knowledge_blocks_build", {}, id);
+    if (courseId.value !== id) return;
+    await loadCourseData();
+    if (courseId.value !== id) return;
+    if (!blocks.value.length) return ElMessage.info("当前没有可复习知识点");
+    activeTab.value = "training";
+    await generateCloze();
+  } catch (error) { showError(error, "复习准备失败，已完成的卡片会保留，可再次继续"); }
+  finally { startingReview.value = false; }
+}
 
 function rememberedCourseKey() {
   return auth.user?.user_id
@@ -215,6 +246,7 @@ async function invoke(
   id = courseId.value,
 ) {
   if (!auth.user) throw new Error("登录状态已失效，请重新登录");
+  const actorId = auth.user.user_id;
   const requiresCourse = ![
     "personal_course_create",
     "available_courses_list",
@@ -228,7 +260,9 @@ async function invoke(
     scope: actionScope(id),
     input,
     context: { source: "vue-student", language: "zh-CN" },
-  });
+  }, { timeout: 130000 });
+  if (auth.user?.user_id !== actorId || (requiresCourse && courseId.value !== id))
+    throw new Error('课程或账号已切换，已忽略上一页面的响应');
   if (data.status !== "success") throw new Error(data.message || "操作失败");
   return data.data;
 }
@@ -262,6 +296,7 @@ async function loadCourses() {
 
 async function courseChanged() {
   rememberCourse();
+  restoreStudyPreferences();
   retrievalMaterial.value = "all";
   session.value = null;
   messages.value = [];
@@ -270,6 +305,9 @@ async function courseChanged() {
   publishedBank.value = null;
   publishedGrade.value = null;
   trainingBlockId.value = undefined;
+  documents.value = []; blocks.value = []; profile.value = null; dashboard.value = null;
+  cloze.value = null; clozeResult.value = null; recitationResult.value = null;
+  memoryQuestions.value = []; memoryGrade.value = null;
   activeTab.value = normalizeStudentView(
     activeTab.value,
     selectedCourse.value?.course_type === "shared_course",
@@ -295,13 +333,15 @@ async function loadPublishedGraph() {
 
 async function loadCourseData() {
   if (!courseId.value) return;
+  const id = courseId.value;
   try {
     const [docs, nextBlocks, nextProfile, nextDashboard] = await Promise.all([
-      invoke("document_status"),
-      invoke("knowledge_blocks_list"),
-      invoke("learning_profile"),
-      invoke("student_dashboard"),
+      invoke("document_status", {}, id),
+      invoke("knowledge_blocks_list", {}, id),
+      invoke("learning_profile", {}, id),
+      invoke("student_dashboard", {}, id),
     ]);
+    if (courseId.value !== id) return;
     documents.value = docs || [];
     blocks.value = nextBlocks || [];
     profile.value = nextProfile || null;
@@ -434,6 +474,7 @@ async function submitQuiz() {
   loading.value = true;
   try {
     grade.value = await invoke("quiz_submit", {
+      paper_id: quiz.value.paper_id,
       question_id: quiz.value.question_id,
       items: quiz.value.items,
       responses: responses.value,
@@ -636,8 +677,8 @@ async function buildBlocks() {
     const result = await invoke("knowledge_blocks_build", {
       document_id: documents.value[0].document_id,
     });
-    blocks.value = [...blocks.value, ...(result || [])];
-    ElMessage.success(`已生成 ${(result || []).length} 个知识卡片`);
+    await loadCourseData();
+    ElMessage.success(`已准备 ${(result || []).length} 张知识卡片，已有卡片会自动复用`);
   } catch (error) {
     showError(error, "知识卡片生成失败");
   } finally {
@@ -793,6 +834,7 @@ async function submitCloze() {
   loading.value = true;
   try {
     clozeResult.value = await invoke("cloze_submit", {
+      paper_id: cloze.value.paper_id,
       block_id: trainingBlockId.value,
       extra_keywords: cloze.value.keywords || cloze.value.extra_keywords || [],
       responses: clozeResponses.value,
@@ -820,7 +862,10 @@ async function evaluateRecitation() {
     return ElMessage.warning("请先输入或粘贴你的背诵内容");
   loading.value = true;
   try {
+    const key = `${courseId.value}:${trainingBlockId.value}:${recitedText.value.trim()}`;
+    if (recitationSubmission.value.key !== key) recitationSubmission.value = {key,id:crypto.randomUUID()};
     recitationResult.value = await invoke("recitation_evaluate", {
+      submission_id: recitationSubmission.value.id,
       block_id: trainingBlockId.value,
       recited_text: recitedText.value.trim(),
     });
@@ -1004,9 +1049,11 @@ async function loadPublishedBank() {
 
 async function submitPublishedBank() {
   if (!publishedBank.value) return;
+  publishedBank.value.submission_id ||= crypto.randomUUID();
   loading.value = true;
   try {
     publishedGrade.value = await invoke("quiz_submit", {
+      submission_id: publishedBank.value.submission_id,
       version_id: publishedBank.value.version_id,
       items: publishedBank.value.items,
       responses: publishedResponses.value,
@@ -1089,6 +1136,11 @@ watch([courseId, activeTab], ([course, tab]) => {
     String(route.query.view || "") !== tab
   )
     router.replace({ query });
+});
+watch([activeTab, questionCount, speechRate], () => {
+  if (preferencesReady && courseId.value) writeWorkspace(auth.user?.user_id || "", `student:${courseId.value}`, {
+    view: activeTab.value, questionCount: questionCount.value, speechRate: speechRate.value,
+  });
 });
 onMounted(async () => {
   activeTab.value = normalizeStudentView(route.query.view, true);
@@ -1188,6 +1240,7 @@ onUnmounted(async () => {
             >还没有课程，可以在下方创建个人课程。</span
           >
         </div>
+        <el-button v-if="selectedCourse" type="primary" :loading="startingReview" @click="startReview">一键准备并复习</el-button>
         <el-button text @click="loadCourses">刷新</el-button>
       </div>
       <div v-if="selectedCourse" class="course-summary-cards">
@@ -1554,6 +1607,7 @@ onUnmounted(async () => {
                   @click="openPublishedKnowledgeDialog"
                   >导入教师已发布知识</el-button
                 ><el-button
+                  v-if="selectedCourse.course_type === 'personal_course'"
                   type="primary"
                   :disabled="!documents.length"
                   @click="buildBlocks"
@@ -1635,6 +1689,9 @@ onUnmounted(async () => {
                 >
                 <el-tag v-if="item.imported" type="success" size="small"
                   >已导入</el-tag
+                >
+                <el-tag v-if="item.update_available" type="warning" size="small"
+                  >教师已更新，个人卡片保留原修改</el-tag
                 >
               </div>
               <p>{{ item.content }}</p>

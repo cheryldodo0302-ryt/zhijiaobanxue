@@ -12,11 +12,13 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from agent_service import CampusAgentService
+import config
+from account_ai_service import AccountAiService
 from auth_service import AuthService
 from campus_service import CampusError, CampusService, NotFound
 from config import (
     DB_PATH, MATERIALS_DIR, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB,
-    get_ai_settings, get_public_ai_settings, save_user_ai_settings, student_import_config_status,
+    student_import_config_status,
 )
 from database import LearningDatabase
 from llm_provider import backend_provider_status
@@ -268,7 +270,12 @@ class QuestionReviewPayload(BaseModel):
 
 class QuestionBankSubmitPayload(BaseModel):
     version_id: str
+    submission_id: str | None = Field(default=None, min_length=1, max_length=100)
     responses: list[dict] = Field(min_length=1, max_length=100)
+
+
+class KnowledgePublishPayload(BaseModel):
+    request_id: str = Field(min_length=1,max_length=100)
 
 
 class QuestionFolderPayload(BaseModel):
@@ -374,6 +381,8 @@ def current_teacher(user: dict = Depends(current_user)) -> dict:
         raise HTTPException(status_code=403, detail="仅教师可以访问该接口")
     if user.get("must_change_password"):
         raise HTTPException(status_code=403, detail="请先修改初始密码")
+    if not config.TEACHER_PORTAL_ENABLED:
+        raise HTTPException(status_code=403, detail={'status':'disabled','message':'教师能力暂未开放'})
     return user
 
 
@@ -386,6 +395,8 @@ def current_student(user: dict = Depends(current_user)) -> dict:
 
 
 def current_ready_user(user: dict = Depends(current_user)) -> dict:
+    if user.get('role') == 'teacher':
+        return current_teacher(user)
     if user.get("must_change_password"):
         raise HTTPException(status_code=403, detail="请先修改初始密码")
     return user
@@ -414,8 +425,7 @@ def capabilities() -> dict:
 
 @app.get("/api/v1/runtime/ai-settings")
 def runtime_ai_settings(user: dict = Depends(current_ready_user)) -> dict:
-    del user
-    return get_public_ai_settings()
+    return AccountAiService(db).public(user)
 
 
 @app.put("/api/v1/runtime/ai-settings")
@@ -423,21 +433,9 @@ def update_runtime_ai_settings(
     payload: RuntimeAiSettingsPayload,
     user: dict = Depends(current_ready_user),
 ) -> dict:
-    del user
     try:
-        current = get_ai_settings()
-        api_key = payload.api_key
-        if payload.mode == "custom" and not api_key and current.get("mode") == "custom":
-            api_key = str(current.get("api_key") or "")
-        save_user_ai_settings(
-            payload.mode,
-            provider=payload.provider,
-            base_url=payload.base_url,
-            model=payload.model,
-            api_key=api_key,
-        )
-        return get_public_ai_settings()
-    except ValueError as exc:
+        return AccountAiService(db).save(user, **payload.model_dump())
+    except (ValueError, CampusError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -1514,6 +1512,8 @@ def document_preview_token(document_id: str, user: dict = Depends(current_ready_
 def document_source(document_id: str, token: str = Query(...)) -> FileResponse:
     try:
         user = auth.authenticate_document_token(token, document_id)
+        if user.get('role') == 'teacher':
+            current_teacher(user)
         document, source = ingestion.source_file(user, document_id)
         return FileResponse(
             source, media_type=document["mime_type"], filename=document["original_name"],
@@ -1528,6 +1528,8 @@ def document_source(document_id: str, token: str = Query(...)) -> FileResponse:
 def document_preview(document_id: str, token: str = Query(...)) -> Response:
     try:
         user = auth.authenticate_document_token(token, document_id)
+        if user.get('role') == 'teacher':
+            current_teacher(user)
         media_type, value = ingestion.preview_file(user, document_id)
         if isinstance(value, str):
             return Response(
@@ -1717,17 +1719,35 @@ def student_question_folders(course_id: str,
 def student_question_submit(course_id: str, payload: QuestionBankSubmitPayload,
                             user: dict = Depends(current_student)) -> dict:
     try:
-        return question_banks.submit(user, course_id, payload.version_id, payload.responses)
+        return question_banks.submit(user, course_id, payload.version_id, payload.responses, payload.submission_id)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/teacher/courses/{course_id}/knowledge-versions/publish")
-def teacher_knowledge_publish(course_id: str, user: dict = Depends(current_teacher)) -> dict:
+def teacher_knowledge_publish(course_id: str, payload: KnowledgePublishPayload | None = None, user: dict = Depends(current_teacher)) -> dict:
     try:
-        return ingestion.publish(user, course_id)
+        return ingestion.publish(user, course_id, payload.request_id if payload else None)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get('/api/v1/teacher/courses/{course_id}/knowledge-versions')
+def teacher_knowledge_versions(course_id: str, user: dict = Depends(current_teacher)) -> list[dict]:
+    from published_knowledge import version_history
+    try:
+        return version_history(campus,user,course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403,detail=str(exc)) from exc
+
+
+@app.post('/api/v1/teacher/courses/{course_id}/knowledge-versions/{version_id}/withdraw')
+def teacher_knowledge_version_withdraw(course_id: str, version_id: str, user: dict = Depends(current_teacher)) -> dict:
+    from published_knowledge import withdraw_version
+    try:
+        return withdraw_version(campus,user,course_id,version_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403,detail=str(exc)) from exc
 
 
 @app.post("/api/v1/agent/invoke")

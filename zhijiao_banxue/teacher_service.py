@@ -206,14 +206,25 @@ class TeacherService:
         major = str(updates.get("major", current.get("major")) or "").strip()[:120]
         teaching_level = str(updates.get("teaching_level", current.get("teaching_level")) or "").strip()[:100]
         try:
-            self.db.execute(
-                """UPDATE classes SET course_id=?,term_id=?,class_name=?,class_variant=?,
+            with self.db.connect() as conn:
+                conn.execute(
+                    """UPDATE classes SET course_id=?,term_id=?,class_name=?,class_variant=?,
                           teaching_time_slot=?,campus=?,cohort_year=?,major=?,teaching_level=?,
                           updated_at=CURRENT_TIMESTAMP
                    WHERE class_id=? AND teacher_id=?""",
-                (course_id, term_id, class_name, class_variant, teaching_time_slot,
+                    (course_id, term_id, class_name, class_variant, teaching_time_slot,
                  campus, cohort_year, major, teaching_level, class_id, teacher_id),
-            )
+                )
+                if course_id != current["course_id"]:
+                    members = conn.execute(
+                        "SELECT student_id FROM class_memberships WHERE class_id=? AND status='active'", (class_id,),
+                    ).fetchall()
+                    for member in members:
+                        self._remove_unused_enrollment(conn, current["course_id"], member["student_id"])
+                        conn.execute(
+                            "INSERT OR IGNORE INTO course_enrollments(course_id,student_id,direct_grant) VALUES(?,?,0)",
+                            (course_id, member["student_id"]),
+                        )
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():
                 raise ValidationError("该课程和学期下已存在同名教学班") from exc
@@ -223,9 +234,21 @@ class TeacherService:
 
     def delete_class(self, actor: dict[str, Any], class_id: str) -> None:
         teacher_id = self.require_teacher(actor)
-        self.require_class(actor, class_id)
-        self.db.execute(
-            "DELETE FROM classes WHERE class_id=? AND teacher_id=?", (class_id, teacher_id)
+        current = self.require_class(actor, class_id)
+        with self.db.connect() as conn:
+            members = conn.execute("SELECT student_id FROM class_memberships WHERE class_id=?", (class_id,)).fetchall()
+            conn.execute("DELETE FROM classes WHERE class_id=? AND teacher_id=?", (class_id, teacher_id))
+            for member in members:
+                self._remove_unused_enrollment(conn, current["course_id"], member["student_id"])
+
+    @staticmethod
+    def _remove_unused_enrollment(conn, course_id: str, student_id: str) -> None:
+        conn.execute(
+            """DELETE FROM course_enrollments WHERE course_id=? AND student_id=? AND direct_grant=0
+               AND NOT EXISTS (
+                   SELECT 1 FROM class_memberships m JOIN classes c USING(class_id)
+                   WHERE c.course_id=? AND m.student_id=? AND m.status='active' AND c.status='active'
+               )""", (course_id, student_id, course_id, student_id),
         )
 
     def require_class(self, actor: dict[str, Any], class_id: str) -> dict[str, Any]:
@@ -399,7 +422,7 @@ class TeacherService:
             raise PermissionDenied("只能重置当前教学班在册学生的密码")
         with self.db.connect() as conn:
             conn.execute(
-                """UPDATE users SET password_hash=?,must_change_password=1,
+                """UPDATE users SET password_hash=?,must_change_password=1,session_version=session_version+1,
                        password_changed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE user_id=?""",
                 (self.passwords.hash(new_password), student_id),
             )
@@ -491,7 +514,7 @@ class TeacherService:
                             (class_id, user_id, anon),
                         )
                         conn.execute(
-                            "INSERT OR IGNORE INTO course_enrollments(course_id,student_id) VALUES(?,?)",
+                            "INSERT OR IGNORE INTO course_enrollments(course_id,student_id,direct_grant) VALUES(?,?,0)",
                             (scope["course_id"], user_id),
                         )
                         status = "created" if created else "reused"

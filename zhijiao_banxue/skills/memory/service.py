@@ -155,7 +155,29 @@ class MemoryLearningSkill:
         return {**document, "extracted_text": text}
 
     def build_blocks(self, course_id: str, user_id: str, document_id: str | None = None) -> list[dict]:
-        self._student_course(course_id, user_id)
+        course = self._student_course(course_id, user_id)
+        if course["course_type"] == "shared_course":
+            published = self.list_published_knowledge(course_id, user_id)
+            ids = [row["node_id"] for row in published["items"]
+                   if not document_id or row["document_id"] == document_id]
+            if not ids:
+                raise ValidationError("当前资料没有已发布知识点，请等待教师审核发布")
+            for start in range(0, len(ids), 200):
+                self.import_published_knowledge(course_id, user_id, ids[start:start + 200])
+            return [row for row in self.list_blocks(course_id, user_id)
+                    if not document_id or row["document_id"] == document_id]
+        existing = [row for row in self.list_blocks(course_id, user_id)
+                    if not document_id or row["document_id"] == document_id]
+        if document_id and existing:
+            return existing
+        if not document_id:
+            documents = self.db.fetch_all(
+                "SELECT document_id FROM course_documents WHERE course_id=? ORDER BY created_at", (course_id,),
+            )
+            if not documents:
+                raise ValidationError("请先上传学习资料")
+            return [block for document in documents
+                    for block in self.build_blocks(course_id, user_id, document["document_id"])]
         params: tuple = (course_id,)
         sql = """SELECT c.content,c.section,c.document_id,d.original_name
                  FROM document_chunks c JOIN course_documents d USING(document_id)
@@ -170,6 +192,17 @@ class MemoryLearningSkill:
         blocks = semantic.semantic_chunks(rows)
         created: list[dict] = []
         with self.db.connect() as conn:
+            # Recheck after the model call: two requests must not create two sets.
+            conn.execute("BEGIN IMMEDIATE")
+            saved = conn.execute(
+                "SELECT * FROM knowledge_blocks WHERE course_id=? AND owner_id=? AND document_id=? ORDER BY block_order",
+                (course_id, user_id, document_id),
+            ).fetchall()
+            if saved:
+                result = [dict(row) for row in saved]
+                for row in result:
+                    row["keywords"] = _loads(row.pop("keywords_json"))
+                return result
             current = conn.execute("SELECT COALESCE(MAX(block_order),0) FROM knowledge_blocks WHERE course_id=?",
                                    (course_id,)).fetchone()[0]
             for offset, block in enumerate(blocks, 1):
@@ -193,43 +226,37 @@ class MemoryLearningSkill:
         )
         for row in rows:
             row["keywords"] = _loads(row.pop("keywords_json"))
-        return rows
+        return [row for row in rows if self._block_visible(row,user_id)]
+
+    def _block_visible(self, block, user_id):
+        course = self._student_course(block['course_id'],user_id)
+        if course['course_type'] != 'shared_course':
+            return True
+        from published_knowledge import visible_nodes, document_allowed
+        if block.get('source_node_id'):
+            allowed = {r['node_id'] for r in visible_nodes(self.db,block['course_id'],user_id)[1]}
+            return all(document_allowed(self.db,block['course_id'],source[4:],user_id) if source.startswith('doc:')
+                       else source in allowed for source in block['source_node_id'].split(','))
+        return bool(block.get('document_id')) and document_allowed(self.db,block['course_id'],block['document_id'],user_id)
 
     def list_published_knowledge(self, course_id: str, user_id: str) -> dict[str, Any]:
         course = self._student_course(course_id, user_id)
         if course["course_type"] != "shared_course":
             raise PermissionDenied("只有教师共享课程可以导入已发布知识点")
-        version = self.db.fetch_one(
-            """SELECT version_id,version_number,published_at FROM knowledge_versions
-               WHERE course_id=? AND status='published'
-               ORDER BY version_number DESC LIMIT 1""",
-            (course_id,),
-        )
-        if not version:
-            return {"version": None, "items": []}
-        rows = self.db.fetch_all(
-            """SELECT n.node_id,n.document_id,n.title,n.summary,n.markdown,n.keywords_json,
-                      n.material_type,d.original_name,
-                      CASE WHEN EXISTS (
-                          SELECT 1 FROM knowledge_blocks b
-                          WHERE b.course_id=? AND b.owner_id=?
-                            AND b.title=n.title
-                            AND b.content=COALESCE(NULLIF(n.markdown,''),n.summary,n.title)
-                      ) THEN 1 ELSE 0 END imported
-               FROM knowledge_version_nodes vn
-               JOIN knowledge_nodes n ON n.node_id=vn.node_id
-               LEFT JOIN course_documents d ON d.document_id=n.document_id
-               WHERE vn.version_id=? AND n.node_type='knowledge_point'
-               ORDER BY n.material_type,n.sort_order,n.title""",
-            (course_id, user_id, version["version_id"]),
-        )
-        items: list[dict[str, Any]] = []
+        from published_knowledge import visible_nodes
+        version, rows = visible_nodes(self.db, course_id, user_id)
+        items = []
         for row in rows:
             row["keywords"] = _loads(row.pop("keywords_json"))
             row["content"] = str(row.get("markdown") or row.get("summary") or row["title"])
-            row["imported"] = bool(row.get("imported"))
+            existing = self.db.fetch_one("""SELECT source_version_id FROM knowledge_blocks WHERE course_id=? AND owner_id=?
+                AND (instr(','||COALESCE(source_node_id,'')||',',','||?||',')>0 OR (source_node_id IS NULL AND title=? AND content=?)) LIMIT 1""",
+                (course_id,user_id,row["node_id"],row["title"],row["content"]))
+            row["imported"] = existing is not None
+            row["update_available"] = bool(existing and existing["source_version_id"] != version["version_id"])
             items.append(row)
-        return {"version": version, "items": items}
+        public_version = {k:version[k] for k in ("version_id","version_number","published_at")} if version else None
+        return {"version":public_version,"items":items}
 
     def import_published_knowledge(self, course_id: str, user_id: str,
                                    node_ids: list[str]) -> dict[str, Any]:
@@ -241,25 +268,13 @@ class MemoryLearningSkill:
             raise ValidationError("请至少选择一个已发布知识点")
         if len(clean_ids) > 200:
             raise ValidationError("一次最多导入 200 个知识点")
-        version = self.db.fetch_one(
-            """SELECT version_id,version_number,published_at FROM knowledge_versions
-               WHERE course_id=? AND status='published'
-               ORDER BY version_number DESC LIMIT 1""",
-            (course_id,),
-        )
+        from published_knowledge import visible_nodes
+        version, available = visible_nodes(self.db, course_id, user_id)
         if not version:
             raise ValidationError("该课程尚未发布知识点")
-        placeholders = ",".join("?" for _ in clean_ids)
-        rows = self.db.fetch_all(
-            f"""SELECT n.node_id,n.document_id,n.title,n.summary,n.markdown,n.keywords_json
-                FROM knowledge_version_nodes vn
-                JOIN knowledge_nodes n ON n.node_id=vn.node_id
-                WHERE vn.version_id=? AND n.node_type='knowledge_point'
-                  AND n.node_id IN ({placeholders})""",
-            (version["version_id"], *clean_ids),
-        )
+        rows = [row for row in available if row["node_id"] in clean_ids]
         if len(rows) != len(clean_ids):
-            raise ValidationError("所选知识点中包含未发布或不属于当前课程的内容")
+            raise ValidationError("所选知识点未发布或未授权给当前教学班")
         current = self.db.fetch_one(
             "SELECT COALESCE(MAX(block_order),0) block_order FROM knowledge_blocks WHERE course_id=? AND owner_id=?",
             (course_id, user_id),
@@ -268,12 +283,13 @@ class MemoryLearningSkill:
         imported: list[dict[str, Any]] = []
         skipped: list[str] = []
         with self.db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
             for row in rows:
                 content = str(row.get("markdown") or row.get("summary") or row["title"]).strip()
                 duplicate = conn.execute(
                     """SELECT block_id FROM knowledge_blocks
-                       WHERE course_id=? AND owner_id=? AND title=? AND content=? LIMIT 1""",
-                    (course_id, user_id, row["title"], content),
+                       WHERE course_id=? AND owner_id=? AND (instr(','||COALESCE(source_node_id,'')||',',','||?||',')>0 OR (source_node_id IS NULL AND title=? AND content=?)) LIMIT 1""",
+                    (course_id, user_id, row['node_id'], row["title"], content),
                 ).fetchone()
                 if duplicate:
                     skipped.append(str(row["node_id"]))
@@ -281,14 +297,14 @@ class MemoryLearningSkill:
                 next_order += 1
                 keywords = _loads(row.get("keywords_json"))
                 cursor = conn.execute(
-                    """INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content)
-                       VALUES(?,?,?,?,?,?,?)""",
+                    """INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content,source_node_id,source_version_id)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
                     (course_id, row.get("document_id"), user_id, next_order, row["title"],
-                     json.dumps(keywords, ensure_ascii=False), content),
+                     json.dumps(keywords, ensure_ascii=False), content,row['node_id'],version['version_id']),
                 )
                 imported.append({"block_id": int(cursor.lastrowid), "node_id": row["node_id"],
                                  "title": row["title"]})
-        return {"version": version, "imported": imported, "imported_count": len(imported),
+        return {"version": {k:version[k] for k in ('version_id','version_number','published_at')}, "imported": imported, "imported_count": len(imported),
                 "skipped_node_ids": skipped, "skipped_count": len(skipped)}
 
     def _owned_block(self, block_id: int, user_id: str) -> dict:
@@ -298,6 +314,8 @@ class MemoryLearningSkill:
         self._student_course(block["course_id"], user_id)
         if block["owner_id"] != user_id:
             raise PermissionDenied("只能调整自己创建的知识块")
+        if not self._block_visible(block,user_id):
+            raise PermissionDenied('当前教学班已无权访问该知识卡片')
         return block
 
     def update_block(self, block_id: int, user_id: str, title: str, keywords: list[str],
@@ -321,12 +339,12 @@ class MemoryLearningSkill:
         with self.db.connect() as conn:
             conn.execute("UPDATE knowledge_blocks SET content=?,title=?,updated_at=CURRENT_TIMESTAMP WHERE block_id=?",
                          (left, f"{block['title']}（上）", block_id))
-            conn.execute("UPDATE knowledge_blocks SET block_order=block_order+1 WHERE course_id=? AND block_order>?",
-                         (block["course_id"], block["block_order"]))
-            conn.execute("""INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content)
-                          VALUES(?,?,?,?,?,?,?)""",
+            conn.execute("UPDATE knowledge_blocks SET block_order=block_order+1 WHERE course_id=? AND owner_id=? AND block_order>?",
+                         (block["course_id"], user_id, block["block_order"]))
+            conn.execute("""INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content,source_node_id,source_version_id)
+                          VALUES(?,?,?,?,?,?,?,?,?)""",
                          (block["course_id"], block["document_id"], user_id, block["block_order"]+1,
-                          f"{block['title']}（下）", block["keywords_json"], right))
+                          f"{block['title']}（下）", block["keywords_json"], right,block.get('source_node_id'),block.get('source_version_id')))
         return self.list_blocks(block["course_id"], user_id)
 
     @staticmethod
@@ -399,25 +417,29 @@ class MemoryLearningSkill:
                     )
                     continue
                 conn.execute(
-                    """INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content)
-                       VALUES(?,?,?,?,?,?,?)""",
+                    """INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content,source_node_id,source_version_id)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
                     (block["course_id"], block["document_id"], user_id,
-                     block["block_order"] + index, part["title"], keywords_json, part["content"]),
+                     block["block_order"] + index, part["title"], keywords_json, part["content"],block.get('source_node_id'),block.get('source_version_id')),
                 )
         return self.list_blocks(block["course_id"], user_id)
 
     def merge_next(self, block_id: int, user_id: str) -> list[dict]:
         block = self._owned_block(block_id, user_id)
-        next_block = self.db.fetch_one("""SELECT * FROM knowledge_blocks WHERE course_id=? AND block_order>?
+        next_block = self.db.fetch_one("""SELECT * FROM knowledge_blocks WHERE course_id=? AND owner_id=? AND block_order>?
                                         ORDER BY block_order,block_id LIMIT 1""",
-                                       (block["course_id"], block["block_order"]))
+                                       (block["course_id"], user_id, block["block_order"]))
         if not next_block or next_block["owner_id"] != user_id:
             raise ValidationError("没有可合并的下一个知识块")
+        self._owned_block(next_block['block_id'],user_id)
+        sources = set()
+        for item in (block,next_block):
+            sources.update(filter(None,(item.get('source_node_id') or ('doc:'+item['document_id'] if item.get('document_id') else '')).split(',')))
         keywords = list(dict.fromkeys(_loads(block["keywords_json"]) + _loads(next_block["keywords_json"])))[:12]
         with self.db.connect() as conn:
-            conn.execute("UPDATE knowledge_blocks SET content=?,keywords_json=?,updated_at=CURRENT_TIMESTAMP WHERE block_id=?",
+            conn.execute("UPDATE knowledge_blocks SET content=?,keywords_json=?,source_node_id=?,updated_at=CURRENT_TIMESTAMP WHERE block_id=?",
                          (block["content"].rstrip()+"\n\n"+next_block["content"].lstrip(),
-                          json.dumps(keywords, ensure_ascii=False), block_id))
+                          json.dumps(keywords, ensure_ascii=False),','.join(sorted(sources)) or None,block_id))
             conn.execute("DELETE FROM knowledge_blocks WHERE block_id=?", (next_block["block_id"],))
         return self.list_blocks(block["course_id"], user_id)
 
@@ -469,7 +491,9 @@ class MemoryLearningSkill:
         if not any(x["type"] == "blank" for x in parts):
             raise ValidationError("AI 或当前关键词没有在知识块原文中找到可挖空内容，请补充关键词后重试")
         public_parts = [{k:v for k,v in item.items() if k != "answer"} for item in parts]
-        return {"title": block["title"], "segments": public_parts,
+        from assessment_store import AssessmentStore
+        paper_id = AssessmentStore(self.db).create(block['course_id'],user_id,'cloze',parts,{'block_id':block_id})
+        return {"paper_id":paper_id,"title": block["title"], "segments": public_parts,
                 "blank_count": sum(x["type"] == "blank" for x in parts),
                 "extra_keywords": supplied_keywords, "keywords": keywords,
                 "keyword_source": keyword_source}
@@ -492,13 +516,20 @@ class MemoryLearningSkill:
         return parts
 
     def submit_cloze(self, block_id: int, user_id: str, extra_keywords: list[str],
-                     responses: list[str]) -> dict:
+                     responses: list[str], paper_id: str | None = None) -> dict:
         block = self._owned_block(block_id, user_id)
-        content = str(block["content"] or "")
-        keywords = self._keywords_in_content(
-            content, _loads(block["keywords_json"]) + (extra_keywords or [])
-        )
-        blanks = [x for x in self._cloze_parts(content, keywords) if x["type"] == "blank"]
+        from assessment_store import AssessmentStore
+        store = AssessmentStore(self.db)
+        if not paper_id:
+            latest = self.db.fetch_one("SELECT paper_id FROM assessment_papers WHERE user_id=? AND course_id=? AND kind='cloze' AND json_extract(metadata_json,'$.block_id')=? ORDER BY rowid DESC LIMIT 1", (user_id,block['course_id'],block_id))
+            paper_id = latest['paper_id'] if latest else self.cloze(block_id,user_id,extra_keywords)['paper_id']
+        paper = store.load(paper_id,block['course_id'],user_id,'cloze')
+        if paper['metadata']['block_id'] != block_id:
+            raise ValidationError('试卷与知识卡片不匹配')
+        previous = store.previous(paper,responses)
+        if previous is not None:
+            return previous
+        blanks = [x for x in paper['items'] if x['type']=='blank']
         if not blanks:
             raise ValidationError("当前知识块没有可检测的挖空")
         corrections, missing, errors = [], [], []
@@ -515,17 +546,34 @@ class MemoryLearningSkill:
             corrections.append({"index":index+1,"response":response,"correct_answer":expected,"correct":correct})
         score = round(100 * correct_count / len(blanks), 1)
         feedback = "全部填写正确。" if score == 100 else f"共 {len(blanks)} 空，答对 {correct_count} 空；错误已加入背诵本。"
-        attempt_id = self.db.execute("""INSERT INTO memory_attempts(course_id,block_id,user_id,mode,score,missing_points_json,error_points_json,feedback)
-                                    VALUES(?,?,?,?,?,?,?,?)""",
-                                   (block["course_id"],block_id,user_id,"cloze",score,
-                                    json.dumps(missing,ensure_ascii=False),json.dumps(errors,ensure_ascii=False),feedback))
-        return {"attempt_id":attempt_id,"score":score,"correct_count":correct_count,"total":len(blanks),
-                "corrections":corrections,"missing_points":missing,"error_points":errors,"feedback":feedback}
+        def save(conn):
+            cursor = conn.execute("""INSERT INTO memory_attempts(course_id,block_id,user_id,mode,score,missing_points_json,error_points_json,feedback)
+                VALUES(?,?,?,?,?,?,?,?)""", (block["course_id"],block_id,user_id,"cloze",score,
+                json.dumps(missing,ensure_ascii=False),json.dumps(errors,ensure_ascii=False),feedback))
+            from learning_events import record
+            record(conn,'memory',cursor.lastrowid,block['course_id'],user_id,score,len(blanks),
+                   [{"knowledge_points":[block['title']],"correct":c['correct']} for c in corrections])
+            return {"attempt_id":cursor.lastrowid,"score":score,"correct_count":correct_count,"total":len(blanks),
+                    "corrections":corrections,"missing_points":missing,"error_points":errors,"feedback":feedback}
+        return store.finish(paper,responses,save)
 
-    def evaluate_recitation(self, block_id: int, user_id: str, recited_text: str) -> dict:
+    def evaluate_recitation(self, block_id: int, user_id: str, recited_text: str, request_id: str | None = None) -> dict:
         block = self._owned_block(block_id, user_id)
         if len(recited_text.strip()) < 5:
             raise ValidationError("请输入或粘贴背诵内容后再检测")
+        from assessment_store import AssessmentStore
+        if request_id is not None and (not isinstance(request_id,str) or not 1<=len(request_id)<=100):
+            raise ValidationError('提交标识无效')
+        store = AssessmentStore(self.db)
+        paper_id = store.create(block['course_id'],user_id,'recitation',[{'content':block['content']}],{'block_id':block_id},
+            paper_id=f'recitation:{user_id}:{request_id}' if request_id else None)
+        paper = store.load(paper_id,block['course_id'],user_id,'recitation')
+        if paper['metadata']['block_id'] != block_id:
+            raise ValidationError('提交标识与知识卡片不匹配')
+        previous = store.previous(paper,[recited_text])
+        if previous is not None:
+            return previous
+        block['content'] = paper['items'][0]['content']
         provider = self.campus.provider_factory()
         raw = provider.generate(
             "你是严格但友善的背诵监督员。只输出 JSON 对象，字段为 score(0-100)、"
@@ -539,12 +587,15 @@ class MemoryLearningSkill:
         missing = [str(x) for x in result.get("missing_points", [])]
         errors = [str(x) for x in result.get("error_points", [])]
         feedback = str(result.get("feedback", ""))
-        attempt_id = self.db.execute("""INSERT INTO memory_attempts(course_id,block_id,user_id,mode,score,missing_points_json,error_points_json,feedback)
-                                    VALUES(?,?,?,?,?,?,?,?)""",
-                                   (block["course_id"], block_id, user_id, "recitation", score,
-                                    json.dumps(missing, ensure_ascii=False), json.dumps(errors, ensure_ascii=False), feedback))
-        return {"attempt_id": attempt_id, "score": score, "missing_points": missing,
-                "error_points": errors, "feedback": feedback}
+        def save(conn):
+            cursor = conn.execute("""INSERT INTO memory_attempts(course_id,block_id,user_id,mode,score,missing_points_json,error_points_json,feedback)
+                VALUES(?,?,?,?,?,?,?,?)""", (block['course_id'],block_id,user_id,'recitation',score,
+                json.dumps(missing,ensure_ascii=False),json.dumps(errors,ensure_ascii=False),feedback))
+            from learning_events import record
+            record(conn,'memory',cursor.lastrowid,block['course_id'],user_id,score,1,
+                   [{'knowledge_points':[block['title']],'correct':score>=80}])
+            return {'attempt_id':cursor.lastrowid,'score':score,'missing_points':missing,'error_points':errors,'feedback':feedback}
+        return store.finish(paper,[recited_text],save)
 
     def memory_summary(self, course_id: str, user_id: str) -> dict:
         self._student_course(course_id, user_id)
@@ -586,7 +637,12 @@ class MemoryLearningSkill:
             raise ValidationError("大模型题目格式无效")
         self.db.execute("INSERT INTO generated_practice(course_id,user_id,questions_json) VALUES(?,?,?)",
                         (course_id,user_id,json.dumps(cleaned,ensure_ascii=False)))
-        return cleaned
+        return self._save_question_paper(course_id,user_id,cleaned)
+
+    def _save_question_paper(self, course_id, user_id, questions):
+        from assessment_store import AssessmentStore
+        paper_id = AssessmentStore(self.db).create(course_id,user_id,'ai',questions)
+        return [{**q,'paper_id':paper_id,'item_index':i} for i,q in enumerate(questions)]
 
     @staticmethod
     def _question_bank_text(file_name: str, data: bytes) -> str:
@@ -686,7 +742,7 @@ class MemoryLearningSkill:
             raise ValidationError("题库中没有可保存的有效题目")
         self.db.execute("INSERT INTO generated_practice(course_id,user_id,questions_json) VALUES(?,?,?)",
                         (course_id, user_id, json.dumps(questions, ensure_ascii=False)))
-        return questions
+        return self._save_question_paper(course_id,user_id,questions)
 
     @staticmethod
     def _question_bank_chunks(text: str, target_size: int = 4500, overlap: int = 320) -> list[str]:
@@ -745,6 +801,13 @@ class MemoryLearningSkill:
     def grade_questions(self, course_id: str, user_id: str, questions: list[dict],
                         responses: list[Any]) -> dict:
         self._student_course(course_id, user_id)
+        from assessment_store import AssessmentStore
+        store = AssessmentStore(self.db)
+        paper = store.load(questions[0].get('paper_id') if questions else None,course_id,user_id,'ai')
+        questions = paper['items']
+        previous = store.previous(paper,responses)
+        if previous is not None:
+            return previous
         if not questions or len(responses) != len(questions):
             raise ValidationError("题目或作答数据不完整")
         normalized_questions = []
@@ -791,13 +854,35 @@ class MemoryLearningSkill:
                     )
         score = max(0.0, min(100.0, float(result.get("score", 0))))
         result["score"] = score
-        attempt_id = self.db.execute("""INSERT INTO ai_practice_attempts(course_id,user_id,questions_json,responses_json,result_json,score)
-                                    VALUES(?,?,?,?,?,?)""",
-                                   (course_id,user_id,json.dumps(normalized_questions,ensure_ascii=False),
-                                    json.dumps(normalized_responses,ensure_ascii=False),
-                                    json.dumps(result,ensure_ascii=False),score))
-        result["attempt_id"] = attempt_id
-        return result
+        from question_bank_service import QuestionBankService
+        indexed = {int(r['index'])-1:r for r in result['results'] if isinstance(r,dict) and str(r.get('index','')).isdigit()}
+        checked = []
+        type_map = {'单选题':'single_choice','多选题':'multiple_choice','判断题':'true_false'}
+        for index, question in enumerate(normalized_questions):
+            entry = indexed.get(index)
+            kind = type_map.get(question['type'])
+            if kind and question.get('answer'):
+                correct = QuestionBankService._is_correct(kind,normalized_responses[index],question['answer'])
+                entry = {'index':index+1,'correct':correct,'correct_answer':question['answer'],
+                         'feedback':question.get('explanation') or ('回答正确' if correct else '请对照标准答案复习')}
+            if entry is None or not isinstance(entry.get('correct'),bool):
+                raise ValidationError('批改结果不完整，请重试本次提交')
+            checked.append(entry)
+        result['results'] = checked
+        score = round(100*sum(r['correct'] for r in checked)/len(checked),1)
+        result['score'] = score
+        def save(conn):
+            cursor = conn.execute("""INSERT INTO ai_practice_attempts(course_id,user_id,questions_json,responses_json,result_json,score)
+                VALUES(?,?,?,?,?,?)""", (course_id,user_id,json.dumps(normalized_questions,ensure_ascii=False),
+                json.dumps(normalized_responses,ensure_ascii=False),json.dumps(result,ensure_ascii=False),score))
+            result["attempt_id"] = cursor.lastrowid
+            from learning_events import record
+            by_index = {int(r.get('index',0))-1:r for r in result['results']}
+            record(conn,'ai_private' if any(q.get('source_file') for q in questions) else 'ai',cursor.lastrowid,course_id,user_id,score,len(questions),
+                [{"knowledge_points":[q.get('knowledge_point','')],"question":q['question'],
+                  "correct":bool(by_index.get(i,{}).get('correct'))} for i,q in enumerate(questions)])
+            return result
+        return store.finish(paper,responses,save)
 
     def student_dashboard(self, user_id: str, course_id: str | None = None) -> dict:
         courses = self.campus.list_courses(user_id, "student")
@@ -823,15 +908,21 @@ class MemoryLearningSkill:
         published_rows = self.db.fetch_all(f"""SELECT a.attempt_id,a.submission_id,a.course_id,a.version_id,
                                                a.item_id,a.response_json,a.is_correct,a.submitted_at,
                                                v.version_number,v.folder_id,f.folder_name,
-                                               q.question_type,q.stem_markdown,q.answer_markdown,
-                                               q.correct_answer_json,q.explanation_markdown,q.knowledge_points_json
+                                               vi.snapshot_json
                                         FROM question_bank_attempts a
                                         JOIN question_bank_versions v ON v.version_id=a.version_id
                                         LEFT JOIN question_bank_folders f ON f.folder_id=v.folder_id
-                                        JOIN question_bank_items q ON q.item_id=a.item_id
+                                        LEFT JOIN question_bank_version_items vi ON vi.version_id=a.version_id AND vi.item_id=a.item_id
                                         WHERE a.course_id IN ({placeholders}) AND a.student_id=?
                                         ORDER BY a.submitted_at DESC,a.attempt_id DESC""",
                                        tuple(course_ids)+(user_id,))
+        for row in published_rows:
+            snapshot = json.loads(row.pop('snapshot_json') or '{}')
+            defaults = {'question_type':'other','stem_markdown':'历史题目（缺少发布快照）',
+                        'answer_markdown':'','correct_answer_json':'null',
+                        'explanation_markdown':'','knowledge_points_json':'[]'}
+            for key, default in defaults.items():
+                row[key] = snapshot.get(key, default)
         recitation_book, point_counts = [], {}
         for row in memory:
             row["missing_points"] = _loads(row.pop("missing_points_json"))

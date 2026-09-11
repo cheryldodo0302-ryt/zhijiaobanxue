@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import{computed,onMounted,reactive,ref}from'vue';import{ElMessage,ElMessageBox}from'element-plus';import{api}from'../api';import MemberManager from'./MemberManager.vue'
+import {useTeacherWorkspace} from '../teacher-workspace'
 const loading=ref(true),courses=ref<any[]>([]),terms=ref<any[]>([]),classes=ref<any[]>([]),institution=ref<any>({school_name:'',campuses:[],majors:[]})
 const courseFilter=ref(''),termFilter=ref(''),search=ref(''),createOpen=ref(false),createType=ref<'course'|'term'|'class'>('class'),editingClassId=ref('')
+const {restoreCourse}=useTeacherWorkspace(courses,courseFilter,true)
 const courseForm=reactive({course_name:'',description:''})
 const termForm=reactive({term_name:'',academic_year:'',teaching_period:''})
 const classForm=reactive({course_id:'',term_id:'',class_name:'',class_variant:'',teaching_time_slot:'',campus:'',cohort_year:'',major:'',teaching_level:''}),memberManager=ref<any>(null)
@@ -19,7 +21,7 @@ async function createTerm(){await api.post('/teacher/terms',termForm);Object.ass
 function resetClassForm(){Object.assign(classForm,{course_id:'',term_id:'',class_name:'',class_variant:'',teaching_time_slot:'',campus:'',cohort_year:'',major:'',teaching_level:''})} async function createClass(){await api.post('/teacher/classes',classForm);resetClassForm();ElMessage.success('教学班已创建');await load();await memberManager.value?.refresh()} function startEdit(row:any){editingClassId.value=row.class_id;Object.assign(classForm,{course_id:row.course_id,term_id:row.term_id,class_name:row.class_name,class_variant:row.class_variant||'',teaching_time_slot:row.teaching_time_slot||'',campus:row.campus||'',cohort_year:row.cohort_year||'',major:row.major||'',teaching_level:row.teaching_level||''});createType.value='class';createOpen.value=true} async function updateClass(){if(!editingClassId.value)return;await api.patch('/teacher/classes/'+editingClassId.value,classForm);resetClassForm();editingClassId.value='';ElMessage.success('教学班已更新');await load();await memberManager.value?.refresh()} async function removeClass(row:any){try{await ElMessageBox.confirm('删除“'+row.class_name+'”后，成员、课表和相关教学档案关联也会被删除，且无法恢复。是否继续？','删除教学班',{type:'warning',confirmButtonText:'确认删除',cancelButtonText:'取消'});await api.delete('/teacher/classes/'+row.class_id);if(editingClassId.value===row.class_id)closeCreate();ElMessage.success('教学班已删除');await load();await memberManager.value?.refresh()}catch(e:any){if(e==='cancel'||e==='close')return;ElMessage.error(e.response?.data?.detail||'删除失败')}} function closeCreate(){createOpen.value=false;editingClassId.value=''}
 function startCreate(type:'course'|'term'|'class'){closeCreate();if(type==='class')resetClassForm();createType.value=type;createOpen.value=true}
 async function create(){try{if(editingClassId.value){await updateClass()}else if(createType.value==='course'){await createCourse()}else if(createType.value==='term'){await createTerm()}else{await createClass()}createOpen.value=false}catch(e:any){ElMessage.error(e.response?.data?.detail||(editingClassId.value?'保存失败':'创建失败'))}}
-onMounted(load)
+onMounted(async()=>{await load();restoreCourse()})
 </script>
 <template><main class="content teaching-scope" v-loading="loading">
   <header class="workbench-hero"><div><h1>课程与教学班</h1><p>按课程、学年学期、校区和专业管理教学范围与学生账号。</p></div><div class="teaching-actions"><el-button class="teaching-create-action" @click="startCreate('course')">新增课程</el-button><el-button class="teaching-create-action" @click="startCreate('term')">新增学年学期</el-button><el-button class="teaching-create-action" @click="startCreate('class')">新增教学班</el-button></div></header>

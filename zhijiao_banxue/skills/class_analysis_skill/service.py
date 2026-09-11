@@ -15,6 +15,4 @@ class ClassAnalysisSkill(ProjectSkill[ClassAnalysisInput, DictOutput]):
         super().__init__(); self.campus = campus
 
     def execute(self, context: SkillContext, payload: ClassAnalysisInput) -> DictOutput:
-        if payload.class_id:
-            raise ValidationError("当前轻量 Skill 仅支持课程级匿名聚合；教学班筛选请使用教师端教学诊断接口")
-        return DictOutput(data=self.campus.class_analysis(context.course_id, context.user_id))
+        return DictOutput(data=self.campus.class_analysis(context.course_id, context.user_id, payload.class_id))

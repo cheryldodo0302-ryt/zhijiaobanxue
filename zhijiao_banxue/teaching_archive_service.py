@@ -1033,6 +1033,9 @@ class TeachingArchiveService:
     def _route_external(self, actor: dict[str, Any], batch: dict[str, Any], row: dict[str, Any]) -> str | None:
         suffix = Path(row["stored_path"]).suffix.lower()
         if row["routing_target"] == "knowledge_center" and self.ingestion and suffix in MODERN_EXTENSIONS - {".xlsx"}:
+            existing = self.db.fetch_one('SELECT document_id FROM course_documents WHERE course_id=? AND sha256=?', (batch['course_id'],row['sha256']))
+            if existing:
+                return str(existing['document_id'])
             with Path(row["stored_path"]).open("rb") as stream:
                 result = self.ingestion.queue_document_stream(
                     actor, batch["course_id"], row["original_name"], row["mime_type"], stream,

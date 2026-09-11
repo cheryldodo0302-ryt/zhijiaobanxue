@@ -51,7 +51,7 @@ watch(() => props.modelValue, value => { if (value) load() })
 <template>
   <el-dialog v-model="open" title="AI 服务设置" width="min(620px, 94vw)" append-to-body>
     <div v-loading="loading" class="ai-settings-form">
-      <el-alert title="设置保存在当前运行这套系统的电脑中，API Key 不会返回到浏览器。" type="info" :closable="false" />
+      <el-alert title="设置仅对当前账号生效；API Key 加密保存，不会返回到浏览器。更换接口地址需重新填写 Key。" type="info" :closable="false" />
       <el-form label-position="top">
         <el-form-item label="调用方式">
           <el-segmented v-model="form.mode" :options="[

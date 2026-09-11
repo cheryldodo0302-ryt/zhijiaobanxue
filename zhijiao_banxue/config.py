@@ -3,6 +3,8 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -10,6 +12,16 @@ BASE_DIR = Path(__file__).resolve().parent
 USER_AI_ENV = BASE_DIR / "user_ai.env"
 BUNDLED_RELAY_ENV = BASE_DIR / "relay_client.env"
 SERVER_ENV = BASE_DIR / "server.env"
+_request_ai_settings: ContextVar[dict | None] = ContextVar("request_ai_settings", default=None)
+
+
+@contextmanager
+def use_request_ai_settings(settings: dict):
+    token = _request_ai_settings.set(settings)
+    try:
+        yield
+    finally:
+        _request_ai_settings.reset(token)
 
 _AI_NAMES = {
     "ZHIJIAO_AI_MODE",
@@ -49,7 +61,7 @@ _AI_NAMES = {
 }
 
 
-def _read_env_file(path: Path) -> dict[str, str]:
+def _read_env_file(path: Path, *, allowed_names: set[str] | None = None) -> dict[str, str]:
     if not path.exists():
         return {}
     try:
@@ -62,18 +74,22 @@ def _read_env_file(path: Path) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         name, value = line.split("=", 1)
-        if name.strip() in _AI_NAMES:
+        if name.strip() in (_AI_NAMES if allowed_names is None else allowed_names):
             values[name.strip()] = value.strip()
     return values
 
 
 def get_runtime_setting(name: str, default: str = "") -> str:
     """Resolve a deployment setting from the process or the uncommitted server.env."""
-    return os.environ.get(name, "").strip() or _read_env_file(SERVER_ENV).get(name, default).strip()
+    return os.environ.get(name, "").strip() or _read_env_file(
+        SERVER_ENV, allowed_names={name}
+    ).get(name, default).strip()
 
 
-def get_ai_settings() -> dict[str, str | bool]:
+def get_ai_settings(*, use_request: bool = True, mode_override: str | None = None) -> dict[str, str | bool]:
     """Resolve AI settings dynamically so the web client can switch modes without restarting."""
+    if use_request and _request_ai_settings.get() is not None:
+        return dict(_request_ai_settings.get())
     bundled_values = _read_env_file(BUNDLED_RELAY_ENV)
     server_values = _read_env_file(SERVER_ENV)
     user_values = _read_env_file(USER_AI_ENV)
@@ -103,6 +119,7 @@ def get_ai_settings() -> dict[str, str | bool]:
         else:
             mode = "mock"
 
+    mode = mode_override or mode
     if mode == "mock":
         provider = "mock"
         base_url = ""

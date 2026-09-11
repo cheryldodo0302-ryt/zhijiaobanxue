@@ -699,6 +699,9 @@ class KnowledgeGraphService:
         if not nodes:
             raise ValidationError("没有已批准的图谱节点")
         node_ids = {row["graph_node_id"] for row in nodes}
+        for row in nodes:
+            row['_class_ids'] = [s['class_id'] for s in self.db.fetch_all(
+                'SELECT class_id FROM knowledge_node_class_scopes WHERE node_id=?', (row.get('source_knowledge_node_id'),))]
         relations = [row for row in self.db.fetch_all(
             "SELECT * FROM knowledge_graph_relations WHERE graph_id=? AND review_status='approved'",
             (graph["graph_id"],),
@@ -757,4 +760,17 @@ class KnowledgeGraphService:
             node["source"] = {key: source[key] for key in ("file", "sheet", "row", "source_pages") if key in source}
             if node.get("origin") == "knowledge_center":
                 node["markdown"] = ""
+        classes = {r['class_id'] for r in self.db.fetch_all("""SELECT c.class_id FROM classes c JOIN class_memberships m USING(class_id)
+            WHERE c.course_id=? AND m.student_id=? AND c.status='active' AND m.status='active'""", (course_id,actor['user_id']))}
+        visible = []
+        for node in nodes:
+            scope = node.pop('_class_ids',None)
+            if scope is None:
+                scope = [r['class_id'] for r in self.db.fetch_all('SELECT class_id FROM knowledge_node_class_scopes WHERE node_id=?', (node.get('source_knowledge_node_id'),))]
+            if not scope or classes.intersection(scope):
+                visible.append(node)
+        nodes = visible
+        ids = {n['graph_node_id'] for n in nodes}
+        relations = [r for r in relations if r['source_node_id'] in ids and r['target_node_id'] in ids]
+        version = {**version,'node_count':len(nodes),'relation_count':len(relations)}
         return {"version": version, "nodes": nodes, "relations": relations}

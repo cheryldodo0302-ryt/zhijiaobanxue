@@ -7,14 +7,21 @@ import MarkdownIt from 'markdown-it'
 import {katex as katexPlugin} from '@mdit/plugin-katex'
 import 'katex/dist/katex.min.css'
 import{buildCompactKnowledgeTree,normalizeTreeTitle,visibleBranchIdentity}from'../knowledge-tree'
+import {useTeacherWorkspace} from '../teacher-workspace'
+import {useCoursePreferences} from '../course-preferences'
 
 const courses=ref<any[]>([]),jobs=ref<any[]>([]),trash=ref<any[]>([]),courseId=ref(''),selectedDoc=ref<any>(null),analysis=ref<any>(null),readiness=ref<any>(null)
+const {restoreCourse}=useTeacherWorkspace(courses,courseId)
 const outlineMode=ref<'document'|'course'>('document'),nodes=ref<any[]>([]),relations=ref<any[]>([]),partitions=ref<any[]>([]),teachingLevels=ref<any[]>([]),teachingScopeFilter=ref(''),selectedMaterialType=ref(''),selectedNode=ref<any>(null),treeRef=ref<any>(null)
-const rememberedTeachingScopeByCourse=ref<Record<string,string[]>>({})
+const rememberedTeachingScopeIds=ref<string[]>([])
 const lastTreeMove=ref<{scopeKey:string,placements:{node_id:string,parent_id:string|null,sort_order:number}[],createdNodeIds:string[]}|null>(null),undoingTreeMove=ref(false)
 const previewUrl=ref(''),downloadUrl=ref(''),previewKind=ref('unavailable'),previewError=ref(''),previewText=ref(''),parserStatus=ref<any>(null)
 const page=ref(1),pageInput=ref(1),file=ref<File|null>(null),folderFiles=ref<File[]>([]),uploading=ref(false),pptxHost=ref<HTMLElement|null>(null),selectedJobs=ref<any[]>([]),selectedTrash=ref<any[]>([])
 const uploadDialogVisible=ref(false),progressDialogVisible=ref(false),trashDialogVisible=ref(false)
+const completingReview=ref(false)
+const pendingUploadNames=ref<string[]>([])
+const pendingReviewIds=ref<string[]>([]),pendingPublishId=ref('')
+useCoursePreferences('knowledge-preparation',courseId,{pendingUploadNames,pendingReviewIds,pendingPublishId,teachingScopeFilter,selectedMaterialType,rememberedTeachingScopeIds})
 const pptBuffer=ref<ArrayBuffer|null>(null)
 let timer:number|undefined,parserTimer:number|undefined,pptResizeTimer:number|undefined,pptResizeObserver:ResizeObserver|undefined,pptRenderedWidth=0,pptRendering=false,pptRenderPending=false
 const apiSource=ref<'server'|'custom'|'local'>('server'),aiProvider=ref('openai_compatible'),aiBaseUrl=ref(''),aiModel=ref(''),aiApiKey=ref('')
@@ -71,7 +78,6 @@ const knowledgeNodeTypeLabel=(value:string)=>({chapter:'章',section:'节',knowl
 const relationTypeLabel=(value:string)=>({part_of:'整体—部分',prerequisite:'前置关系',progression:'后续进阶',parallel:'并列关系',related:'相关关系'} as Record<string,string>)[String(value||'').toLowerCase()]||value||'关联关系'
 const candidateChapterPath=(candidate:any)=>Array.isArray(candidate?.chapter_path)&&candidate.chapter_path.length?candidate.chapter_path.join(' / '):'未分配章节'
 const teachingLevelLabel=(item:any)=>`${item.academic_year||''} ${item.teaching_period||item.term_name||''} · ${item.class_variant||item.class_name}`.trim()
-const rememberedTeachingScopeIds=computed(()=>rememberedTeachingScopeByCourse.value[courseId.value]||[])
 const rememberedTeachingScopeLabel=computed(()=>rememberedTeachingScopeIds.value.map(id=>teachingLevels.value.find(item=>item.class_id===id)).filter(Boolean).map(teachingLevelLabel).join('、'))
 const selectedNodeIsCourseWide=computed(()=>Boolean(selectedNode.value&&selectedNode.value.node_type==='knowledge_point'&&!selectedNode.value.class_ids?.length))
 const materialTypes=[
@@ -119,15 +125,45 @@ const analysisStageLabel=(value:any)=>({queued:'排队中',running:'分析中',w
 async function loadAiSettings(){const result=(await api.get('/teacher/ai-settings')).data;aiSettings.value=result;aiProvider.value=result.provider||'openai_compatible';aiBaseUrl.value=result.base_url||'';aiModel.value=result.model||''}
 async function refreshParserStatus(){try{parserStatus.value=(await api.get('/system/parser-status')).data}catch{const previous=parserStatus.value||{};parserStatus.value={...previous,mineru:{...(previous.mineru||{}),status:'unreachable'},pix2text:{...(previous.pix2text||{}),status:'unreachable'}}}}
 function onParserVisibilityChange(){if(document.visibilityState==='visible')void refreshParserStatus()}
-function loadTeachingScopeMemory(){if(!courseId.value)return;try{const raw=localStorage.getItem(`zhijiao:teaching-scope:${courseId.value}`);rememberedTeachingScopeByCourse.value={...rememberedTeachingScopeByCourse.value,[courseId.value]:raw?JSON.parse(raw).filter((id:any)=>typeof id==='string'):[]}}catch{rememberedTeachingScopeByCourse.value={...rememberedTeachingScopeByCourse.value,[courseId.value]:[]}}}
-function rememberTeachingScope(ids:string[]){if(!courseId.value||!ids.length)return;const value=[...new Set(ids.map(String))];rememberedTeachingScopeByCourse.value={...rememberedTeachingScopeByCourse.value,[courseId.value]:value};try{localStorage.setItem(`zhijiao:teaching-scope:${courseId.value}`,JSON.stringify(value))}catch{}}
+function rememberTeachingScope(ids:string[]){if(!courseId.value)return;const allowed=new Set(teachingLevels.value.map(item=>String(item.class_id)));rememberedTeachingScopeIds.value=[...new Set(ids.map(String))].filter(id=>allowed.has(id))}
 function applyRememberedTeachingScope(){if(!selectedNode.value||selectedNode.value.node_type!=='knowledge_point'||!rememberedTeachingScopeIds.value.length)return;selectedNode.value.class_ids=[...rememberedTeachingScopeIds.value];ElMessage.info('已沿用上次教学层级，请点击“保存教学层级”确认')}
-async function load(){const[c,p]=await Promise.all([api.get('/teacher/courses'),api.get('/system/parser-status')]);courses.value=c.data;parserStatus.value=p.data;if(!courseId.value&&courses.value.length)courseId.value=courses.value[0].course_id;loadTeachingScopeMemory();await Promise.all([loadJobs(),loadAiSettings()])}
+async function load(){const[c,p]=await Promise.all([api.get('/teacher/courses'),api.get('/system/parser-status')]);courses.value=c.data;parserStatus.value=p.data;restoreCourse();await Promise.all([loadJobs(),loadAiSettings()])}
 async function loadJobs(){if(!courseId.value)return;const[j,r,t]=await Promise.all([api.get(`/teacher/courses/${courseId.value}/ingestion-jobs`),api.get(`/teacher/courses/${courseId.value}/publish-readiness`),api.get(`/teacher/courses/${courseId.value}/knowledge-trash`)]);if(!selectedJobs.value.length)jobs.value=j.data;readiness.value=r.data;if(!selectedTrash.value.length)trash.value=t.data;if(selectedDoc.value)selectedDoc.value=(selectedJobs.value.length?j.data:jobs.value).find((x:any)=>x.document_id===selectedDoc.value.document_id)||selectedDoc.value}
-async function changeCourse(){loadTeachingScopeMemory();selectedJobs.value=[];selectedTrash.value=[];selectedDoc.value=null;selectedNode.value=null;selectedCandidateId.value='';candidateDraftId.value='';candidateDraft.value='';selectedMaterialType.value='';teachingScopeFilter.value='';analysis.value=null;nodes.value=[];relations.value=[];partitions.value=[];teachingLevels.value=[];trash.value=[];candidates.value=[];previewUrl.value='';downloadUrl.value='';await loadJobs()}
+async function changeCourse(){selectedJobs.value=[];selectedTrash.value=[];selectedDoc.value=null;selectedNode.value=null;selectedCandidateId.value='';candidateDraftId.value='';candidateDraft.value='';analysis.value=null;nodes.value=[];relations.value=[];partitions.value=[];teachingLevels.value=[];trash.value=[];candidates.value=[];previewUrl.value='';downloadUrl.value='';await loadJobs()}
 function choose(x:UploadFile){file.value=x.raw||null}
-function chooseFolder(event:Event){const input=event.target as HTMLInputElement;const supported=['.pdf','.docx','.pptx','.md','.markdown','.txt'];folderFiles.value=Array.from(input.files||[]).filter(item=>supported.some(ext=>item.name.toLowerCase().endsWith(ext)));if(!folderFiles.value.length)ElMessage.warning('所选目录中没有支持的课程资料')}
-async function uploadFolder(){if(!folderFiles.value.length)return;uploading.value=true;let accepted=0,failed=0;try{for(const item of folderFiles.value){const form=new FormData();form.append('file',item);form.append('relative_path',(item as any).webkitRelativePath||item.name);form.append('analysis_mode','local');try{await api.post(`/teacher/courses/${courseId.value}/documents`,form,{timeout:0});accepted++}catch{failed++}}folderFiles.value=[];if(failed)ElMessage.warning(`已本地提交 ${accepted} 个文件，${failed} 个文件未通过安全或重复校验`);else ElMessage.success(`整包 ${accepted} 个文件已进入本地解析队列；需要 AI 的文件可再由教师明确启动`);await loadJobs();uploadDialogVisible.value=false;progressDialogVisible.value=true}finally{uploading.value=false}}
+function uploadIdentity(item:File){return ((item as any).webkitRelativePath||item.name)+':'+item.size+':'+item.lastModified}
+function chooseFolder(event:Event){
+  const input=event.target as HTMLInputElement,supported=['.pdf','.docx','.pptx','.md','.markdown','.txt']
+  const all=Array.from(input.files||[]).filter(item=>supported.some(ext=>item.name.toLowerCase().endsWith(ext)))
+  const pending=new Set(pendingUploadNames.value)
+  const matching=all.filter(item=>pending.has(uploadIdentity(item)))
+  folderFiles.value=matching.length?matching:all
+  if(matching.length)ElMessage.info('已恢复上次未完成的文件，成功文件不会重复上传')
+  if(!folderFiles.value.length)ElMessage.warning('所选目录中没有支持的课程资料')
+}
+async function uploadFolder(){
+  if(!folderFiles.value.length||uploading.value)return
+  const id=courseId.value,remaining=[...folderFiles.value]
+  pendingUploadNames.value=remaining.map(uploadIdentity)
+  uploading.value=true
+  let accepted=0
+  const failed:File[]=[]
+  try{
+    for(const item of remaining){
+      const form=new FormData();form.append('file',item);form.append('relative_path',(item as any).webkitRelativePath||item.name);form.append('analysis_mode','local')
+      try{
+        await api.post(`/teacher/courses/${id}/documents`,form,{timeout:0})
+        accepted++
+        if(courseId.value===id)pendingUploadNames.value=pendingUploadNames.value.filter(x=>x!==uploadIdentity(item))
+      }catch{failed.push(item)}
+    }
+    if(courseId.value!==id)return
+    folderFiles.value=failed
+    if(failed.length)ElMessage.warning(`已提交 ${accepted} 个，剩余 ${failed.length} 个已保留；再次点击只重试失败项。刷新后可重选同一目录继续。`)
+    else ElMessage.success(`整包 ${accepted} 个文件已进入解析队列`)
+    await loadJobs();uploadDialogVisible.value=failed.length>0;progressDialogVisible.value=true
+  }finally{uploading.value=false}
+}
 async function upload(){if(!file.value)return;if(analysisMode.value==='api'&&useOwnApi.value&&!ownAiReady.value)return ElMessage.warning(aiProvider.value==='ollama'?'请填写 Ollama Base URL 和模型':'请完整填写并保存自有 API 配置');const form=new FormData();form.append('file',file.value);form.append('analysis_mode',analysisMode.value);if(analysisMode.value==='api'&&useOwnApi.value){form.append('ai_provider',aiProvider.value);form.append('ai_base_url',aiBaseUrl.value);form.append('ai_model',aiModel.value);form.append('ai_api_key',aiApiKey.value);form.append('use_saved_ai',String(!aiApiKey.value&&hasSavedAiKey.value))}uploading.value=true;try{await api.post(`/teacher/courses/${courseId.value}/documents`,form,{timeout:0});file.value=null;aiApiKey.value='';ElMessage.success(analysisMode.value==='api'?'资料已进入解析与 API 语义分析队列':'资料已进入解析与仅本地分析队列');await loadJobs();uploadDialogVisible.value=false;progressDialogVisible.value=true}catch(e){fail(e,'上传失败')}finally{uploading.value=false}}
 function stopPptObserver(){pptResizeObserver?.disconnect();pptResizeObserver=undefined;if(pptResizeTimer)window.clearTimeout(pptResizeTimer);pptResizeTimer=undefined}
 function schedulePptRender(){if(pptResizeTimer)window.clearTimeout(pptResizeTimer);pptResizeTimer=window.setTimeout(()=>void renderPptPreview(),180)}
@@ -204,14 +240,58 @@ const resourcePublishReady=(job:any)=>Boolean(
   && (Number(job.document_block_count||0)>0
     || (job.knowledge_review_mode==='whole_document'&&job.knowledge_review_status==='approved'))
 )
-async function publish(){try{const x=(await api.post(`/teacher/courses/${courseId.value}/knowledge-versions/publish`)).data;ElMessage.success(`结构化知识库 v${x.version_number} 已发布`);await loadJobs()}catch(e){fail(e,'发布失败')}}
+async function reviewSelectedAndPublish(){
+  if(completingReview.value||(!selectedJobs.value.length&&!pendingPublishId.value))return
+  const id=courseId.value
+  const selected=pendingPublishId.value?jobs.value.filter(job=>pendingReviewIds.value.includes(job.document_id)):[...selectedJobs.value]
+  if(selected.some(job=>!wholeDocumentReviewReadyFor(job)))return ElMessage.warning('请先完成所选资料的解析与语义分析')
+  completingReview.value=true
+  let reviewed=0
+  try{
+    await ElMessageBox.confirm(`确认已预览并核对本批次资料？尚需审核 ${selected.length} 份，然后统一发布课程所有满足条件的知识。已完成的步骤会保留。`,'审核并发布课程',{type:'warning',confirmButtonText:'继续审核并发布'})
+    if(!pendingPublishId.value){pendingPublishId.value=crypto.randomUUID();pendingReviewIds.value=selected.map(job=>job.document_id)}
+    const operation=pendingPublishId.value
+    for(const job of selected){
+      if(job.knowledge_review_status!=='approved')await api.post(`/teacher/documents/${job.document_id}/knowledge-review`)
+      reviewed++
+      pendingReviewIds.value=pendingReviewIds.value.filter(value=>value!==job.document_id)
+    }
+    const version=(await api.post(`/teacher/courses/${id}/knowledge-versions/publish`,{request_id:operation})).data
+    pendingPublishId.value='';pendingReviewIds.value=[]
+    ElMessage.success(`已完成本批次审核，并发布课程知识库 v${version.version_number}`)
+  }catch(e:any){if(e!=='cancel'&&e!=='close')ElMessage.error(`本次已完成 ${reviewed} 份审核；进度已保存，可继续未完成步骤。 ${e.response?.data?.detail||''}`)}
+  finally{completingReview.value=false;await loadJobs()}
+}
+async function publish(){
+  if(completingReview.value)return
+  completingReview.value=true
+  pendingPublishId.value ||= crypto.randomUUID()
+  try{
+    const x=(await api.post(`/teacher/courses/${courseId.value}/knowledge-versions/publish`,{request_id:pendingPublishId.value})).data
+    pendingPublishId.value='';pendingReviewIds.value=[]
+    ElMessage.success(`课程全部符合条件的已审核知识已发布：v${x.version_number}`)
+    await loadJobs()
+  }catch(e){fail(e,'发布失败，可继续本次操作')}
+  finally{completingReview.value=false}
+}
 async function publishApprovedKnowledge(job:any){
   if(!resourcePublishReady(job))return ElMessage.warning('请先确认资料分类，并逐条批准知识点，或在预览区完成整本资料审核')
+  await publish()
+}
+async function withdrawPublication(){
+  if(completingReview.value)return
+  const id=courseId.value
   try{
-    const x=(await api.post(`/teacher/courses/${courseId.value}/knowledge-versions/publish`)).data
-    ElMessage.success(`已发布“${job.original_name}”对应的审核知识；课程知识库 v${x.version_number} 已更新`)
-    await loadJobs()
-  }catch(e){fail(e,'发布已批准知识失败')}
+    const versions=(await api.get(`/teacher/courses/${id}/knowledge-versions`)).data
+    const version=versions.find((row:any)=>row.status==='published')
+    if(!version)return ElMessage.info('当前没有已发布的知识版本')
+    await ElMessageBox.confirm(`确认撤回知识版本 v${version.version_number}？学生将暂时不能使用该版本的知识和原文件，已有学习记录保留。`,'撤回指定版本',{type:'warning'})
+    completingReview.value=true
+    await api.post(`/teacher/courses/${id}/knowledge-versions/${version.version_id}/withdraw`)
+    ElMessage.success(`知识版本 v${version.version_number} 已撤回，可修改草稿后重新发布`)
+    if(courseId.value===id)await loadJobs()
+  }catch(e){if(e!=='cancel'&&e!=='close')fail(e,'撤回失败')}
+  finally{completingReview.value=false}
 }
 function go(v:any=pageInput.value){page.value=pageInput.value=clampPage(v,totalPages.value,page.value);if(previewKind.value==='pptx')nextTick(()=>focusPptSlide(page.value))}
 watch(reviewMode,async()=>{if(previewKind.value==='pptx'&&pptBuffer.value){await nextTick();pptRenderedWidth=0;await renderPptPreview(true);observePptHost()}})
@@ -220,6 +300,10 @@ onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(pars
 </script>
 
 <template><main class="content knowledge-center">
+  <el-alert v-if="selectedJobs.length" type="info" :closable="false">
+    <span>已选择 {{selectedJobs.length}} 份资料。预览核对后，可一次完成审核与课程发布。</span>
+    <el-button type="success" :loading="completingReview" @click="reviewSelectedAndPublish">{{pendingPublishId?'继续上次审核发布':'审核勾选资料并发布课程'}}</el-button>
+  </el-alert>
   <div class="teacher-page-topbar workbench-hero">
     <div class="page-title"><h1>知识中心</h1><p class="muted">上传课程资料，检查系统整理结果，确认后发布给学生使用。</p></div>
     <div class="topbar-tools">
@@ -258,7 +342,7 @@ onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(pars
   <el-alert v-if="readiness&&!readiness.can_publish" class="readiness-alert" type="warning" :closable="false"><template #title>知识库尚未达到发布条件</template><span v-for="item in readiness.blockers" :key="item.code">{{item.message}}（{{item.count}}）　</span></el-alert>
   <el-card shadow="never" class="resource-toolbar-card">
     <div class="resource-toolbar">
-      <div class="resource-course-select"><span class="toolbar-label">当前课程</span><el-select v-model="courseId" @change="changeCourse"><el-option v-for="x in courses" :key="x.course_id" :label="x.course_name" :value="x.course_id"/></el-select></div>
+      <div class="resource-course-select"><span class="toolbar-label">当前课程</span><el-select v-model="courseId" :disabled="uploading||completingReview" @change="changeCourse"><el-option v-for="x in courses" :key="x.course_id" :label="x.course_name" :value="x.course_id"/></el-select></div>
       <div class="resource-toolbar-copy"><span class="toolbar-kicker">课程知识建设</span><strong>资料、解析和审核集中管理</strong><small>平时只显示两项处理状态，需要时再打开上传进度或知识点回收站。</small></div>
       <div class="resource-toolbar-actions"><el-button type="primary" @click="uploadDialogVisible=true">上传资料</el-button><el-button plain :disabled="!jobs.length" @click="progressDialogVisible=true">查看处理进度</el-button><el-button plain @click="trashDialogVisible=true">知识点回收站 <span class="toolbar-count">{{trash.length}}</span></el-button><el-button circle @click="loadJobs" aria-label="刷新"><span class="refresh-symbol">↻</span></el-button></div>
     </div>
@@ -282,9 +366,9 @@ onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(pars
     <div class="trash-dialog-actions"><el-button type="danger" plain :disabled="!selectedTrash.length" @click="deleteSelectedTrash">批量彻底删除（{{selectedTrash.length}}）</el-button><el-button @click="loadJobs">刷新</el-button></div>
     <el-empty v-if="!trash.length" description="暂无被驳回的知识点"/><el-table v-else :data="trash" @selection-change="selectedTrash=$event"><el-table-column type="selection" width="46"/><el-table-column prop="title" label="知识点" min-width="220"/><el-table-column label="类型" width="110"><template #default="s"><el-tag>{{s.row.node_type}}</el-tag></template></el-table-column><el-table-column prop="reason" label="进入原因" min-width="180"/><el-table-column prop="original_name" label="来源资料" min-width="160"><template #default="s">{{s.row.original_name||s.row.sources?.[0]?.original_name||'课程统一知识树'}}</template></el-table-column><el-table-column prop="trashed_at" label="时间" width="165"/><el-table-column label="操作" width="220"><template #default="s"><el-button link @click="previewTrash(s.row)">预览来源</el-button><el-button link type="success" @click="restoreTrash(s.row)">恢复</el-button><el-button link type="danger" @click="deleteTrash(s.row)">彻底删除</el-button></template></el-table-column></el-table>
   </el-dialog>
-  <el-card shadow="never" class="job-card"><template #header><div class="card-header"><div class="card-header-copy"><b>资料、用途与语义分析</b><div class="muted">系统按内容建议用途，教师确认后用于课程知识组织；状态标签会显示文档解析与 AI 语义分析的中文进度。</div></div><div class="header-actions"><el-button type="danger" plain :disabled="!selectedJobs.length" @click="deleteSelectedDocuments">批量删除（{{selectedJobs.length}}）</el-button><el-button type="success" :disabled="!readiness?.can_publish" @click="publish">发布已批准知识</el-button></div></div></template><el-table class="jobs-table" :data="jobs" @selection-change="selectedJobs=$event"><el-table-column type="selection" width="46"/><el-table-column prop="original_name" label="资料" min-width="190"/><el-table-column label="资料用途" min-width="160"><template #default="s"><el-select v-model="s.row.material_type" size="small"><el-option v-for="item in materialTypes" :key="item[0]" :label="item[1]" :value="item[0]"/></el-select><small class="classification-hint">{{s.row.classification_status==='confirmed'?'教师已确认':`系统建议：${materialLabel(s.row.suggested_material_type)}`}}</small></template></el-table-column><el-table-column label="分类标签" min-width="190"><template #default="s"><el-select v-model="s.row.tags" multiple filterable allow-create default-first-option size="small" placeholder="输入标签并回车"/></template></el-table-column><el-table-column label="文档解析" width="130"><template #default="s"><el-tag size="small" :type="documentStatusType(s.row)">{{documentStatusLabel(s.row)}}</el-tag></template></el-table-column><el-table-column label="AI语义分析" width="140"><template #default="s"><el-tag size="small" :type="analysisStatusType(s.row)">{{analysisStatusLabel(s.row)}}</el-tag></template></el-table-column><el-table-column label="操作" width="650" fixed="right"><template #default="s"><div class="job-row-actions"><el-button link @click="openDocument(s.row)">预览/审核</el-button><el-button link type="success" @click="saveMaterial(s.row)">确认分类</el-button><el-button link type="warning" :disabled="s.row.knowledge_review_status==='approved'||!wholeDocumentReviewReadyFor(s.row)" @click="approveWholeDocument(s.row)">整本审核无误</el-button><el-button v-if="s.row.status==='failed'||(Number(s.row.document_block_count||0)===0&&s.row.status==='review_required')" link type="warning" @click="retryParse(s.row)">重新解析</el-button><el-button v-if="String(s.row.original_name||'').toLowerCase().endsWith('.pptx')" link type="warning" :disabled="['queued','running'].includes(s.row.status)" @click="rebuildPptTitles(s.row)">重建PPT标题</el-button><el-button link type="primary" :disabled="!['ready','review_required'].includes(s.row.status)||['queued','running'].includes(s.row.analysis_status)||Number(s.row.document_block_count||0)===0" @click="analyze(s.row)">重新分析</el-button><el-button link type="success" :disabled="!resourcePublishReady(s.row)" @click="publishApprovedKnowledge(s.row)">发布已批准知识</el-button><el-button link type="danger" @click="deleteDocument(s.row)">删除</el-button></div></template></el-table-column></el-table></el-card>
+  <el-card shadow="never" class="job-card"><template #header><div class="card-header"><div class="card-header-copy"><b>资料、用途与语义分析</b><div class="muted">系统按内容建议用途，教师确认后用于课程知识组织；状态标签会显示文档解析与 AI 语义分析的中文进度。</div></div><div class="header-actions"><el-button type="danger" plain :disabled="!selectedJobs.length" @click="deleteSelectedDocuments">批量删除（{{selectedJobs.length}}）</el-button><el-button type="success" :disabled="!readiness?.can_publish" @click="publish">发布已批准知识</el-button><el-button :disabled="completingReview" @click="withdrawPublication">撤回当前发布</el-button><el-button v-if="pendingPublishId&&!selectedJobs.length" :loading="completingReview" @click="reviewSelectedAndPublish">继续上次审核发布</el-button></div></div></template><el-table class="jobs-table" :data="jobs" @selection-change="selectedJobs=$event"><el-table-column type="selection" width="46"/><el-table-column prop="original_name" label="资料" min-width="190"/><el-table-column label="资料用途" min-width="160"><template #default="s"><el-select v-model="s.row.material_type" size="small"><el-option v-for="item in materialTypes" :key="item[0]" :label="item[1]" :value="item[0]"/></el-select><small class="classification-hint">{{s.row.classification_status==='confirmed'?'教师已确认':`系统建议：${materialLabel(s.row.suggested_material_type)}`}}</small></template></el-table-column><el-table-column label="分类标签" min-width="190"><template #default="s"><el-select v-model="s.row.tags" multiple filterable allow-create default-first-option size="small" placeholder="输入标签并回车"/></template></el-table-column><el-table-column label="文档解析" width="130"><template #default="s"><el-tag size="small" :type="documentStatusType(s.row)">{{documentStatusLabel(s.row)}}</el-tag></template></el-table-column><el-table-column label="AI语义分析" width="140"><template #default="s"><el-tag size="small" :type="analysisStatusType(s.row)">{{analysisStatusLabel(s.row)}}</el-tag></template></el-table-column><el-table-column label="操作" width="650" fixed="right"><template #default="s"><div class="job-row-actions"><el-button link @click="openDocument(s.row)">预览/审核</el-button><el-button link type="success" @click="saveMaterial(s.row)">确认分类</el-button><el-button link type="warning" :disabled="s.row.knowledge_review_status==='approved'||!wholeDocumentReviewReadyFor(s.row)" @click="approveWholeDocument(s.row)">整本审核无误</el-button><el-button v-if="s.row.status==='failed'||(Number(s.row.document_block_count||0)===0&&s.row.status==='review_required')" link type="warning" @click="retryParse(s.row)">重新解析</el-button><el-button v-if="String(s.row.original_name||'').toLowerCase().endsWith('.pptx')" link type="warning" :disabled="['queued','running'].includes(s.row.status)" @click="rebuildPptTitles(s.row)">重建PPT标题</el-button><el-button link type="primary" :disabled="!['ready','review_required'].includes(s.row.status)||['queued','running'].includes(s.row.analysis_status)||Number(s.row.document_block_count||0)===0" @click="analyze(s.row)">重新分析</el-button><el-button link type="success" :disabled="!resourcePublishReady(s.row)" @click="publishApprovedKnowledge(s.row)">发布已批准知识</el-button><el-button link type="danger" @click="deleteDocument(s.row)">删除</el-button></div></template></el-table-column></el-table></el-card>
   <el-alert v-if="analysis" :type="analysis.status==='failed'?'error':analysis.warnings?.length?'warning':'info'" :closable="false"><template #title>AI语义分析：{{analysisStatusLabel(analysis)}} · 阶段 {{analysisStageLabel(analysis.current_stage)}} · {{analysis.current_batch}}/{{analysis.total_batches}} 批 · 已调用 {{analysis.api_calls}} 次</template><p class="analysis-source-note">输入来源：已落库文档内容；重新分析不会重新连接文档解析服务器。</p><p v-if="analysis.error_message">{{analysis.error_message}}</p><p v-for="warning in analysis.warnings||[]" :key="warning" class="analysis-warning">{{warning}}</p><el-tag v-if="analysis.status==='failed'&&!analysis.retryable" type="danger">额度或权限错误不会自动重试；已有调用次数包含此前成功批次</el-tag><el-button v-if="analysis.status==='failed'&&analysis.retryable" @click="analysisAction('retry')">断点重试</el-button><el-button v-if="['queued','running','retry_wait'].includes(analysis.status)" @click="analysisAction('cancel')">取消</el-button></el-alert>
-  <el-card v-if="selectedDoc" shadow="never" class="candidate-card"><template #header><div class="card-header"><div><b>知识点审核工作区</b><div class="muted">候选与文档独立目录共用同一批最小知识点和审核状态；当前知识点正文会直接载入编辑框，可在原文基础上增删改并保存，来源 block 仍用于追溯。</div></div><div class="candidate-summary"><el-tag type="warning">{{pendingCandidateCount}} 待审核</el-tag><el-tag type="success">{{approvedCandidateCount}} 已通过</el-tag><el-tag type="info">{{candidates.length}} 个最小知识点</el-tag></div></div></template><el-alert v-if="structure?.warnings?.length" type="warning" :closable="false" class="structure-warning"><span v-for="warning in structure.warnings" :key="warning.message">{{warning.message}}；</span></el-alert><div class="review-mode-bar"><span class="muted">当前审核范围</span><el-radio-group v-model="reviewMode" size="small"><el-radio-button value="candidates">知识点候选（{{pendingCandidateCount}}）</el-radio-button><el-radio-button value="outline">知识结构治理</el-radio-button></el-radio-group><span class="muted">可逐条批准后统一发布，也可整本预览无误后直接纳入发布。</span><div class="document-review-actions"><el-tag v-if="selectedDoc.knowledge_review_status==='approved'" type="success">整本资料已审核</el-tag><el-button type="primary" plain :disabled="!wholeDocumentReviewReady" @click="approveWholeDocument">整本资料审核无误</el-button></div></div></el-card>
+  <el-card v-if="selectedDoc" shadow="never" class="candidate-card"><template #header><div class="card-header"><div><b>知识点审核工作区</b><div class="muted">候选与文档独立目录共用同一批最小知识点和审核状态；当前知识点正文会直接载入编辑框，可在原文基础上增删改并保存，来源 block 仍用于追溯。</div></div><div class="candidate-summary"><el-tag type="warning">{{pendingCandidateCount}} 待审核</el-tag><el-tag type="success">{{approvedCandidateCount}} 已通过</el-tag><el-tag type="info">{{candidates.length}} 个最小知识点</el-tag></div></div></template><el-alert v-if="structure?.warnings?.length" type="warning" :closable="false" class="structure-warning"><span v-for="warning in structure.warnings" :key="warning.message">{{warning.message}}；</span></el-alert><div class="review-mode-bar"><span class="muted">当前审核范围</span><el-radio-group v-model="reviewMode" size="small"><el-radio-button value="candidates">知识点候选（{{pendingCandidateCount}}）</el-radio-button><el-radio-button value="outline">知识结构治理</el-radio-button></el-radio-group><span class="muted">可逐条批准后统一发布，也可整本预览无误后直接纳入发布。</span><div class="document-review-actions"><el-tag v-if="selectedDoc.knowledge_review_status==='approved'" type="success">整本资料已审核</el-tag><el-button type="primary" plain :disabled="!wholeDocumentReviewReady" @click="approveWholeDocument()">整本资料审核无误</el-button></div></div></el-card>
   <section v-if="selectedDoc&&reviewMode==='candidates'" ref="reviewWorkspace" class="structured-review candidate-review">
     <div class="outline-pane candidate-queue-pane">
       <div class="review-pane-heading"><b>最小知识点队列</b><el-tag size="small" type="info">{{filteredCandidates.length}}</el-tag></div>

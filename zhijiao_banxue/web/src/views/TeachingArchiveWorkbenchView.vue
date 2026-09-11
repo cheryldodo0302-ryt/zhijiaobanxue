@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import {computed,nextTick,onBeforeUnmount,onMounted,reactive,ref} from 'vue'
+import {computed,nextTick,onBeforeUnmount,onMounted,reactive,ref,toRefs} from 'vue'
 import {ElMessage,ElMessageBox} from 'element-plus'
 import {api} from '../api'
+import {useTeacherWorkspace} from '../teacher-workspace'
+import {useCoursePreferences} from '../course-preferences'
 
 type Row=Record<string,any>
 const courses=ref<Row[]>([]),terms=ref<Row[]>([]),data=ref<Row|null>(null),courseId=ref(''),loading=ref(false),tab=ref('overview'),institution=ref<Row>({school_name:'',campuses:[],majors:[]})
+const {restoreCourse}=useTeacherWorkspace(courses,courseId)
 const filters=reactive({term_id:'',campus:'',cohort_year:'',major:'',class_id:'',class_variant:'',teaching_level:'',record_type:'',status:''})
 const importOpen=ref(false),importStep=ref(0),working=ref(false),chosen=ref<File[]>([]),batch=ref<Row|null>(null)
 const uploadProgress=reactive({current:0,total:0,uploaded:0,skipped:0,failed:0,currentName:''})
@@ -13,6 +16,8 @@ const duplicateOpen=ref(false)
 const failureOpen=ref(false)
 const defaults=reactive({term_id:'',campus:'',cohort_year:'',major:'',class_variant:'',teaching_level:''})
 const defaultClassIds=ref<string[]>([])
+useCoursePreferences('archive-filters',courseId,toRefs(filters))
+useCoursePreferences('archive-import',courseId,{...toRefs(defaults),defaultClassIds})
 const detailOpen=ref(false),item=ref<Row|null>(null),previewOpen=ref(false),previewDoc=ref<Row|null>(null),previewHtml=ref(''),previewUrl=ref(''),previewError=ref(''),pptHost=ref<HTMLElement|null>(null)
 const classOpen=ref(false),editingClassId=ref(''),classForm=reactive({course_id:'',term_id:'',class_name:'',campus:'',cohort_year:'',major:'',class_variant:'',teaching_level:'',teaching_time_slot:''})
 const calendarOpen=ref(false),calendarData=ref<Row>({events:[],schedules:[]}),calendarClassId=ref(''),scheduleRows=ref<Row[]>([])
@@ -62,10 +67,10 @@ const matchedAttachmentIds=computed(()=>new Set(experimentMatrix.value.flatMap((
 const unmatchedExperimentFiles=computed(()=>[...byType('experiment_material').filter((x:Row)=>experimentNumber(x)==null||!experimentMatrix.value.some((g:Row)=>g.version_id===experimentVersionKey(x)&&g.number===experimentNumber(x))),...byType('experiment_report').filter((x:Row)=>experimentNumber(x)==null||!experimentMatrix.value.some((g:Row)=>g.version_id===experimentVersionKey(x)&&g.number===experimentNumber(x))),...attachments.value.filter((x:Row)=>!matchedAttachmentIds.value.has(x.attachment_id))])
 function fail(e:any,text:string){ElMessage.error(e?.response?.data?.detail||e?.message||text)}
 function tag(status:string){return status==='published'?'success':status==='review_required'?'warning':status==='failed'?'danger':'info'}
-async function init(){try{const result=await Promise.all([api.get('/teacher/courses'),api.get('/teacher/terms'),api.get('/teacher/institution-profile')]);courses.value=result[0].data;terms.value=result[1].data;institution.value=result[2].data;if(courses.value.length){courseId.value=courses.value[0].course_id;await load()}}catch(e:any){fail(e,'初始化失败')}}
+async function init(){try{const result=await Promise.all([api.get('/teacher/courses'),api.get('/teacher/terms'),api.get('/teacher/institution-profile')]);courses.value=result[0].data;terms.value=result[1].data;institution.value=result[2].data;restoreCourse();await load()}catch(e:any){fail(e,'初始化失败')}}
 async function load(){if(!courseId.value)return;loading.value=true;try{const[result,calendar]=await Promise.all([api.get(`/teacher/courses/${courseId.value}/teaching-archive/workbench`,{params:{...params(),_refresh:Date.now()},headers:{'Cache-Control':'no-cache'}}),api.get(`/teacher/courses/${courseId.value}/calendar`,{params:filters.term_id?{term_id:filters.term_id}:{}})]);data.value=result.data;calendarData.value=calendar.data;syncCalendarSelection()}catch(e:any){fail(e,'教学档案加载失败')}finally{loading.value=false}}
 async function reset(){Object.keys(filters).forEach(k=>(filters as Row)[k]='');await load()}
-function openImport(){Object.assign(defaults,{term_id:terms.value[0]?.term_id||'',campus:'',cohort_year:'',major:'',class_variant:'',teaching_level:''});defaultClassIds.value=[];chosen.value=[];batch.value=null;uploadFailures.value=[];Object.assign(uploadProgress,{current:0,total:0,uploaded:0,skipped:0,failed:0,currentName:''});importStep.value=0;importOpen.value=true}
+function openImport(){if(!terms.value.some((term:Row)=>term.term_id===defaults.term_id))defaults.term_id=terms.value[0]?.term_id||'';defaultClassIds.value=defaultClassIds.value.filter(id=>classes.value.some((row:Row)=>row.class_id===id));chosen.value=[];batch.value=null;uploadFailures.value=[];Object.assign(uploadProgress,{current:0,total:0,uploaded:0,skipped:0,failed:0,currentName:''});importStep.value=0;importOpen.value=true}
 function chooseFiles(e:Event){chosen.value=Array.from((e.target as HTMLInputElement).files||[]);uploadFailures.value=[];Object.assign(uploadProgress,{current:0,total:chosen.value.length,uploaded:0,skipped:chosen.value.filter(file=>file.size===0).length,failed:0,currentName:''})}
 function chooseStandaloneFiles(e:Event){openImport();chosen.value=Array.from((e.target as HTMLInputElement).files||[]);uploadProgress.total=chosen.value.length;importStep.value=1;(e.target as HTMLInputElement).value=''}
 async function upload(){if(!chosen.value.length)return ElMessage.warning('请选择一个或多个文件，或选择整个教学资料文件夹');working.value=true;uploadFailures.value=[];Object.assign(uploadProgress,{current:0,total:chosen.value.length,uploaded:0,skipped:0,failed:0,currentName:''});try{const created=(await api.post(`/teacher/courses/${courseId.value}/teaching-archive/import-batches`,{term_id:defaults.term_id||null,batch_name:`教学档案导入 ${new Date().toLocaleString()}`,defaults})).data;batch.value=created;const batchId=created.batch_id;for(const [index,file] of chosen.value.entries()){uploadProgress.current=index+1;uploadProgress.currentName=(file as any).webkitRelativePath||file.name;if(file.size===0){uploadProgress.skipped++;uploadFailures.value.push({name:uploadProgress.currentName,reason:'空文件，已跳过'});continue}const form=new FormData();form.append('file',file,file.name);form.append('relative_path',uploadProgress.currentName);try{await api.post(`/teacher/teaching-archive/import-batches/${batchId}/files`,form,{timeout:0});uploadProgress.uploaded++}catch(e:any){uploadProgress.failed++;uploadFailures.value.push({name:uploadProgress.currentName,reason:e?.response?.data?.detail||'浏览器无法读取或服务器拒绝'})}}const uploadedBatch=(await api.get(`/teacher/teaching-archive/import-batches/${batchId}`)).data;if(defaultClassIds.value.length)for(const row of uploadedBatch.files){if(!row.class_ids?.length)row.class_ids=[...defaultClassIds.value]}batch.value=uploadedBatch;if(!uploadedBatch.files.length){failureOpen.value=uploadFailures.value.length>0;return ElMessage.error('所选内容没有可提交的非空安全文件')}importStep.value=2;duplicateOpen.value=duplicateRows.value.length>0;failureOpen.value=uploadFailures.value.length>0;if(uploadProgress.failed||uploadProgress.skipped)ElMessage.warning(`已上传 ${uploadProgress.uploaded} 个；跳过 ${uploadProgress.skipped} 个空文件，失败 ${uploadProgress.failed} 个`);else ElMessage.success(`已完整上传 ${uploadProgress.uploaded} 个文件`)}catch(e:any){fail(e,'无法创建档案导入批次')}finally{working.value=false;uploadProgress.currentName=''}}
