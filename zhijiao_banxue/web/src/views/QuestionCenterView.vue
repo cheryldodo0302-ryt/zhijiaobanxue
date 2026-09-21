@@ -281,7 +281,7 @@ onMounted(loadBase)
 <template>
   <main class="content question-center" v-loading="loading">
     <div class="page-title workbench-hero">
-      <span class="eyebrow">REVIEWED QUESTION BANK</span>
+      <span class="eyebrow">题库审核与发布</span>
       <h1>习题中心</h1>
       <p class="muted">教师导入任意常见 Excel 题库并审核，学生只作答已发布版本；教材例题不会自动进入正式题库。</p>
     </div>
@@ -307,6 +307,8 @@ onMounted(loadBase)
       <div class="metric success"><span>已批准</span><strong>{{ summary.approved }}</strong></div>
       <div class="metric danger"><span>已驳回</span><strong>{{ summary.rejected }}</strong></div>
     </section>
+    <div class="question-organizer-layout">
+    <aside class="question-sidebar">
     <el-card shadow="never" class="folder-card">
       <template #header><div class="card-title"><div><h3>试卷 / 作业 / 章节练习</h3><p>每个文件夹独立导入、审核和发布；未归档题目可批量移动。</p></div></div></template>
       <div class="folder-create">
@@ -334,6 +336,9 @@ onMounted(loadBase)
                    @click="publish(folderFilter)">统一发布当前文件夹</el-button>
       </div>
     </el-card>
+    </aside>
+    <section class="question-main">
+    <el-alert title="先创建分组，再拖入题目或勾选后批量移动；审核通过后发布给学生。" type="info" :closable="false" />
     <el-card shadow="never" class="import-card">
       <template #header>
         <div class="card-title">
@@ -355,12 +360,12 @@ onMounted(loadBase)
         <el-button type="success" plain :loading="uploading" :disabled="!folderFiles.length" @click="importFolderPackage">整包本地导入（{{folderFiles.length}}）</el-button>
       </div>
       <el-collapse class="ai-settings">
-        <el-collapse-item title="智能识别与教师自有 API（可选）">
+        <el-collapse-item title="识别方式与自有接口（可选）">
           <el-alert type="info" :closable="false"
             title="本地规则先识别；只有低置信度或非标准内容才调用 API。API 失败不会丢失本地结果。" />
           <div class="ai-grid">
             <div><label>识别方式</label><el-radio-group v-model="aiMode">
-              <el-radio-button label="auto">自动：本地 + AI 补充</el-radio-button>
+              <el-radio-button label="auto">自动：本地识别与模型补充</el-radio-button>
               <el-radio-button label="local">仅本地识别</el-radio-button>
             </el-radio-group></div>
             <div><label>接口来源</label><el-switch v-model="useOwnApi" active-text="使用我自己的 API" inactive-text="使用服务器默认接口" /></div>
@@ -380,11 +385,14 @@ onMounted(loadBase)
       <el-collapse v-if="imports.length" class="import-history">
         <el-collapse-item v-for="entry in imports" :key="entry.import_id">
           <template #title>
-            <span>{{ entry.original_name }}</span>
-            <el-tag type="success">{{ entry.valid_rows }} 题有效</el-tag>
-            <el-tag v-if="entry.invalid_rows" type="warning">{{ entry.invalid_rows }} 行异常</el-tag>
-            <el-tag :type="entry.ai_used ? 'primary' : 'info'">{{ entry.ai_used ? 'AI 辅助' : '本地识别' }}</el-tag>
-            <span class="muted">{{ entry.created_at }}</span>
+            <span class="import-record">
+              <span class="import-record-identity"><strong :title="entry.original_name">{{ entry.original_name }}</strong><time>{{ entry.created_at }}</time></span>
+              <span class="import-record-summary">
+                <el-tag type="success" size="small">{{ entry.valid_rows }} 题有效</el-tag>
+                <el-tag v-if="entry.invalid_rows" type="warning" size="small">{{ entry.invalid_rows }} 行异常</el-tag>
+                <span class="import-record-method">{{ entry.ai_used ? '模型辅助' : '本地识别' }}</span>
+              </span>
+            </span>
           </template>
           <el-alert v-for="warning in entry.warnings" :key="`${warning.sheet}-${warning.row}-${warning.message}`"
                     type="warning" :closable="false" show-icon
@@ -407,7 +415,7 @@ onMounted(loadBase)
     <el-empty v-if="!filteredItems.length" description="暂无符合条件的题目，请先导入题库模板" />
     <el-card v-for="(item, index) in filteredItems" :key="item.item_id" shadow="never" class="question-card" :class="{selected:selectedItems.some(value=>value.item_id===item.item_id)}">
       <div class="question-head">
-        <span class="drag-handle" draggable="true" title="拖到上方试卷、作业或章节练习" @dragstart="startQuestionDrag(item,$event)">⠿</span>
+        <span class="drag-handle" draggable="true" title="拖到分组栏中的试卷、作业或章节练习" @dragstart="startQuestionDrag(item,$event)">⠿</span>
         <el-checkbox :model-value="selectedItems.some(value=>value.item_id===item.item_id)"
                      @change="itemSelectionChanged(item,$event)"/>
         <span class="question-index">{{ index + 1 }}</span>
@@ -423,7 +431,7 @@ onMounted(loadBase)
         </el-tag>
         <span class="muted">Excel 第 {{ item.import_row_number }} 行</span>
         <el-tag v-if="item.recognition_method" effect="plain">
-          {{ item.recognition_method === 'local' ? '本地识别' : item.recognition_method === 'ai' ? 'AI 识别' : '本地 + AI' }}
+          {{ item.recognition_method === 'local' ? '本地识别' : item.recognition_method === 'ai' ? '模型识别' : '本地与模型识别' }}
           · {{ Math.round((item.recognition_confidence || 0) * 100) }}%
         </el-tag>
       </div>
@@ -457,6 +465,8 @@ onMounted(loadBase)
         <el-button @click="save(item, 'draft')">保存草稿</el-button>
       </div>
     </el-card>
+    </section>
+    </div>
   </main>
 </template>
 
@@ -471,14 +481,27 @@ onMounted(loadBase)
 .ai-settings{margin-top:18px}.ai-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px}
 .folder-create,.folder-list,.bulk-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.folder-create .el-input{max-width:420px}.folder-create .el-select,.bulk-actions .el-select{width:220px}.folder-list{margin:14px 0}.folder-card{border-radius:16px}
 .ai-grid label{display:block;margin-bottom:6px;color:#47655e;font-size:13px;font-weight:600}.ai-grid .el-select{width:100%}
-.import-history :deep(.el-collapse-item__title){gap:10px}.question-card{border-left:4px solid #378f81}
+.import-history :deep(.el-collapse-item__header){height:auto;min-height:76px;padding:16px 4px;text-align:left;font-family:inherit;line-height:1.5;background:transparent}
+.import-history :deep(.el-collapse-item__title){flex:1;min-width:0;margin-right:14px}
+.import-record{display:flex;align-items:center;justify-content:space-between;gap:16px;width:100%;min-width:0}
+.import-record-identity{display:grid;gap:5px;min-width:0}
+.import-record-identity strong{font-size:14px;font-weight:600;color:var(--text-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.import-record-identity time{font-size:12px;font-weight:400;color:var(--text-secondary);font-variant-numeric:tabular-nums;letter-spacing:.01em}
+.import-record-summary{display:flex;align-items:center;gap:8px;flex-shrink:0;font-weight:400}
+.import-record-summary :deep(.el-tag){height:25px;padding:0 9px;font-size:12px;border-color:transparent;border-radius:6px}
+.import-record-method{margin-left:4px;color:var(--text-secondary);font-size:12px;white-space:nowrap}
+@media(max-width:1000px){.import-record{align-items:flex-start;flex-direction:column;gap:10px}.import-record-summary{flex-wrap:wrap;flex-shrink:1}.import-history :deep(.el-collapse-item__arrow){align-self:center}}.question-card{border-left:4px solid #378f81}
 .question-card label{display:block;margin:14px 0 6px;color:#47655e;font-size:13px;font-weight:600}
 .question-index{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#d9eee8;color:#23746f;font-weight:700}
 .type-select{width:130px}.options-editor{margin-top:12px;display:grid;gap:8px}.option-row{display:grid;grid-template-columns:28px 1fr;align-items:center;gap:8px}
 .answer-grid{display:grid;grid-template-columns:1.4fr .7fr .7fr;gap:12px}.question-actions{justify-content:flex-end;margin-top:16px}
 .muted{color:#687d77;font-size:13px}
-.question-center{background:#f3f7f7;min-height:100vh}.question-center :deep(.el-button--primary){--el-button-bg-color:#23746f;--el-button-border-color:#23746f;--el-button-hover-bg-color:#378f81;--el-button-hover-border-color:#378f81}.folder-card,.import-card{border-color:#dce9e5}
+.question-center{background:#f3f7f7;min-height:100vh}.folder-card,.import-card{border-color:#dce9e5}
 .organizer-head{display:flex;gap:10px;margin:15px 0 12px}.organizer-head button{display:grid;grid-template-columns:1fr auto;gap:4px 14px;min-width:160px;padding:11px 14px;border:1px solid #d4e3df;border-radius:11px;background:#fff;color:#365b55;text-align:left;cursor:pointer}.organizer-head button small{grid-column:1/-1;color:#81938f}.organizer-head button.active{border-color:#378f81;background:#eaf6f2;color:#173e49}.folder-board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:14px}.folder-column{display:grid;align-content:start;gap:8px;min-height:142px;padding:12px;border:1px solid #dbe8e5;border-radius:13px;background:#f7fbfa}.folder-column>header{display:grid;margin-bottom:2px}.folder-column>header b{color:#173e49}.folder-column>header span{font-size:12px;color:#7b8e89}.folder-drop{display:grid;grid-template-columns:1fr auto;gap:5px 10px;padding:11px;border:1px solid #dce8e5;border-radius:10px;background:#fff;color:#365b55;text-align:left;cursor:pointer;transition:.16s ease}.folder-drop small{grid-column:1/-1;color:#84948f}.folder-drop.active{border-color:#378f81;background:#edf8f5}.folder-drop.over,.organizer-head button.over{border-color:#23746f;background:#dcefe9;box-shadow:0 0 0 3px #378f8126;transform:translateY(-2px)}.empty-folder{padding:17px 8px;border:1px dashed #c8dbd6;border-radius:9px;color:#879792;text-align:center;font-size:12px}.selected-count{padding:6px 10px;border-radius:9px;background:#dcefe9;color:#173e49}.drag-handle{display:grid;place-items:center;width:26px;height:30px;border-radius:7px;color:#5e7c75;font-size:22px;cursor:grab;user-select:none}.drag-handle:active{cursor:grabbing}.question-card.selected{border-color:#378f81;background:#fbfefd;box-shadow:0 0 0 2px #378f811c}
 @media(max-width:900px){.metric-grid{grid-template-columns:repeat(2,1fr)}.answer-grid,.ai-grid{grid-template-columns:1fr}}
 @media(max-width:900px){.folder-board{grid-template-columns:1fr}.organizer-head{flex-wrap:wrap}}
+
+.question-organizer-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:18px;align-items:start}.question-sidebar{grid-column:2;grid-row:1;position:sticky;top:12px;max-height:calc(100dvh - 24px);overflow:auto;min-width:0}.question-main{grid-column:1;grid-row:1;display:grid;gap:18px;min-width:0}.question-sidebar .folder-board{grid-template-columns:1fr}.question-sidebar .organizer-head{flex-wrap:wrap}.question-sidebar .organizer-head button{min-width:0;flex:1}.question-sidebar .folder-create .el-input,.question-sidebar .folder-create .el-select,.question-sidebar .bulk-actions .el-select{width:100%;max-width:100%}
+@media(max-width:1150px){.question-organizer-layout{grid-template-columns:minmax(0,1fr)}.question-sidebar,.question-main{grid-column:1;grid-row:auto}.question-sidebar{position:static;max-height:none}.question-sidebar .folder-board{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:700px){.question-sidebar .folder-board{grid-template-columns:1fr}.question-head{gap:8px}.upload-row>*{max-width:100%}}
 </style>

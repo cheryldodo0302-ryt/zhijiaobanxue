@@ -29,7 +29,7 @@ async function load() {
     form.base_url = current.value?.mode === 'custom' ? current.value.base_url : ''
     form.model = current.value?.mode === 'custom' ? current.value.model : 'qwen-plus'
     form.api_key = ''
-  } catch (error:any) { ElMessage.error(error.response?.data?.detail || 'AI 服务设置加载失败') }
+  } catch (error:any) { ElMessage.error(error.response?.data?.detail || '学习服务设置加载失败') }
   finally { loading.value = false }
 }
 
@@ -39,9 +39,9 @@ async function save() {
     const { data } = await api.put('/runtime/ai-settings', form)
     current.value = data
     emit('changed', data)
-    ElMessage.success('AI 服务设置已保存')
+    ElMessage.success('学习服务设置已保存')
     open.value = false
-  } catch (error:any) { ElMessage.error(error.response?.data?.detail || 'AI 服务设置保存失败') }
+  } catch (error:any) { ElMessage.error(error.response?.data?.detail || '学习服务设置保存失败') }
   finally { loading.value = false }
 }
 
@@ -49,13 +49,13 @@ watch(() => props.modelValue, value => { if (value) load() })
 </script>
 
 <template>
-  <el-dialog v-model="open" title="AI 服务设置" width="min(620px, 94vw)" append-to-body>
+  <el-dialog v-model="open" title="学习服务设置" width="min(620px, 94vw)" append-to-body>
     <div v-loading="loading" class="ai-settings-form">
-      <el-alert title="设置仅对当前账号生效；API Key 加密保存，不会返回到浏览器。更换接口地址需重新填写 Key。" type="info" :closable="false" />
+      <el-alert title="设置仅对当前账号生效；接口密钥 加密保存，不会返回到浏览器。更换接口地址需重新填写 Key。" type="info" :closable="false" />
       <el-form label-position="top">
         <el-form-item label="调用方式">
           <el-segmented v-model="form.mode" :options="[
-            {label:'确定性 Mock',value:'mock'}, {label:'默认云端服务',value:'relay'}, {label:'自定义接口',value:'custom'},
+            {label:'离线演示',value:'mock'}, {label:'默认云端服务',value:'relay'}, {label:'自定义接口',value:'custom'},
           ]" block />
         </el-form-item>
         <p v-if="form.mode==='mock'" class="muted">不联网、不需要 Key；相同输入得到稳定结果，适合测试和离线使用。</p>
@@ -69,11 +69,11 @@ watch(() => props.modelValue, value => { if (value) load() })
               <el-option label="本机 Ollama" value="ollama" />
             </el-select>
           </el-form-item>
-          <el-form-item label="API Base URL">
+          <el-form-item label="接口地址">
             <el-input v-model="form.base_url" placeholder="https://example.com/v1 或 http://127.0.0.1:11434/v1" />
           </el-form-item>
           <el-form-item label="模型名称"><el-input v-model="form.model" /></el-form-item>
-          <el-form-item label="API Key">
+          <el-form-item label="接口密钥">
             <el-input v-model="form.api_key" type="password" show-password :placeholder="current?.has_api_key ? '已配置；留空表示继续使用原 Key' : 'Ollama 可留空'" autocomplete="new-password" />
           </el-form-item>
         </template>

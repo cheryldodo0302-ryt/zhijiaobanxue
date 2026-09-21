@@ -1,0 +1,64 @@
+/* One control scale for both portals and their teleported overlays.
+   Standard 36/14/20; small 28/12/18; large 40/14/22 (height/type/line).
+   Multi-line selectors, icon controls and text links retain separate geometry. */
+html:is([data-portal="teacher"], [data-portal="student"]) {
+  --el-font-family: var(--campus-font);
+  --el-font-size-base: 14px;
+  --el-component-size: 36px;
+  --el-component-size-small: 28px;
+  --el-component-size-large: 40px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.teacher-surface, .student-surface, .el-dialog, .el-drawer, .el-popover, .el-message-box) {
+  font-family: var(--campus-font);
+  font-size: 14px;
+  line-height: 1.6;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-button, .folder-picker, .file-picker, .hero-file-button):not(.api-mode-trigger):not(.is-link):not(.is-text):not(.el-button--text):not(.is-circle) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  height: auto;
+  min-height: 36px;
+  max-width: 100%;
+  padding: 7px 14px;
+  font-family: var(--campus-font);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  letter-spacing: normal;
+  vertical-align: middle;
+  white-space: nowrap;
+  border-radius: 8px;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button > span { line-height: inherit; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button.el-button--small:not(.is-link):not(.is-text):not(.is-circle) { min-height: 28px; padding: 4px 10px; font-size: 12px; line-height: 18px; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button.el-button--large:not(.is-link):not(.is-text):not(.is-circle) { min-height: 40px; padding: 8px 18px; font-size: 14px; line-height: 22px; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button:is(.is-link, .is-text, .el-button--text) { height: auto; min-height: 28px; font-size: 13px; line-height: 20px; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button.is-circle { width: 36px; height: 36px; padding: 8px; flex-shrink: 0; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button--small.is-circle { width: 28px; height: 28px; padding: 5px; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button--large.is-circle { width: 40px; height: 40px; padding: 10px; }
+
+/* File labels match buttons, including keyboard focus. Keep the native input
+   reachable instead of display:none so keyboard users can select a file. */
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.folder-picker, .file-picker, .hero-file-button) { position: relative; border: 1px solid var(--el-border-color); background: var(--surface); color: var(--text-primary); cursor: pointer; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.folder-picker, .file-picker, .hero-file-button) input[type="file"] { display: block; position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.folder-picker, .file-picker, .hero-file-button):focus-within { outline: 2px solid #5d7350; outline-offset: 3px; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.folder-picker, .file-picker, .hero-file-button):hover { background: #edf0e7; border-color: #8d9c80; }
+
+/* Flex/grid action groups use gap, not Element Plus sibling margins as well. */
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.upload-row, .upload-actions, .block-actions, .bulk-actions, .question-actions, .teaching-actions, .archive-hero-actions, .resource-toolbar-actions, .api-settings-actions, .focus-actions, .graph-tools, .header-actions) { gap: 10px; align-items: center; flex-wrap: wrap; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.upload-row, .upload-actions, .block-actions, .bulk-actions, .question-actions, .teaching-actions, .archive-hero-actions, .resource-toolbar-actions, .api-settings-actions, .focus-actions, .graph-tools, .header-actions) > .el-button { margin-left: 0; }
+html:is([data-portal="teacher"], [data-portal="student"]) .upload-row { align-items: flex-start; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-upload { vertical-align: top; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-form-item__label { line-height: 1.5; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-dialog__body, .el-drawer__body, .el-alert__description, .el-form-item__content) { line-height: 1.6; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-textarea__inner { font-size: 14px; line-height: 1.65; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-tag, .el-form-item__label, .el-input__inner, .el-select__placeholder) { font-family: var(--campus-font); }
+@media (max-width: 760px) {
+  html:is([data-portal="teacher"], [data-portal="student"]) :is(.upload-row, .upload-actions, .bulk-actions, .question-actions) > :is(.el-button, .folder-picker, .file-picker) { flex-shrink: 0; }
+  html:is([data-portal="teacher"], [data-portal="student"]) .el-dialog__footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
+  html:is([data-portal="teacher"], [data-portal="student"]) .el-dialog__footer > .el-button { margin-left: 0; }
+}

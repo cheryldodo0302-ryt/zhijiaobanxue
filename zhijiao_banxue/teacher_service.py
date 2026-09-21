@@ -266,8 +266,32 @@ class TeacherService:
         return value
 
     def replace_weekly_schedules(self, actor: dict[str, Any], class_id: str,
-                                 schedules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        self.require_class(actor, class_id)
+                                 schedules: list[dict[str, Any]],
+                                 adjustments: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        scope = self.require_class(actor, class_id)
+        changes = []
+        if adjustments is not None:
+            if len(adjustments) > 100:
+                raise ValidationError("单个教学班最多设置 100 条调课记录")
+            term = self.db.fetch_one("SELECT * FROM terms WHERE term_id=?", (scope["term_id"],))
+            seen = set()
+            for entry in adjustments:
+                try:
+                    original = date.fromisoformat(str(entry.get("original_date") or "")).isoformat()
+                    makeup = date.fromisoformat(str(entry["makeup_date"])).isoformat() if entry.get("makeup_date") else None
+                except ValueError as exc:
+                    raise ValidationError("调课日期格式无效") from exc
+                if original in seen or original == makeup:
+                    raise ValidationError("原上课日期不能重复，补课日期不能与原日期相同")
+                seen.add(original)
+                if any((term.get("starts_on") and day < term["starts_on"]) or
+                       (term.get("ends_on") and day > term["ends_on"])
+                       for day in (original, makeup) if day):
+                    raise ValidationError("调课日期必须在学期范围内")
+                reason = str(entry.get("reason") or "").strip()
+                if len(reason) > 120:
+                    raise ValidationError("调课说明不能超过 120 个字符")
+                changes.append((class_id, original, makeup, reason))
         normalized: list[dict[str, Any]] = []
         for entry in schedules:
             weekday = int(entry.get("weekday") or 0)
@@ -289,14 +313,22 @@ class TeacherService:
                 # Imported rows may intentionally omit clock times; their period label
                 # remains visible in the calendar and is enough to identify the class.
                 start_time = end_time = ""
+            location = str(entry.get("location") or "").strip()
+            if not location:
+                raise ValidationError("请填写每条课程的上课地点或线上地址")
+            if len(location) > 120:
+                raise ValidationError("上课地点不能超过 120 个字符")
             normalized.append({
                 "schedule_id": f"cws_{uuid.uuid4().hex[:16]}",
                 "weekday": weekday, "start_time": start_time, "end_time": end_time,
-                "location": str(entry.get("location") or "").strip()[:120],
+                "location": location,
                 "starts_week": starts_week, "ends_week": ends_week,
                 "details_json": json.dumps(details, ensure_ascii=False),
             })
         with self.db.connect() as conn:
+            if adjustments is not None:
+                conn.execute("DELETE FROM class_calendar_adjustments WHERE class_id=?", (class_id,))
+                conn.executemany("INSERT INTO class_calendar_adjustments(class_id,original_date,makeup_date,reason) VALUES(?,?,?,?)", changes)
             conn.execute("DELETE FROM class_weekly_schedules WHERE class_id=?", (class_id,))
             conn.executemany(
                 """INSERT INTO class_weekly_schedules(
@@ -393,8 +425,26 @@ class TeacherService:
                         "total_hours": details.get("total_hours") or "",
                         "lesson_hours": details.get("lesson_hours") or "",
                     })
+        adjustments = []
+        for class_row in classes:
+            adjustments.extend(self.db.fetch_all(
+                "SELECT * FROM class_calendar_adjustments WHERE class_id=? ORDER BY original_date",
+                (class_row["class_id"],)))
+        mapping = {(row["class_id"], row["original_date"]): row for row in adjustments}
+        adjusted, cancelled = [], []
+        for event in events:
+            change = mapping.get((event["class_id"], event["date"]))
+            if change:
+                event = {**event, "original_date": event["date"], "adjustment_reason": change["reason"]}
+                if not change["makeup_date"]:
+                    cancelled.append(event)
+                    continue
+                event["date"] = change["makeup_date"]
+                event["weekday"] = date.fromisoformat(event["date"]).isoweekday()
+            adjusted.append(event)
+        events = adjusted
         events.sort(key=lambda row: (row["date"], row["start_time"], row["class_name"]))
-        return {"course_id": course_id, "schedules": schedules, "events": events}
+        return {"course_id": course_id, "schedules": schedules, "events": events, "adjustments": adjustments, "cancelled_events": cancelled}
 
     def list_members(self, actor: dict[str, Any], class_id: str) -> list[dict[str, Any]]:
         self.require_class(actor, class_id)
@@ -441,7 +491,7 @@ class TeacherService:
 
     @staticmethod
     def _valid_student_number(value: str) -> bool:
-        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,63}", value))
+        return bool(re.fullmatch(r"[0-9]{6,20}", value))
 
     def import_members(self, actor: dict[str, Any], class_id: str,
                        rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -460,10 +510,11 @@ class TeacherService:
             name = str(raw.get("display_name") or "").strip()[:100]
             base = {"row": index, "student_number": number, "display_name": name}
             if not self._valid_student_number(number):
-                results.append({**base, "status": "invalid", "message": "学号格式无效"})
+                results.append({**base, "status": "invalid", "message": "学号必须为 6–20 位数字，请将名单学号列设为文本以保留前导零"})
                 continue
             try:
                 with self.db.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
                     found = conn.execute(
                         "SELECT * FROM users WHERE student_number=? OR username=? ORDER BY student_number IS NOT NULL DESC LIMIT 1",
                         (number, number),
@@ -473,6 +524,12 @@ class TeacherService:
                         user = dict(found)
                         if user["role"] != "student":
                             results.append({**base, "status": "conflict", "message": "该学号已被非学生账号占用"})
+                            continue
+                        if user.get("student_number") and user["student_number"] != number:
+                            results.append({**base, "status": "conflict", "message": "该登录名已绑定其他学号，请核对学生账号"})
+                            continue
+                        if name and user.get("display_name") and name != user["display_name"]:
+                            results.append({**base, "status": "conflict", "message": "该学号已绑定其他姓名，请核对名单，未创建重复账号"})
                             continue
                         user_id = user["user_id"]
                         if not user.get("student_number"):
@@ -518,7 +575,7 @@ class TeacherService:
                             (scope["course_id"], user_id),
                         )
                         status = "created" if created else "reused"
-                results.append({**base, "user_id": user_id, "status": status, "message": ""})
+                results.append({**base, "user_id": user_id, "status": status, "message": "该学生已在本班，未重复添加" if status == "already_member" else "复用已有学生账号" if status == "reused" else "已创建学生账号"})
             except Exception as exc:
                 results.append({**base, "status": "conflict", "message": str(exc)[:160]})
         summary = {key: sum(1 for item in results if item["status"] == key)

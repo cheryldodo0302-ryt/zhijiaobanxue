@@ -1,0 +1,151 @@
+/* Reference palette: forest #294b3c, moss #5d7350, amber and burnt orange.
+   Portal tokens live on html so teleported dialogs/selects retain their theme.
+   Keep the incumbent light workspace in both OS color-scheme preferences.
+   Panels: 10px; controls: 8px.
+   Navigation keeps app layer 50; Element Plus owns overlay layers. */
+.teacher-surface {
+  --surface: #fcfcf8;
+  --surface-subtle: #edf0e7;
+  --text-primary: #294b3c;
+  --text-secondary: #56634d;
+  --border-subtle: #dce1d4;
+  --radius-panel: 10px;
+  color: var(--text-primary);
+  background: #f4f5ed;
+  min-height: 100dvh;
+  scrollbar-color: #8d9c80 #edf0e7;
+}
+.teacher-surface .teacher-route { background: transparent; margin-left: 240px; min-height: 100dvh; }
+.teacher-surface .teacher-route .content { max-width: 1440px; padding: 28px 30px; background: transparent; }
+.teacher-surface .teacher-route :is(.teaching-scope, .graph-workbench, .archive) { grid-template-columns: minmax(0, 1fr); align-content: start; }
+.teacher-surface .teacher-route :is(.content > *, .scope-layout > *) { min-width: 0; }
+.teacher-surface .workbench-filters { align-items: center; }
+.teacher-surface .teacher-nav { width: 240px; padding: 28px 18px 16px; background: #fcfcf8; color: var(--text-primary); border-right: 1px solid var(--border-subtle); }
+.teacher-brand { display: flex; align-items: center; gap: 12px; padding: 0 10px 28px; color: #294b3c; text-decoration: none; font-size: 22px; font-weight: 650; }
+.teacher-brand > .el-icon { font-size: 32px; color: #294b3c; }
+.teacher-brand small { display: block; margin-top: 4px; color: var(--text-secondary); font-size: 11px; font-weight: 400; letter-spacing: .12em; }
+.teacher-surface .teacher-nav nav { display: block; flex: 1; min-height: 0; overflow-y: auto; }
+.teacher-nav-group { display: grid; gap: 4px; margin-bottom: 18px; }
+.teacher-surface .teacher-nav .nav-section { margin: 0; padding: 0 12px 6px; color: var(--text-secondary); font-size: 11px; font-weight: 400; letter-spacing: .06em; }
+.teacher-surface .teacher-nav nav a { display: flex; align-items: center; gap: 10px; padding: 12px; color: #4e604b; border-radius: 8px; font-size: 14px; white-space: nowrap; }
+.teacher-surface .teacher-nav nav a:hover { background: #edf0e7; }
+.teacher-surface .teacher-nav nav a.router-link-active { background: #294b3c; color: #fcfcf8; font-weight: 600; }
+.teacher-nav nav .el-icon { font-size: 18px; flex-shrink: 0; }
+.teacher-surface .nav-user { gap: 10px; padding: 18px 4px 0; border-top: 1px solid var(--border-subtle); color: var(--text-primary); }
+.teacher-avatar { display: grid; place-items: center; width: 34px; height: 34px; flex-shrink: 0; border-radius: 10px; background: #e4e9da; color: #294b3c; font-size: 14px; }
+.teacher-account { display: grid; gap: 4px; min-width: 0; flex: 1; font-size: 13px; }
+.teacher-account > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.teacher-account small { color: var(--text-secondary); font-size: 11px; }
+.teacher-surface .nav-user .el-button { color: #4e604b; }
+
+/* Replace the legacy gradient banners with student-style page headings. */
+.teacher-surface .teacher-route :is(.workbench-hero, .archive > .hero) { background: transparent; color: var(--text-primary); box-shadow: none; border: 0; border-bottom: 1px solid var(--border-subtle); border-radius: 0; padding: 0 0 24px; align-items: center; flex-wrap: wrap; }
+.teacher-surface .teacher-route :is(.workbench-hero, .archive > .hero) > div { min-width: 0; }
+.teacher-surface .teacher-route :is(.page-title, .workbench-hero, .hero, .dashboard-heading) h1 { color: var(--text-primary); font-size: 28px; line-height: 1.4; font-weight: 650; margin: 0 0 8px; letter-spacing: -.02em; }
+.teacher-surface .teacher-route :is(.page-title, .workbench-hero, .hero, .dashboard-heading) p { color: var(--text-secondary); font-size: 14px; line-height: 1.7; margin: 0; }
+.teacher-surface .teacher-route :is(.workbench-hero, .hero) > div > span { color: var(--text-secondary); }
+.teacher-surface .teacher-route :is(.workbench-panel, .workbench-filters, .workbench-metrics article, .archive .filters, .archive .metrics article, .archive .work > aside, .archive .main, .archive .panel) { border-color: var(--border-subtle); border-radius: 10px; background: var(--surface); box-shadow: none; }
+.teacher-surface .teacher-route :is(.workbench-metrics article.warn, .archive .metrics article.warn) { border-color: #d9bd96; background: #faf1e4; }
+.teacher-surface .teacher-route :is(.workbench-metrics, .metrics) :is(span, small), .teacher-surface .teacher-route :is(.cell-sub, .panel-title small, .course-card small, .archive .hint, .archive .pane-title small) { color: var(--text-secondary); }
+.teacher-surface .metric-grid .el-card { border: 1px solid var(--border-subtle); }
+.teacher-surface :is(.metric-grid b, .metric-grid strong, .metrics strong, .workbench-metrics strong) { font-variant-numeric: tabular-nums; }
+.teacher-surface .el-table { --el-table-header-bg-color: #edf0e7; --el-table-row-hover-bg-color: #edf0e7; --el-table-border-color: #dce1d4; --el-table-header-text-color: #4e604b; }
+.teacher-surface .el-table th.el-table__cell { font-weight: 600; }
+.teacher-surface .el-button { border-radius: 8px; white-space: nowrap; }
+.teacher-surface .el-empty__description p { color: var(--text-secondary); }
+.teacher-surface .el-tabs__nav-wrap::after { background-color: var(--border-subtle); }
+.teacher-surface .el-card__header { border-bottom-color: var(--border-subtle); }
+.teacher-surface .el-loading-mask { background-color: rgb(245 248 247 / 90%); }
+.teacher-surface .teacher-route .archive-hero-actions { justify-content: flex-start; }
+
+@media (max-width: 1100px) {
+  .teacher-surface .teacher-route .member-console { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (max-width: 1100px) and (min-width: 761px) {
+  .teacher-surface .teacher-nav { width: 212px; padding-inline: 12px; }
+  .teacher-surface .teacher-route { margin-left: 212px; }
+  .teacher-surface .teacher-route .content { padding: 24px; }
+  .teacher-surface .teacher-route .workbench-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 760px) {
+  .teacher-surface .teacher-nav { position: static; width: 100%; padding: 16px 12px 0; border-right: 0; border-bottom: 1px solid var(--border-subtle); display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px 8px; }
+  .teacher-brand { padding: 0; font-size: 19px; gap: 8px; }
+  .teacher-brand > .el-icon { font-size: 28px; }
+  .teacher-surface .teacher-nav nav { display: flex; grid-column: 1 / -1; grid-row: 2; gap: 8px; overflow-x: auto; padding-bottom: 10px; }
+  .teacher-nav-group { display: flex; gap: 4px; margin: 0; }
+  .teacher-surface .teacher-nav .nav-section { display: none; }
+  .teacher-surface .teacher-nav nav a { padding: 10px 12px; }
+  .teacher-surface .nav-user { padding: 0; margin: 0; border: 0; gap: 4px; }
+  .teacher-avatar, .teacher-account small { display: none; }
+  .teacher-account { max-width: 70px; }
+  .teacher-surface .teacher-route { margin-left: 0; }
+  .teacher-surface .teacher-route .content { padding: 24px 16px; }
+  .teacher-surface .teacher-route :is(.workbench-hero, .archive > .hero) { gap: 18px; padding-bottom: 20px; align-items: flex-start; }
+  .teacher-surface .teacher-route :is(.page-title, .workbench-hero, .hero, .dashboard-heading) h1 { font-size: 24px; }
+  .teacher-surface .dashboard .overview-totals { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+  .teacher-surface .overview-totals > .el-button { margin: 0; width: 100%; }
+  .teacher-surface .pending-panel { padding: 18px; }
+  .teacher-surface .pending-list li { flex-wrap: wrap; gap: 12px; }
+  .teacher-surface .pending-copy { flex-basis: 100%; }
+  .teacher-surface .scope-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .teacher-surface .scope-metrics article { padding: 16px; }
+  .teacher-surface .task-publish-form, .teacher-surface .teacher-route .workbench-filters { grid-template-columns: minmax(0, 1fr); }
+  .teacher-surface .portrait-page .filters > :is(.el-select, .el-input) { width: 100%; }
+  .teacher-surface .evaluation-heading { flex-wrap: wrap; gap: 12px; }
+}
+
+/* Art stays in reserved header space, never behind data or controls. */
+.teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading) {
+  position: relative;
+  min-height: 148px;
+  padding: 24px 204px 24px 24px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: #edf0e7;
+  gap: 18px;
+}
+.teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading)::after {
+  content: '';
+  position: absolute;
+  inset: 6px 10px 6px auto;
+  width: 176px;
+  background: url('./assets/autumn-forest-pattern.png') center / 210px auto no-repeat;
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
+.teacher-surface .teacher-route :is(.workbench-hero, .archive > .hero, .dashboard-heading) { display: flex; flex-wrap: wrap; }
+.teacher-surface .teacher-route .content > .page-title { display: flex; flex-direction: column; justify-content: center; gap: 0; }
+.teacher-surface .teacher-route .page-title .eyebrow { color: #56634d; }
+.teacher-surface .teacher-nav-artwork { flex-shrink: 0; width: 100%; height: 116px; margin: 8px 0 16px; }
+.teacher-surface .teacher-nav-artwork img { object-fit: contain; }
+.teacher-surface .teacher-nav nav a.router-link-active:hover { background: #203c30; }
+.teacher-surface :is(.overview-totals strong, .metric-grid strong, .metric strong, .metric.success strong) { color: #294b3c; }
+.teacher-surface :is(.metric, .scope-metrics article, .weak-point-stat) { background: #edf0e7; border-color: var(--border-subtle); }
+.teacher-surface .student-row.active { color: #294b3c; background: #e4e9da; }
+.teacher-surface .el-button:active:not(:disabled) { transform: translateY(1px); }
+@media (max-height: 820px) and (min-width: 761px) {
+  .teacher-surface .teacher-nav-artwork { display: none; }
+}
+@media (max-width: 1100px) {
+  .teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading) { padding-right: 154px; }
+  .teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading)::after { width: 126px; background-size: 160px auto; }
+}
+@media (max-width: 760px) {
+  .teacher-surface .teacher-nav-artwork { display: none; }
+  .teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading) { padding: 22px 18px; min-height: 0; }
+  .teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading)::after { display: none; }
+  .teacher-surface .teacher-brand { position: relative; padding-right: 56px; }
+  .teacher-surface .teacher-brand::after { content: ''; position: absolute; right: 0; top: 0; width: 54px; height: 48px; background: url('./assets/autumn-forest-pattern.png') center / 70px auto no-repeat; mix-blend-mode: multiply; pointer-events: none; }
+}
+
+.teacher-surface .pending-heading > span { white-space: nowrap; }
+.teacher-surface .teacher-route :is(.course-card.active, .course-card.selected) { background: #e4e9da; border-color: #5d7350; color: #294b3c; box-shadow: none; }
+.teacher-surface .teacher-route :is(.section-kicker, .member-entry-kicker) { color: #56634d; }
+
+.teacher-surface .member-console span { color: #56634d; }
+.teacher-surface .member-console b { color: #294b3c; }
+.teacher-surface .member-console small { color: #56634d; }
+.teacher-surface .graph-canvas { background: #f4f5ed; }
+.teacher-surface .graph-side :is(h2, b), .teacher-surface .graph-side > button.active { color: #294b3c; }
+.teacher-surface .graph-side > button.active { background: #e4e9da; }

@@ -8,6 +8,7 @@ from typing import Any
 
 from campus_service import CampusService, NotFound, PermissionDenied, ValidationError
 from semantic_knowledge_service import SemanticKnowledgeService
+from skills.memory.markdown_cards import split_markdown_cards, split_numbered_sections, markdown_card_title
 
 
 def _loads(value: str | None) -> Any:
@@ -294,16 +295,21 @@ class MemoryLearningSkill:
                 if duplicate:
                     skipped.append(str(row["node_id"]))
                     continue
-                next_order += 1
                 keywords = _loads(row.get("keywords_json"))
-                cursor = conn.execute(
-                    """INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content,source_node_id,source_version_id)
-                       VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (course_id, row.get("document_id"), user_id, next_order, row["title"],
-                     json.dumps(keywords, ensure_ascii=False), content,row['node_id'],version['version_id']),
-                )
-                imported.append({"block_id": int(cursor.lastrowid), "node_id": row["node_id"],
-                                 "title": row["title"]})
+                parts = split_markdown_cards(content)
+                for index, part in enumerate(parts, 1):
+                    next_order += 1
+                    title = row["title"] if len(parts) == 1 else f"{row['title']}（{index}/{len(parts)}）"
+                    if len(parts) > 1:
+                        title = markdown_card_title(part, title)
+                    cursor = conn.execute(
+                        """INSERT INTO knowledge_blocks(course_id,document_id,owner_id,block_order,title,keywords_json,content,source_node_id,source_version_id)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (course_id, row.get("document_id"), user_id, next_order, title,
+                         json.dumps(keywords, ensure_ascii=False), part,row['node_id'],version['version_id']),
+                    )
+                    imported.append({"block_id": int(cursor.lastrowid), "node_id": row["node_id"],
+                                     "title": title})
         return {"version": {k:version[k] for k in ('version_id','version_number','published_at')}, "imported": imported, "imported_count": len(imported),
                 "skipped_node_ids": skipped, "skipped_count": len(skipped)}
 
@@ -353,7 +359,7 @@ class MemoryLearningSkill:
         if not isinstance(raw_parts, list):
             raise ValidationError("AI 未返回有效的语块列表")
         parts: list[dict[str, Any]] = []
-        for index, item in enumerate(raw_parts[:12], 1):
+        for index, item in enumerate(raw_parts, 1):
             if not isinstance(item, dict):
                 continue
             content = str(item.get("content") or item.get("markdown") or "").strip()
@@ -366,7 +372,7 @@ class MemoryLearningSkill:
             clean_keywords = list(dict.fromkeys(
                 str(keyword).strip() for keyword in keywords if str(keyword).strip()
             ))[:12]
-            parts.append({"title": title, "keywords": clean_keywords, "content": content[:6000]})
+            parts.append({"title": title, "keywords": clean_keywords, "content": content})
         if len(parts) < 2:
             raise ValidationError("AI 未能将当前知识点拆成至少两个有效语块")
         return parts
@@ -377,11 +383,21 @@ class MemoryLearningSkill:
         content = str(block["content"] or "").strip()
         if len(content) < 40:
             raise ValidationError("当前知识点内容较短，不需要 AI 拆分；可直接编辑或按位置拆分")
+        numbered = split_numbered_sections(content)
+        if len(numbered) > 1:
+            return {
+                "block_id": block_id, "source_title": block["title"], "source_content": content,
+                "parts": [{"title": markdown_card_title(part, f"{block['title']}（{index}）"),
+                           "keywords": _loads(block.get('keywords_json')), "content": part}
+                          for index, part in enumerate(numbered, 1)],
+            }
         raw = self.campus.provider_factory().generate(
             "你是学习材料语块拆分专家。只输出合法 JSON 数组，不要输出 Markdown 或解释。"
             "把一个过长知识点拆成 2 到 8 个适合学生理解、记忆和练习的独立语块。"
             "每个语块字段必须是 title、keywords、content；keywords 是数组。"
             "每个语块只保留一个核心概念，尽量保留定义、条件、步骤、公式和因果关系。"
+            "优先按章节号（如6.4.3）、一级条目（如1.、2.、3.）识别知识点；"
+            "下级编号（如(1)、(2)）及其例子、解释应跟随所属上级知识点，不要把标题与正文分开。"
             "语块之间要能独立阅读；不得新增原文没有的事实，不得删除关键限定词，不要把一句话机械地从中间截断。",
             f"原知识点标题：{block['title']}\n原关键词：{', '.join(_loads(block.get('keywords_json')))}\n"
             f"原知识点内容：\n{content[:20000]}",
@@ -897,7 +913,7 @@ class MemoryLearningSkill:
                     "practice_average":0,"published_average":0,"recitation_book":[],
                     "wrong_question_book":[],"weak_points":[]}
         placeholders = ",".join("?" for _ in course_ids)
-        documents = self.db.fetch_one(f"SELECT COUNT(*) count FROM course_documents WHERE course_id IN ({placeholders})", tuple(course_ids))
+        documents = {"count": sum(len(self.campus.list_documents(cid, user_id, "student")) for cid in course_ids)}
         blocks = self.db.fetch_one(f"SELECT COUNT(*) count FROM knowledge_blocks WHERE course_id IN ({placeholders}) AND owner_id=?",
                                    tuple(course_ids)+(user_id,))
         memory = self.db.fetch_all(f"""SELECT a.*,b.title FROM memory_attempts a LEFT JOIN knowledge_blocks b USING(block_id)

@@ -229,6 +229,27 @@ npm run build
 
 当前测试重点还包括教师知识治理、题库审核/发布、解析 Worker、公式适配器、AI 配置和中转服务。建议在干净 Python 环境中执行完整后端测试；如果缺少 `pytest` 或文档解析依赖，启动脚本会提示安装缺失依赖。
 
+## 教师知识中心：审查、入库与学生发布
+
+上传文件并等待解析、语义分析完成后，按以下顺序操作：
+
+1. **审查**：在资料行进入原文与知识点对照区，核对分类、来源和正文，使用“保存审查修订”或“驳回”。保存内容修订后需再次批准。
+2. **批准到知识库**：逐个知识点、勾选目录分支，或对已核对的整份资料批准。批量资料按钮仅负责入库；部分失败会逐份报告并支持继续。此时只更新教师知识库，学生版本不变。
+3. **发布给学生**：在“课程知识发布”区统一发布本课程全部符合条件的已入库知识。后端校验发布条件、保存版本快照，并继续执行课程授权和教学层级隔离。资料行不再提供课程发布按钮。
+
+“知识库状态”反映当前资料的批准情况；“学生版本”标出哪个已发布版本包含该资料，不能把它理解为最新修订已经发布。撤回学生知识版本后，教师仍可维护知识库并重新发布。
+
+知识图谱从教师知识库同步已入库知识到图谱草稿，因此不必先发布课程知识。图谱内容与关系可以继续审查；点击“发布图谱给学生”生成独立学生图谱版本。来源被修改、撤销批准或已失效时，应先重新批准并同步，或把对应图谱节点退回审查后再发布。
+
+主要接口（均在 `/api/v1` 下）：
+
+- `GET /teacher/courses/{course_id}/knowledge-workflow`：统一返回发布条件、每份资料的入库状态和实际学生版本。
+- `POST /teacher/documents/{document_id}/approve-to-library`：整份资料批准到知识库；旧 `/knowledge-review` 保留兼容，但不发布。
+- `POST /teacher/courses/{course_id}/knowledge-library/approve`：批量入库，传 `{"ids": ["document_id"]}`；先校验全部资料所属课程，再逐份执行并返回 `approved`、`failed`。
+- `POST /teacher/courses/{course_id}/knowledge-versions/publish`：发布学生知识版本，支持 `request_id` 幂等重试。
+
+没有新增 Agent Action；现有教师能力开关和服务层权限规则继续生效。
+
 ## 数据位置
 
 - SQLite：`data/learning.db`
@@ -259,3 +280,79 @@ npm run build
 网页不再修改它，也不把其 Key 自动复制给某个账号。Ollama 可使用 `http://127.0.0.1:11434/v1` 且无需 API Key。
 
 完整部署步骤见 [CLOUD_RELAY_DEPLOYMENT.md](CLOUD_RELAY_DEPLOYMENT.md)。
+
+
+### 2026-09 图片问题修复补充
+
+- 学生材料预览：教师发布材料并开启“学生查看原文件”后，已授权学生可在课程材料中预览；引导回答的来源支持文档及页码跳转，无页码时显示章节提示。
+- 学号新录入规则为 6–20 位数字，保留前导零；同学号不同姓名作为冲突处理，不覆盖原身份。
+- 教师周课表地点必填。`PUT /api/v1/teacher/classes/{class_id}/weekly-schedules` 新增可选 `adjustments` 数组，每项为 `original_date`、可空的 `makeup_date`、`reason`。省略数组保留现有设置，空数组清除；补课日期为空代表停课。服务层校验教学班归属及学期范围，与课表在同一事务中保存。
+- 课程日历返回 `adjustments` 和 `cancelled_events`；补课事件保留教学周次，并携带 `original_date` 与 `adjustment_reason`。规则只应用一次，不链式移课。按学校校历配置，不自动推断法定假期和学校补课。
+- 新增迁移 `037_class_calendar_adjustments`，由数据库初始化正常应用。教师 Agent 默认开关保持原状。
+
+
+## 2026-09-19 剩余问题复验
+
+问答在相似度之外增加原文覆盖检查，阻断“课程术语＋无关事实”和随机输入；直接问答及引导问答共用门禁。门禁保守处理未覆盖的同义表达，提示补充资料，不宣称解决了任意模型的全部幻觉。规则位于 `skills/qa/grounding.py`，反例测试位于 `tests/test_grounding_gate.py`。
+
+学生问答/练习总次数来自统一学习事件汇总，不再用最近 20 条记录数充当总数；无成绩与实际 0 分分开显示。资料数量只统计当前学生可见文件，教师班级成员人次明确跨班重复计数。
+
+### Windows 干净 Python 环境复现
+
+已在独立 Python 3.12.4 虚拟环境安装并运行全部后端测试和端到端流程。锁定的环境见 `requirements-lock.txt`；不依赖全局 httpx。下面从项目 `zhijiao_banxue` 目录执行，验证目录使用临时位置，不覆盖运行数据：
+
+```powershell
+python -m venv .venv-verify
+.\.venv-verify\Scripts\python.exe -m pip install -r requirements-lock.txt
+.\.venv-verify\Scripts\python.exe -m pytest tests -q
+cd web
+npm ci
+npm run test
+npm run build
+cd ..
+$env:ZHIJIAO_DATA_DIR = Join-Path $env:TEMP ('zhijiao-e2e-' + [guid]::NewGuid())
+.\.venv-verify\Scripts\python.exe scripts/e2e_smoke.py
+```
+
+E2E 使用独立本地端口 18000/15173、虚构账号及离线测试模型，验证服务启动、来源、拒答、练习、权限和导出；不代表已验证外部模型服务或部署到生产站点。教师能力原有开关不变。学生画像见下节。
+
+## 教师端学生画像与班级任务
+
+教师导航“学生画像与任务”（`/student-portraits`）支持按课程、班级、学生及日期查看多维画像。默认最近 30 天，本学期使用班级所属学期的起止日期，未设置日期时需选择自定义范围。学生从“班级作业 / 考试”（`/student/tasks`）进入正式任务。
+
+教师从已发布题库选择单选、多选、判断题并设置分值、截止时间；发布时冻结试题、答案、分值和班级有效学生名单，不随题库或名单后续修改。每题默认 1 分，支持 0.01–1000 分，整份任务最多 100 题。后加入的学生不自动进入旧任务。
+
+- 首次全部题目有有效答案的正式提交确定完成先后；同一 UTC 秒提交并列。名次 = 更早完整提交的人数 + 1，前百分比 = 名次 / 发布时应完成人数。例如 40 人首位为前 2.5%。截止前为动态名次，截止后固定，迟交不参与排名。
+- 作业可多次提交，采用截止前最后一次正式提交的百分制成绩；截止时刻本身仍可提交。首次完整提交时间不会被订正覆盖。作业补交成绩单列；考试只允许一次正式提交，截止后关闭。同一请求标识和相同答案重试返回原结果。
+- 成绩按任务截止日期归入所选时段；到期完整完成率包含完整补交，按时完整提交率不含补交。答题完整率按所列任务最近一次提交累计。未提交与真实零分分开。知识点正确率只计算实际回答的题目。
+- 作业、考试独立计算百分制均分。与前一等长时段各至少 3 次已评分任务才计算分数变化，不校正试题难度，不合成为总分。
+- 自习默认为私人。学生可在开始前关联课程和班级并主动授权；只共享新关联记录的汇总。相邻有效信号间隔不超过 3 秒才计入有效采样；无摄像头、校准、断连和过期浏览器帧不计入专注分母。有效采样累计至少 60 秒才生成按有效时长加权的专注参考，附采样覆盖率，不推断态度、人格或心理状态。
+- 撤销授权、删除自习记录或任务提交变化会使旧 AI 评价失效；源数据指纹再次校验保证读取时不返回失效内容。重新授权不能恢复旧授权记录。AI 只读取去标识化计算证据，逐条引用证据编号，校验结构、引用和数值；仍为供教师复核的草案，不宣称自动验证全部自然语言结论。
+
+接口统一以 `/api/v1` 开头，所有范围校验在服务层：
+
+| 能力 | 接口 |
+| --- | --- |
+| 教师题库来源 | `GET /teacher/courses/{course_id}/classes/{class_id}/task-sources` |
+| 发布、列出任务 | `POST /teacher/courses/{course_id}/classes/{class_id}/tasks`；同路径 `GET` |
+| 学生教学班、任务 | `GET /student/task-scopes`；`GET /student/courses/{course_id}/classes/{class_id}/tasks` |
+| 正式提交 | `POST /student/tasks/{task_id}/submissions`，传 `request_id` 与按题目 ID 索引的 `responses` |
+| 自习授权 | `GET/POST /student/study-room/grants`；`DELETE /student/study-room/grants/{grant_id}` |
+| 关联自习 | `POST /student/study-room/start` 可选传 `course_id`、`class_id`；省略保持私人 |
+| 班级画像列表、单人画像 | `GET /teacher/courses/{course_id}/classes/{class_id}/portraits[/{student_id}]` |
+| AI 评价 | `POST /teacher/courses/{course_id}/classes/{class_id}/portraits/{student_id}/evaluate` |
+
+画像列表与详情必须提供带时区的 `start_at`、`end_at`，范围为左闭右开；评价接口通过 JSON 传同名字段。统一 Agent 增加 `student_portrait`、`student_portrait_evaluate`，`scope` 包含课程及班级，`input` 包含学生及时间范围。教师 API 和 Agent 继续遵守原有开关；默认不因此开放教师端。
+
+数据库初始化增量应用 `038_student_portraits`；自习库通过幂等建表增加授权记录，旧自习记录不回填授权。升级前按现有部署流程备份主库和 `study_room.db`，后端与前端同步更新。新增回归：`tests/test_student_portraits.py`、`web/src/portrait-utils.test.ts`，正式验收还需运行既有后端/前端测试及构建。真实外部模型与生产发布需要部署环境另行验证。
+
+独立画像端到端验收：`.\.venv\Scripts\python.exe scripts/e2e_student_portraits.py`。它创建临时库、虚构账号并启动独立端口，真实执行题库审核发布、正式任务提交、成绩画像和越权检查，结束后停止进程；不会修改正在运行的课程库。离线模式明确验证 AI 失败响应，不将其当成外部模型成功验收。
+
+可选 Chrome 页面验收（临时安装 Playwright，不修改项目依赖）：
+
+```powershell
+npm install --prefix "$env:TEMP/zhijiao-portrait-browser-tools" --cache "$env:TEMP/zhijiao-portrait-npm-cache" --no-save --package-lock=false playwright
+.\.venv\Scripts\python.exe scripts/e2e_student_portraits.py --browser-tools "$env:TEMP/zhijiao-portrait-browser-tools"
+```
+
+需要本机已安装 Chrome；会验证教师发布、学生作答、画像展示、自习授权、结束保存和撤权。输出目录含桌面/窄屏截图和运行日志，所有账号与任务均为验收时生成的虚构数据。

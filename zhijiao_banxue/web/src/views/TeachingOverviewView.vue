@@ -2,6 +2,7 @@
 import { nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api'
+import ExpandableList from '../components/ExpandableList.vue'
 import { useAuthStore } from '../stores/auth'
 import { useTeacherWorkspace } from '../teacher-workspace'
 import { useCoursePreferences } from '../course-preferences'
@@ -102,7 +103,7 @@ async function loadOverview() {
 }
 
 const severity = (value: string) => value === 'high' ? 'danger' : value === 'medium' ? 'warning' : 'info'
-const errorRateColor = (value: number) => value >= 60 ? '#ef4444' : value >= 30 ? '#f59e0b' : '#22c55e'
+const errorRateColor = (value: number) => value >= 60 ? '#a34f28' : value >= 30 ? '#95652f' : '#5d7350'
 onMounted(loadCourses)
 onUnmounted(() => { disposed = true; requestVersion++ })
 </script>
@@ -110,8 +111,9 @@ onUnmounted(() => { disposed = true; requestVersion++ })
 <template>
   <main class="content teaching-overview" v-loading="loading">
     <div class="page-title">
-      <span class="eyebrow">TEACHING INSIGHTS</span>
+      <span class="eyebrow">班级学情分析</span>
       <h1>教学诊断</h1>
+      <el-button @click="$router.push({path:'/student-portraits',query:{course_id:courseId,class_id:classId}})">班级学生画像与任务</el-button>
       <p class="muted">在同一课程和教学班下，查看教学概况、习题学习统计与需要改进的内容。</p>
     </div>
 
@@ -156,14 +158,14 @@ onUnmounted(() => { disposed = true; requestVersion++ })
           <el-card shadow="never">
             <template #header><b>优先处理</b></template>
             <el-empty v-if="!overview.priorities.length" description="暂无需要优先处理的问题" />
-            <el-table v-else :data="overview.priorities">
-              <el-table-column label="等级" width="90"><template #default="{ row }"><el-tag :type="severity(row.severity)">{{ row.severity }}</el-tag></template></el-table-column>
+            <ExpandableList v-else :items="overview.priorities" label="优先处理事项" :reset-key="courseId + ':' + classId"><template #default="{items:visibleItems}"><el-table :data="visibleItems">
+              <el-table-column label="等级" width="90"><template #default="{ row }"><el-tag :type="severity(row.severity)">{{ ({high:'高',medium:'中',low:'低'} as Record<string,string>)[row.severity] || '待评估' }}</el-tag></template></el-table-column>
               <el-table-column prop="title" label="现象" min-width="220" />
               <el-table-column prop="evidence_count" label="证据数" width="90" />
               <el-table-column label="操作" width="100">
                 <template #default="{ row }"><el-button link type="primary" @click="$router.push({ path: row.target, query: { course: courseId } })">处理</el-button></template>
               </el-table-column>
-            </el-table>
+            </el-table></template></ExpandableList>
           </el-card>
         </el-col>
         <el-col :xs="24" :lg="10">
@@ -172,9 +174,9 @@ onUnmounted(() => { disposed = true; requestVersion++ })
             <el-result :icon="overview.knowledge.readiness.can_publish ? 'success' : 'warning'"
                        :title="overview.knowledge.readiness.can_publish ? '可以发布' : '暂不可发布'"
                        :sub-title="`当前版本 v${overview.knowledge.readiness.publication.version_number}`" />
-            <div v-for="entry in overview.knowledge.readiness.blockers" :key="entry.code" class="diagnostic-item">
+            <ExpandableList :items="overview.knowledge.readiness.blockers" label="发布阻塞项" :limit="5" :reset-key="courseId + ':' + classId"><template #default="{items:visibleItems}"><div v-for="entry in visibleItems" :key="entry.code" class="diagnostic-item">
               {{ entry.message }} <el-tag>{{ entry.count }}</el-tag>
-            </div>
+            </div></template></ExpandableList>
           </el-card>
         </el-col>
       </el-row>
@@ -182,20 +184,20 @@ onUnmounted(() => { disposed = true; requestVersion++ })
         <el-col :xs="24" :lg="12">
           <el-card shadow="never">
             <template #header><b>综合薄弱知识点</b></template>
-            <el-table :data="overview.learning.weak_points" empty-text="暂无知识点作答记录">
+            <ExpandableList :items="overview.learning.weak_points" label="薄弱知识点" :reset-key="courseId + ':' + classId"><template #default="{items:visibleItems}"><el-table :data="visibleItems" empty-text="暂无知识点作答记录">
               <el-table-column prop="knowledge_point" label="知识点" />
               <el-table-column prop="answered" label="作答" width="75" />
               <el-table-column label="正确率" width="90"><template #default="{ row }">{{ row.accuracy }}%</template></el-table-column>
-            </el-table>
+            </el-table></template></ExpandableList>
           </el-card>
         </el-col>
         <el-col :xs="24" :lg="12">
           <el-card shadow="never">
             <template #header><b>资料未覆盖问题</b></template>
-            <el-table :data="overview.learning.uncovered_questions" empty-text="暂无未覆盖问题">
+            <ExpandableList :items="overview.learning.uncovered_questions" label="未覆盖问题" :reset-key="courseId + ':' + classId"><template #default="{items:visibleItems}"><el-table :data="visibleItems" empty-text="暂无未覆盖问题">
               <el-table-column prop="question" label="问题" />
               <el-table-column prop="count" label="次数" width="75" />
-            </el-table>
+            </el-table></template></ExpandableList>
           </el-card>
         </el-col>
       </el-row>
@@ -221,16 +223,16 @@ onUnmounted(() => { disposed = true; requestVersion++ })
         <el-card shadow="never" class="stats-card">
           <template #header><h3>习题薄弱知识点</h3></template>
           <el-empty v-if="!statistics.weak_points?.length" description="当前题库还没有可分析的知识点作答数据" :image-size="48" />
-          <div v-else class="weak-point-grid">
-            <div v-for="point in statistics.weak_points" :key="point.point" class="weak-point-stat">
+          <div v-else>
+            <ExpandableList :items="statistics.weak_points" label="错误知识点" :limit="4" :reset-key="courseId + ':' + classId"><template #default="{items:visibleItems}"><div class="weak-point-grid"><div v-for="point in visibleItems" :key="point.point" class="weak-point-stat">
               <div><b>{{ point.point }}</b><span>{{ point.wrong_count }} / {{ point.attempts }} 次作答答错</span></div>
               <el-progress :percentage="point.error_rate" :color="errorRateColor(point.error_rate)" />
-            </div>
+            </div></div></template></ExpandableList>
           </div>
         </el-card>
         <el-card shadow="never" class="stats-card">
           <template #header><h3>高错误率题目排行榜</h3></template>
-          <el-table :data="statistics.ranking" stripe empty-text="当前题库暂无题目">
+          <ExpandableList :items="statistics.ranking" label="题目排行" :reset-key="courseId + ':' + classId"><template #default="{items:visibleItems}"><el-table :data="visibleItems" stripe empty-text="当前题库暂无题目">
             <el-table-column label="排名" width="72"><template #default="{ row }">{{ row.rank ?? '—' }}</template></el-table-column>
             <el-table-column prop="stem_markdown" label="题目" min-width="300" show-overflow-tooltip />
             <el-table-column prop="attempts" label="作答人数" width="100" />
@@ -241,10 +243,10 @@ onUnmounted(() => { disposed = true; requestVersion++ })
             <el-table-column label="错误率" width="180">
               <template #default="{ row }">
                 <el-progress v-if="row.attempts" :percentage="row.error_rate" :color="errorRateColor(row.error_rate)" />
-                <span v-else class="muted">尚未作答</span>
+                <span class="muted">尚未作答</span>
               </template>
             </el-table-column>
-          </el-table>
+          </el-table></template></ExpandableList>
         </el-card>
         <el-alert type="info" :closable="false" title="教师端仅展示匿名汇总；个人答案和错题由学生在自己的学习画像中查看。" />
       </template>
@@ -267,8 +269,8 @@ onUnmounted(() => { disposed = true; requestVersion++ })
 .question-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
 .metric { padding: 18px; background: #f2faf8; border: 1px solid #dce9e5; border-radius: 14px; }
 .metric span { display: block; color: #687d77; font-size: 13px; }
-.metric strong { display: block; margin-top: 8px; font-size: 30px; color: #173e49; }
-.metric.success strong { color: #23746f; }
+.metric strong { display: block; margin-top: 8px; font-size: 30px; color: #294b3c; }
+.metric.success strong { color: #294b3c; }
 .weak-point-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .weak-point-stat { padding: 12px 14px; border: 1px solid #e3ece8; border-radius: 12px; background: linear-gradient(135deg, #fff, #f7fbfa); }
 .weak-point-stat > div { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: #294a42; flex-wrap: wrap; }

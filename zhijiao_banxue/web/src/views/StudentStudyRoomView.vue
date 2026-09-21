@@ -9,6 +9,19 @@ const auth = useAuthStore()
 const loading = ref(false)
 const status = ref<any>({ status: '等待开始', learning: false, score: 0, focus: 0, study_time: 0 })
 const records = ref<any[]>([])
+const sharingScopes = ref<any[]>([]), sharingGrants = ref<any[]>([]), sharingClass = ref(''), sharingEnabled = ref(false)
+const sharingBusy = ref(false)
+async function loadSharing() {
+  try {
+    const [scopes, grants] = await Promise.all([api.get('/student/task-scopes'), api.get('/student/study-room/grants')])
+    sharingScopes.value = scopes.data; sharingGrants.value = grants.data
+  } catch { ElMessage.error('自习授权加载失败；默认不共享') }
+}
+async function revokeSharing(id: string) {
+  sharingBusy.value = true
+  try { await api.delete(`/student/study-room/grants/${id}`); sharingEnabled.value = false; await loadSharing(); ElMessage.success('已撤销授权，相关教师评价已失效') }
+  catch { ElMessage.error('撤销失败，请重试') } finally { sharingBusy.value = false }
+}
 const statistics = ref<any>({ total_sessions: 0, total_study_time: 0, average_score: 0, average_focus: 0, best_score: 0 })
 const videoRef = ref<HTMLVideoElement | null>(null)
 const cameraReady = ref(false)
@@ -19,6 +32,8 @@ const aiStatus = ref('等待开始')
 let browserStream: MediaStream | null = null
 let analyzer: BrowserStudyAnalyzer | null = null
 let latestAiResult: StudyAiResult | null = null
+let latestAiAt = 0
+let latestVideoTime = -1
 let poller: number | undefined
 let telemetryTimer: number | undefined
 let telemetryPromise: Promise<void> | null = null
@@ -58,7 +73,8 @@ async function sendTelemetry(force = false) {
   if (!status.value.learning) return
   telemetryPromise = (async () => {
     try {
-      const payload = latestAiResult
+      const freshCamera = browserStream?.getVideoTracks().some(track => track.readyState === 'live' && track.enabled && !track.muted)
+      const payload = latestAiResult && cameraReady.value && freshCamera && Date.now() - latestAiAt <= 3000
         ? {
             face_ok: latestAiResult.face_ok,
             head_ok: latestAiResult.head_ok,
@@ -76,7 +92,7 @@ async function sendTelemetry(force = false) {
       status.value = data
       if (data.status) aiStatus.value = data.status
     } catch (error: any) {
-      if (force) ElMessage.error(error.response?.data?.detail || 'AI 自习状态同步失败')
+      if (force) ElMessage.error(error.response?.data?.detail || '自习状态同步失败')
     }
   })()
   try { await telemetryPromise } finally { telemetryPromise = null }
@@ -110,28 +126,32 @@ async function startLocalAi() {
   if (!videoRef.value) return
   aiLoading.value = true
   aiReady.value = false
-  cameraMessage.value = '正在加载本地 AI 模型，摄像头画面不会上传服务器。'
+  cameraMessage.value = '正在加载本地识别服务，摄像头画面不会上传服务器。'
   analyzer = analyzer || new BrowserStudyAnalyzer()
   try {
     await analyzer.load()
     analyzer.start(videoRef.value, result => {
       latestAiResult = result
+      if (videoRef.value && videoRef.value.currentTime !== latestVideoTime) {
+        latestVideoTime = videoRef.value.currentTime
+        latestAiAt = Date.now()
+      }
       aiStatus.value = result.calibrating ? '校准中' : (status.value.status || '检测中')
       cameraMessage.value = result.calibrating
         ? '请正对摄像头保持 3 秒，系统正在校准你的坐姿。'
-        : '本地 AI 正在识别；服务器只接收脱敏统计信号。'
+        : '正在本机识别；服务器只接收脱敏统计信号。'
     }, () => {
       if (!aiReady.value) return
       aiReady.value = false
-      cameraMessage.value = '本地 AI 识别暂时不可用，已切换为仅计时。'
+      cameraMessage.value = '本地 模型识别暂时不可用，已切换为仅计时。'
       latestAiResult = null
     })
     aiReady.value = true
-    cameraMessage.value = '本地 AI 已就绪，请正对摄像头完成 3 秒姿态校准。'
+    cameraMessage.value = '本地识别已就绪，请正对摄像头完成 3 秒姿态校准。'
   } catch {
     aiReady.value = false
     latestAiResult = null
-    cameraMessage.value = '本地 AI 模型加载失败，已切换为仅计时；摄像头画面仍不会上传。'
+    cameraMessage.value = '本地识别服务加载失败，已切换为仅计时；摄像头画面仍不会上传。'
   } finally {
     aiLoading.value = false
   }
@@ -145,13 +165,23 @@ function startPolling() {
 async function startStudy() {
   loading.value = true
   try {
-    const { data } = await api.post('/student/study-room/start')
+    let sharing = {}
+    if (sharingEnabled.value) {
+      const scope = sharingScopes.value.find(s => s.class_id === sharingClass.value)
+      if (!scope) { ElMessage.warning('请选择要共享的课程与班级'); return }
+      sharing = { course_id: scope.course_id, class_id: scope.class_id }
+      await api.post('/student/study-room/grants', sharing)
+      await loadSharing()
+    }
+    const { data } = await api.post('/student/study-room/start', sharing)
     status.value = data
     latestAiResult = null
+    latestAiAt = 0
+    latestVideoTime = -1
     try {
       browserStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
       cameraReady.value = true
-      cameraMessage.value = '摄像头已开启，正在启动本地 AI。'
+      cameraMessage.value = '摄像头已开启，正在启动本地识别。'
       await nextTick()
       if (videoRef.value) videoRef.value.srcObject = browserStream
       await startLocalAi()
@@ -164,7 +194,7 @@ async function startStudy() {
       startTelemetry()
     }
     startPolling()
-    ElMessage.success(cameraReady.value ? '自习已开始，本地 AI 识别已开启' : '自习计时已开始')
+    ElMessage.success(cameraReady.value ? '自习已开始，本地 模型识别已开启' : '自习计时已开始')
   } catch (error: any) {
     ElMessage.error(error.response?.data?.detail || '无法开始自习')
   } finally { loading.value = false }
@@ -193,7 +223,7 @@ async function clearHistory() {
 }
 
 async function logout() { await auth.logout(); location.href = '/login' }
-onMounted(() => { loadData(); startPolling() })
+onMounted(() => { loadData(); loadSharing(); startPolling() })
 onUnmounted(() => {
   if (poller) window.clearInterval(poller)
   stopStudyCamera()
@@ -203,10 +233,19 @@ onUnmounted(() => {
 
 <template>
   <main class="content student-study-room" :aria-busy="loading">
+    <el-card shadow="never">
+      <h3>自习数据共享（可选）</h3>
+      <p v-if="isLearning">当前会话：{{status.sharing_grant_id && sharingGrants.some(g=>g.grant_id===status.sharing_grant_id) ? '已关联课程并授权共享' : '仅自己可见'}}</p>
+      <p class="muted">默认仅自己可见。主动授权后，任课教师可查看关联课程的新自习汇总；不会共享历史私人记录或摄像头画面。</p>
+      <el-checkbox v-model="sharingEnabled" :disabled="isLearning || loading">本次关联课程，并授权任课教师查看汇总</el-checkbox>
+      <el-select v-if="sharingEnabled" v-model="sharingClass" placeholder="课程与教学班" :disabled="isLearning || loading"><el-option v-for="s in sharingScopes" :key="s.class_id" :value="s.class_id" :label="`${s.course_name} · ${s.class_name}`"/></el-select>
+      <p v-for="g in sharingGrants" :key="g.grant_id">已授权：{{sharingScopes.find(s=>s.class_id===g.class_id)?.class_name || '历史教学班'}} <el-button text type="danger" :loading="sharingBusy" @click="revokeSharing(g.grant_id)">撤销授权</el-button></p>
+      <small class="muted">撤销后教师不能再查看该授权的数据；重新授权不恢复旧记录。有效采样累计不足 60 秒时不生成专注参考值，未开启摄像头或采样不足不会计为低专注。</small>
+    </el-card>
     <header class="student-header">
       <div class="page-title">
-        <h1>AI 自习室</h1>
-        <p class="muted">本地 AI 识别人脸、姿态、眼睛和手部状态；服务器只保存脱敏统计结果。</p>
+        <h1>自习室</h1>
+        <p class="muted">本地 模型识别人脸、姿态、眼睛和手部状态；服务器只保存脱敏统计结果。</p>
       </div>
       <div class="student-account">
         <el-button plain @click="$router.push('/student/courses')">返回课程</el-button>
@@ -230,7 +269,7 @@ onUnmounted(() => {
       <el-card shadow="never" class="study-camera-card">
         <template #header><div class="card-heading"><b>实时状态</b><el-tag :type="isLearning ? 'success' : 'info'">{{ status.status || aiStatus || '等待开始' }}</el-tag></div></template>
         <div v-show="cameraReady" class="study-video-wrap"><video ref="videoRef" autoplay muted playsinline aria-label="本地摄像头预览" /></div>
-        <div v-if="!cameraReady" class="study-video-placeholder"><span class="study-video-icon">◉</span><b>{{ aiLoading ? '正在加载本地 AI 模型' : '本地摄像头未开启' }}</b><p class="muted">开始自习时浏览器会请求权限；拒绝授权会切换为仅计时。</p></div>
+        <div v-if="!cameraReady" class="study-video-placeholder"><span class="study-video-icon">◉</span><b>{{ aiLoading ? '正在加载本地识别服务' : '本地摄像头未开启' }}</b><p class="muted">开始自习时浏览器会请求权限；拒绝授权会切换为仅计时。</p></div>
         <div class="study-metrics">
           <div><span>实时分</span><strong :class="scoreClass">{{ Number(status.score || 0).toFixed(1) }}</strong></div>
           <div><span>专注度</span><strong>{{ Number(status.focus || 0).toFixed(1) }}%</strong></div>

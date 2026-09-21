@@ -58,6 +58,10 @@ class AuthService:
             raise ValidationError("用户角色不合法")
         if len(password) < 10:
             raise ValidationError("密码至少需要 10 个字符")
+        if student_number is not None:
+            student_number = str(student_number).strip()
+            if role != "student" or not student_number.isascii() or not student_number.isdigit() or not 6 <= len(student_number) <= 20:
+                raise ValidationError("学号必须为 6–20 位数字，且只能绑定学生账号")
         user_id = f"{'t' if role == 'teacher' else 's'}_{uuid.uuid4().hex[:16]}"
         try:
             self.db.execute(
@@ -68,7 +72,7 @@ class AuthService:
             )
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():
-                raise ValidationError("用户名已存在") from exc
+                raise ValidationError("学号已存在" if "student_number" in str(exc) else "用户名已存在") from exc
             raise
         return self.get_user(user_id)
 

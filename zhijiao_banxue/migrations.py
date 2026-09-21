@@ -1378,7 +1378,50 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
     ('036_question_publication_snapshot', """
         ALTER TABLE question_bank_version_items ADD COLUMN snapshot_json TEXT;
     """),
+    ('037_class_calendar_adjustments', """
+        CREATE TABLE class_calendar_adjustments (
+            class_id TEXT NOT NULL REFERENCES classes(class_id) ON DELETE CASCADE,
+            original_date TEXT NOT NULL,
+            makeup_date TEXT,
+            reason TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(class_id, original_date)
+        );
+    """),
 )
+
+
+MIGRATIONS += (("038_student_portraits", """
+    CREATE TABLE class_tasks (
+        task_id TEXT PRIMARY KEY,
+        course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+        class_id TEXT NOT NULL REFERENCES classes(class_id) ON DELETE CASCADE,
+        teacher_id TEXT NOT NULL, title TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('homework','exam')),
+        version_id TEXT NOT NULL, items_json TEXT NOT NULL,
+        roster_json TEXT NOT NULL, published_at TEXT NOT NULL, due_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_class_tasks_scope ON class_tasks(course_id,class_id,due_at);
+    CREATE TABLE class_task_submissions (
+        submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES class_tasks(task_id) ON DELETE CASCADE,
+        student_id TEXT NOT NULL, request_id TEXT NOT NULL,
+        responses_json TEXT NOT NULL, records_json TEXT NOT NULL,
+        submitted_at TEXT NOT NULL, complete INTEGER NOT NULL,
+        answered INTEGER NOT NULL, score REAL NOT NULL, total REAL NOT NULL,
+        UNIQUE(task_id,student_id,request_id)
+    );
+    CREATE INDEX idx_task_submission_owner ON class_task_submissions(task_id,student_id,submitted_at);
+    CREATE TABLE student_portrait_evaluations (
+        evaluation_id TEXT PRIMARY KEY,
+        course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+        class_id TEXT NOT NULL REFERENCES classes(class_id) ON DELETE CASCADE,
+        student_id TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL,
+        metrics_version TEXT NOT NULL, evidence_version TEXT NOT NULL,
+        content_json TEXT NOT NULL, created_at TEXT NOT NULL,
+        invalidated INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_portrait_evaluation_scope ON student_portrait_evaluations(course_id,class_id,student_id,start_at,end_at);
+"""),)
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:

@@ -400,19 +400,23 @@ def test_knowledge_card_ai_split_and_cloze_only_call_provider_on_generation(tmp_
     assert len(provider.calls) == 2, "未通过权限校验时不应发送知识点内容"
 
 
-def test_student_can_import_published_shared_course_knowledge(campus):
+@pytest.mark.parametrize('long_content', [False, True])
+def test_student_can_import_published_shared_course_knowledge(campus, long_content):
     agent = CampusAgentService(campus)
     course = campus.create_course("教师共享知识", "shared_course", "teacher_1", "teacher")
     campus.enroll_student(course["course_id"], "teacher_1", "student_1")
     campus.enroll_student(course["course_id"], "teacher_1", "student_2")
     node_id = "kn_published_1"
     version_id = "kv_published_1"
+    content = ('# 监督学习\n\n' + '使用带标签样本训练模型。' * 80
+               + '\n\n## 损失函数\n\n$$\nL = (y - x)^2\n$$\n\n' + '根据误差更新参数。' * 80
+               if long_content else '监督学习使用带标签样本训练模型。')
     campus.db.execute(
         """INSERT INTO knowledge_nodes(
                node_id,course_id,node_scope,node_type,title,summary,markdown,keywords_json,status,material_type
            ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (node_id, course["course_id"], "course", "knowledge_point", "监督学习",
-         "监督学习使用带标签样本训练模型。", "监督学习使用带标签样本训练模型。",
+         "监督学习使用带标签样本训练模型。", content,
          json.dumps(["监督学习", "标签"], ensure_ascii=False), "approved", "textbook"),
     )
     campus.db.execute(
@@ -445,13 +449,17 @@ def test_student_can_import_published_shared_course_knowledge(campus):
         "input": {"node_ids": [node_id]},
     })
     assert imported.status == "success"
-    assert imported.data["imported_count"] == 1
+    assert imported.data["imported_count"] > 1 if long_content else imported.data["imported_count"] == 1
+    saved = campus.db.fetch_all('SELECT * FROM knowledge_blocks WHERE course_id=? ORDER BY block_order', (course['course_id'],))
+    assert ''.join(row['content'] for row in saved) == content
+    assert all(row['source_node_id'] == node_id and row['source_version_id'] == version_id for row in saved)
+    assert campus.db.fetch_one('SELECT markdown FROM knowledge_nodes WHERE node_id=?', (node_id,))['markdown'] == content
     assert agent.invoke({
         "request_id": "blocks-1", "agent": "student_assistant",
         "action": "knowledge_blocks_list",
         "actor": {"user_id": "student_1", "role": "student"},
         "scope": {"course_id": course["course_id"]},
-    }).data[0]["title"] == "监督学习"
+    }).data[0]["title"].startswith("监督学习")
 
     repeated = agent.invoke({
         "request_id": "published-repeat", "agent": "student_assistant",
@@ -468,6 +476,29 @@ def test_student_can_import_published_shared_course_knowledge(campus):
         "actor": {"user_id": "student_2", "role": "student"},
         "scope": {"course_id": course["course_id"]},
     }).data == []
+
+
+def test_numbered_split_preview_and_save_preserve_all_points(campus):
+    from skills.memory.service import MemoryLearningSkill
+    course = campus.create_course('编号知识点', 'personal_course', 'student_1', 'student')
+    content = '\n\n'.join(f'{index}. 知识点{index}\n这是该知识点的完整解释。\n(1) 下级示例。\n(2) 适用条件。' for index in range(1, 15))
+    campus.db.execute(
+        'INSERT INTO knowledge_blocks(course_id,owner_id,block_order,title,keywords_json,content) VALUES(?,?,?,?,?,?)',
+        (course['course_id'], 'student_1', 1, '编号知识点', '[]', content),
+    )
+    block = campus.db.fetch_one('SELECT block_id FROM knowledge_blocks WHERE course_id=?', (course['course_id'],))
+    memory = MemoryLearningSkill(campus)
+    with patch.object(campus, 'provider_factory', side_effect=AssertionError('编号拆分不需要模型')):
+        preview = memory.ai_split_preview(block['block_id'], 'student_1')
+        with pytest.raises(PermissionDenied):
+            memory.ai_split_preview(block['block_id'], 'student_2')
+    assert len(preview['parts']) == 14
+    assert ''.join(part['content'] for part in preview['parts']) == content
+    assert len(memory.list_blocks(course['course_id'], 'student_1')) == 1
+    saved = memory.apply_ai_split(block['block_id'], 'student_1', preview['parts'])
+    assert len(saved) == 14
+    assert all('(1) 下级示例。' in item['content'] and '(2) 适用条件。' in item['content'] for item in saved)
+    assert saved[-1]['title'] == '14. 知识点14'
 
 
 def test_agent_returns_model_network_error_without_crashing(tmp_path):

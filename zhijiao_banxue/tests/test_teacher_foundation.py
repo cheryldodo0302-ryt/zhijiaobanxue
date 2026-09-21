@@ -42,7 +42,7 @@ def test_teacher_course_class_scope_and_membership(services, monkeypatch):
     course = teachers.create_course(teacher, "数据库原理")
     term = teachers.create_term(teacher, "2026 秋季")
     class_row = teachers.create_class(teacher, course["course_id"], term["term_id"], "临床一班")
-    imported = teachers.add_members(teacher, class_row["class_id"], ["student_1", "student_2", "student_1"])
+    imported = teachers.add_members(teacher, class_row["class_id"], ["20260001", "20260002", "20260001"])
     assert imported["imported"] == 2
     assert len(imported["members"]) == 2
     assert imported["members"][0]["anonymous_id"]

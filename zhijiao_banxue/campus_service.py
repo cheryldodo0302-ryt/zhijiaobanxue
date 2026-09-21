@@ -254,6 +254,7 @@ class ChunkRetriever:
             results.append(Evidence(
                 row["original_name"], row["section"] or "正文", row["content"], round(score, 4),
                 str(row.get("material_type") or ""), str(row.get("material_label") or ""),
+                row.get("document_id"), row.get("page_number"), row.get("locations") or [],
             ))
             if len(results) >= max(1, min(int(top_k), 20)):
                 break
@@ -504,8 +505,21 @@ class CampusService:
                 if not content.strip():
                     continue
                 label = COURSE_MATERIAL_LABELS.get(item["material_type"], "其他")
-                rows.append({"content":content, "section":label + " · " + (item.get("section") or f"第 {item.get('page_number') or 1} 页"),
-                             "original_name":item["original_name"], "page_number":item.get("page_number"),
+                sources = item.get("sources") or ([item] if item.get("document_id") else [])
+                locations = []
+                for source_ref in sources:
+                    if not source_ref.get("document_id"):
+                        continue
+                    location = {"document_id": source_ref["document_id"],
+                                "source_file": source_ref.get("original_name") or item["original_name"],
+                                "page_number": source_ref.get("page_number"),
+                                "section": item.get("section") or "正文"}
+                    if location not in locations:
+                        locations.append(location)
+                primary = locations[0] if locations else {}
+                rows.append({"content":content, "section":label + " · " + (item.get("section") or "正文"),
+                             "original_name":item["original_name"], "page_number":primary.get("page_number"),
+                             "document_id":primary.get("document_id"), "locations":locations,
                              "material_type":item["material_type"], "material_label":label})
             return ChunkRetriever(rows)
         if self.get_course(course_id)["course_type"] == "shared_course":
@@ -516,7 +530,7 @@ class CampusService:
         if material_type:
             chunk_condition = " AND COALESCE(m.material_type,'other')=?"
             chunk_params += (material_type,)
-        rows = self.db.fetch_all("""SELECT c.content,c.section,c.page_number,d.original_name,
+        rows = self.db.fetch_all("""SELECT c.content,c.section,c.page_number,c.document_id,d.original_name,
                                          COALESCE(m.material_type,'other') material_type
                                   FROM document_chunks c JOIN course_documents d USING(document_id)
                                   LEFT JOIN document_material_metadata m USING(document_id)
@@ -728,7 +742,7 @@ class CampusService:
                 'total':event['total'],'created_at':event['created_at'],'records':records,
                 'wrong_items':[r for r in records if not r.get('correct')],
                 'knowledge_points':list(dict.fromkeys(p for r in records for p in r.get('knowledge_points',[])))})
-        return {"questions": questions, "attempts": attempts, "weak_points": weak,
+        return {"summary": summarize(learning), "questions": questions, "attempts": attempts, "weak_points": weak,
                 "wrong_questions": [x for a in attempts for x in a["wrong_items"]]}
 
     def class_analysis(self, course_id: str, teacher_id: str, class_id: str | None = None) -> dict:

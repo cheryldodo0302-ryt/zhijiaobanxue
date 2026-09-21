@@ -5023,12 +5023,12 @@ class IngestionService:
             source_rows,
         )
         previous_revision = str(candidate.get("teacher_revision") or "")
-        revision_changed = teacher_revision != previous_revision
-        if teacher_revision:
-            status = "MODIFIED"
-        elif candidate["review_status"] == "MODIFIED":
-            # Clearing the revision returns the candidate to the normal review queue.
-            status = "PENDING"
+        revision_changed = (teacher_revision != previous_revision
+                            or title != candidate["title"]
+                            or knowledge_type != candidate["knowledge_type"])
+        if revision_changed:
+            status = "MODIFIED" if (teacher_revision or title != candidate["title"]
+                                    or knowledge_type != candidate["knowledge_type"]) else "PENDING"
         else:
             status = candidate["review_status"]
         self.db.execute(
@@ -5051,6 +5051,13 @@ class IngestionService:
                 str(node["node_id"]), reset_approval=revision_changed,
                 actor_id=str(actor["user_id"]),
             )
+        if revision_changed and source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            self.db.execute(
+                f"UPDATE document_blocks SET verification_status='review_required' WHERE block_id IN ({placeholders})",
+                tuple(source_ids),
+            )
+            self._sync_approved_source_blocks(str(candidate["document_id"]))
         response = self._candidate_response(self.db.fetch_one(
             "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
         ) or candidate)
@@ -5148,9 +5155,10 @@ class IngestionService:
         ) or candidate)
 
     def approve_document_knowledge(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
-        """Mark a whole document as reviewed so point-by-point approval is optional."""
+        """Approve safe document content into the teacher library; never publish it."""
         document = self.require_document_access(actor, document_id)
-        if actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]:
+        if (actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]
+                or document["course_type"] != "shared_course"):
             raise PermissionDenied("无权审核该资料")
         job = self.db.fetch_one(
             "SELECT * FROM ingestion_jobs WHERE document_id=? ORDER BY created_at DESC LIMIT 1",
@@ -5231,11 +5239,73 @@ class IngestionService:
             (document_id,),
         ) or {"document_id": document_id}
         result.update({
-            "review_mode_label": "整本资料审核",
+            "review_mode_label": "整本批准到知识库",
+            "library_status": "approved",
             "knowledge_block_count": int(counts.get("knowledge_block_count") or 0),
             "pending_candidate_count": int(counts.get("pending_candidate_count") or 0),
         })
         return result
+
+    def approve_documents_to_library(
+        self, actor: dict[str, Any], course_id: str, document_ids: list[str]
+    ) -> dict[str, Any]:
+        """Course-scoped approval with explicit per-document results, without release."""
+        self._require_knowledge_workflow_course(actor, course_id)
+        ids = list(dict.fromkeys(document_ids))
+        if not ids or len(ids) > 100:
+            raise ValidationError("请选择 1 至 100 份资料批准到知识库")
+        # Validate the entire scope before any writes, including mixed-course input.
+        for document_id in ids:
+            document = self.require_document_access(actor, document_id)
+            if document["course_id"] != course_id:
+                raise PermissionDenied("只能批准当前课程的资料到知识库")
+        approved, failed = [], []
+        for document_id in ids:
+            try:
+                self.approve_document_knowledge(actor, document_id)
+                approved.append(document_id)
+            except ValidationError as exc:
+                failed.append({"document_id": document_id, "message": str(exc)})
+        return {"approved": approved, "failed": failed}
+
+    def _require_knowledge_workflow_course(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
+        if actor.get("role") != "teacher":
+            raise PermissionDenied("仅教师可管理课程知识库")
+        course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
+        if course["course_type"] != "shared_course" or course["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("只能管理自己的共享课程知识库")
+        return course
+
+    def knowledge_workflow(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
+        """Keep working-library approval separate from the frozen student release."""
+        self._require_knowledge_workflow_course(actor, course_id)
+        readiness = self.publish_readiness(actor, course_id)
+        from published_knowledge import publication
+        version, nodes, blocks = publication(self.db, course_id)
+        published_documents = {str(block["document_id"]) for block in blocks}
+        for node in nodes:
+            published_documents.update(str(source["document_id"]) for source in node.get("sources", []))
+        documents = []
+        for job in self.list_jobs(actor, course_id):
+            approved = int(job.get("knowledge_candidate_approved_count") or 0)
+            pending = int(job.get("knowledge_candidate_pending_count") or 0)
+            whole = job.get("knowledge_review_status") == "approved"
+            library_status = "approved" if whole or (approved and not pending) else (
+                "partial" if approved else "pending"
+            )
+            can_approve = (job["status"] in {"ready", "review_required"}
+                           and job.get("analysis_status") not in {"queued", "running", "retry_wait", "failed"})
+            documents.append({
+                "document_id": job["document_id"], "library_status": library_status,
+                "approved_candidates": approved, "pending_candidates": pending,
+                "can_approve": can_approve and not whole,
+                "student_version": version["version_number"] if version and str(job["document_id"]) in published_documents else None,
+            })
+        student_version = {key: version[key] for key in (
+            "version_id", "version_number", "status", "published_at"
+        )} if version else None
+        return {**readiness, "documents": documents, "student_publication": student_version,
+                "student_knowledge_points": sum(n["node_type"] == "knowledge_point" for n in nodes)}
 
     def require_document_access(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
         document = self.db.fetch_one(
@@ -5250,6 +5320,10 @@ class IngestionService:
             if document["owner_id"] != user_id:
                 raise PermissionDenied("无权查看该课程原始资料")
         elif role == "student":
+            if document["course_type"] == "personal_course":
+                if document["owner_id"] != user_id:
+                    raise PermissionDenied("无权查看他人的个人资料")
+                return document
             if document["course_type"] != "shared_course" or not document["student_file_visible"]:
                 raise PermissionDenied("教师尚未向学生开放该原始资料")
             published = self.db.fetch_one(
@@ -6260,6 +6334,13 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
     def update_node(self, actor: dict[str, Any], node_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         node = self._require_node(actor, node_id)
         status = str(updates.get("status", node["status"]))
+        # Saving a revision is not a new approval. Explicit approval may save and
+        # approve together, but ordinary edits must return to the review queue.
+        content_changed = any(
+            key in updates and updates[key] != node[key] for key in ("title", "markdown")
+        )
+        if "status" not in updates and content_changed:
+            status = "draft"
         if status not in {"draft", "approved", "rejected"}:
             raise ValidationError("知识节点审核状态无效")
         parent_id = updates.get("parent_id", node["parent_id"])
@@ -6349,6 +6430,15 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                     WHERE block_id IN (SELECT block_id FROM knowledge_node_sources
                     WHERE node_id IN ({placeholders}))""",
                 (verification, actor["user_id"], *affected_ids),
+            )
+        if content_changed and status != "approved":
+            for source in self.db.fetch_all(
+                "SELECT DISTINCT document_id FROM knowledge_node_sources WHERE node_id=?", (node_id,),
+            ):
+                self._reset_document_knowledge_review(str(source["document_id"]))
+        if node["node_scope"] == "document" and content_changed:
+            self._sync_course_nodes_from_document_node(
+                node_id, reset_approval=status != "approved", actor_id=str(actor["user_id"]),
             )
         updated = self.db.fetch_one("SELECT * FROM knowledge_nodes WHERE node_id=?", (node_id,)) or {}
         if "class_ids" in updates:
@@ -7248,9 +7338,7 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         }
 
     def publish(self, actor: dict[str, Any], course_id: str, request_id: str | None = None) -> dict[str, Any]:
-        course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
-        if course["owner_id"] != actor["user_id"]:
-            raise PermissionDenied("无权发布该课程知识库")
+        self._require_knowledge_workflow_course(actor, course_id)
         if request_id is not None and (not isinstance(request_id,str) or not 1<=len(request_id)<=100):
             raise ValidationError('发布操作标识无效')
         if request_id:

@@ -39,6 +39,7 @@ TEACHER_ACTIONS = {
     "document_status", "course_knowledge_status", "class_question_analysis",
     "class_weak_point_analysis", "uncovered_question_analysis",
     "class_quiz_analysis", "teaching_report", "class_data_export",
+    "student_portrait", "student_portrait_evaluate",
 }
 
 
@@ -129,6 +130,16 @@ class CampusAgentService:
 
     def _dispatch(self, req: AgentRequest, user_id: str, role: str) -> Any:
         action, inp, scope = req.action, req.input, req.scope
+        if action in {"student_portrait", "student_portrait_evaluate"}:
+            from browser_study_room_service import BrowserStudyRoomService
+            from student_portrait_service import StudentPortraitService
+            room = BrowserStudyRoomService(self.campus.db.db_path.parent / "study_room.db", campus=self.campus)
+            try:
+                service = StudentPortraitService(self.campus, room)
+                method = service.get if action == "student_portrait" else service.evaluate
+                return method(req.actor, scope["course_id"], scope["class_id"], inp["student_id"], inp["start_at"], inp["end_at"])
+            finally:
+                room.engine.dispose()
         skill_context = SkillContext(user_id=user_id, role=role, course_id=scope.get("course_id") or "unscoped")
         if action == "personal_course_create":
             return self.campus.create_course(inp["course_name"], "personal_course", user_id, role, inp.get("description", ""))

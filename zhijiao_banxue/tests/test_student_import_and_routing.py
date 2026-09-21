@@ -32,7 +32,7 @@ def test_import_creates_login_and_forces_password_change(tmp_path, monkeypatch):
         {"student_number": "20260001", "display_name": "重复"},
         {"student_number": "bad number"},
     ])
-    assert imported["summary"] == {"created": 1, "reused": 0, "already_member": 1, "conflict": 0, "invalid": 1}
+    assert imported["summary"] == {"created": 1, "reused": 0, "already_member": 0, "conflict": 1, "invalid": 1}
     row = db.fetch_one("SELECT * FROM users WHERE student_number='20260001'")
     assert row["password_hash"] != "initial-password-123"
     PasswordHasher().verify(row["password_hash"], "initial-password-123")

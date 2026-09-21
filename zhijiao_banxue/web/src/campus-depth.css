@@ -1,0 +1,110 @@
+/* Reference: paper compositions on an olive backdrop. Elevation denotes the
+   working surface, navigation and overlays; nested content stays flat.
+   Existing layer scale: content auto, navigation 50, Element Plus overlays 2000+. */
+html:is([data-portal="teacher"], [data-portal="student"]),
+:is(.teacher-surface, .student-surface) {
+  --surface: #fcfcf8;
+  --surface-subtle: #edf0e7;
+  --text-primary: #294b3c;
+  --text-secondary: #56634d;
+  --border-subtle: #d2d8c7;
+  --campus-backdrop: #dfe3d5;
+  --paper-shadow: 0 2px 3px rgb(41 61 35 / 7%), 0 12px 25px -14px rgb(41 61 35 / 30%);
+  --paper-raised: 0 3px 5px rgb(41 61 35 / 10%), 0 20px 36px -18px rgb(41 61 35 / 38%);
+  --campus-ease: cubic-bezier(.16, 1, .3, 1);
+  background: var(--campus-backdrop);
+}
+.student-surface .student-workspace,
+.student-surface .student-study-room,
+.student-surface .task-page { background: transparent; }
+
+/* Paper sheets are lifted off the backdrop. Lists and cards inside them are not. */
+.teacher-surface .teacher-route :is(.pending-panel, .workbench-panel, .workbench-filters, .archive .main, .archive .filters, .archive .work > aside),
+.teacher-surface .teacher-route .content > .el-card,
+.student-surface :is(.student-course-nav, .course-strip, .source-inspector, .focus-message, .focus-context),
+.student-surface .student-grid > .el-card,
+.student-surface :is(.learning-column, .profile-column, .student-two-column) > .el-card,
+.student-surface :is(.task-page, .student-study-room) > .el-card {
+  background: var(--surface);
+  border-color: transparent;
+  box-shadow: var(--paper-shadow);
+}
+.teacher-surface .teacher-route .workbench-metrics article,
+.teacher-surface .teacher-route .archive .metrics article { background: #f0f2e9; }
+.teacher-surface .teacher-nav { border-right: 0; box-shadow: 4px 0 18px -10px rgb(41 61 35 / 25%); }
+.student-surface :is(.student-topbar, .student-portal-nav) { background: var(--surface); border-bottom-color: transparent; box-shadow: 0 6px 16px -13px rgb(41 61 35 / 40%); }
+.student-surface .student-workspace .student-course-nav { background: #edf0e5; }
+.student-surface .student-workspace .course-nav-item.selected { background: #294b3c; color: #fcfcf8; }
+.student-surface .student-workspace .course-nav-item.selected:hover { background: #203c30; }
+.student-surface .student-workspace-tabs > .el-tabs__header { background: var(--surface); border-color: transparent; box-shadow: var(--paper-shadow); }
+
+/* The heading is the nearest paper plane; art remains unframed and blends into the paper. */
+.teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading),
+.student-surface :is(.student-header, .study-room-hero),
+.student-surface .task-page > .page-title {
+  background: #f6f6ed;
+  border: 0;
+  border-radius: 12px;
+  box-shadow: var(--paper-raised);
+}
+.student-surface .student-workspace .student-header { min-height: 132px; padding: 24px 182px 24px 24px; margin-bottom: 20px; overflow: visible; }
+.student-surface .student-workspace .student-header .page-title { display: block; }
+.student-surface .student-workspace .student-header p { margin-bottom: 0; }
+.student-surface .student-workspace .student-header > .study-artwork { inset: 12px 18px 12px auto; width: 140px; height: auto; opacity: 1; }
+.student-surface .task-page > .page-title { padding: 24px; margin-bottom: 22px; }
+.student-surface .study-room-hero { padding: 24px; }
+.teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading)::after,
+.student-surface .student-workspace .student-header > .study-artwork {
+  background-color: transparent;
+  border-radius: 0;
+  box-shadow: none;
+  transform: translate3d(var(--art-x, 0px), var(--art-y, 0px), 0);
+}
+.teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading)::after { inset-block: 14px; }
+.teacher-surface .overview-totals { border-color: #bdc6af; }
+.student-surface :is(.history-kind.practice, .history-kind.memory) { color: #294b3c; background: #e4e9da; }
+.student-surface :is(.graph-canvas, .dialogue-row.student) { background: #edf0e7; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-dialog, .el-drawer, .el-message-box) {
+  box-shadow: 0 8px 20px rgb(31 48 27 / 15%), 0 32px 80px -20px rgb(31 48 27 / 35%);
+}
+html:is([data-portal="teacher"], [data-portal="student"]) .el-overlay { background: rgb(36 47 31 / 38%); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .campus-page-enter-active { transition: opacity .24s ease-out, transform .36s var(--campus-ease); }
+  .campus-page-leave-active { transition: opacity .12s ease-in; }
+  .campus-page-enter-from { opacity: 0; transform: translateY(12px); }
+  .campus-page-leave-to { opacity: 0; }
+  /* Only the art plane follows the pointer. Text, inputs and tables stay still. */
+  .teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading)::after,
+  .student-surface .student-workspace .student-header > .study-artwork { transition: transform .55s var(--campus-ease); }
+  :is(.teacher-surface, .student-surface) :is(.el-button, .course-card, .course-nav-item, .teacher-nav nav a) { transition: transform .22s var(--campus-ease), background-color .18s ease; }
+  /* Existing dashboard choreography is the focal entrance, so route transitions
+     don't also stagger all its data a second time. */
+  .teacher-surface :is(.dashboard-heading, .overview-totals, .pending-panel, .pending-list li) { animation: none; }
+}
+@media (hover: hover) and (pointer: fine) and (prefers-reduced-motion: no-preference) {
+  :is(.teacher-surface, .student-surface) .el-button:not(:disabled):not(.is-link):not(.is-text):hover { transform: translateY(-2px); }
+  :is(.teacher-surface, .student-surface) .el-button:not(:disabled):active { transform: translateY(0) scale(.98); }
+  .teacher-surface .course-card:hover { transform: translateY(-2px); }
+  .teacher-surface .teacher-nav nav a:hover { transform: translateX(2px); }
+}
+@media (max-width: 760px) {
+  :is(.teacher-surface, .student-surface) { --paper-shadow: 0 2px 3px rgb(41 61 35 / 6%), 0 8px 18px -12px rgb(41 61 35 / 28%); }
+  .student-surface .student-workspace .student-header { min-height: 112px; padding: 20px 100px 20px 18px; }
+  .student-surface .student-workspace .student-header > .study-artwork { width: 74px; inset: 18px 12px 18px auto; opacity: 1; }
+  .student-surface .student-workspace .student-header h1 { font-size: 23px; }
+  .student-surface .student-workspace .student-header p { font-size: 12px; }
+  .student-surface .task-page > .page-title { padding: 20px 18px; }
+  .student-surface .study-room-hero { padding: 20px 18px; }
+  .teacher-surface .teacher-nav { box-shadow: 0 6px 16px -13px rgb(41 61 35 / 40%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .campus-page-enter-active, .campus-page-leave-active { transition: none; }
+  .campus-page-enter-from, .campus-page-leave-to { transform: none; opacity: 1; }
+  .teacher-surface .teacher-route :is(.content > .page-title, .workbench-hero, .archive > .hero, .dashboard-heading)::after,
+  .student-surface .student-workspace .student-header > .study-artwork { transform: none; }
+}
+
+.student-surface .student-workspace .course-strip { background: var(--surface); }
+.student-surface .paper-workspace { --paper-accent: #294b3c; --paper-border: #d2d8c7; }
+.student-surface .paper-workspace .paper-question { background: var(--surface); }

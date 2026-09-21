@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from auth_service import AuthService
-from campus_service import CampusService, PermissionDenied
+from campus_service import CampusService, PermissionDenied, ValidationError
 from database import LearningDatabase
 from knowledge_graph_service import KnowledgeGraphService
 from teacher_service import TeacherService
@@ -120,3 +120,79 @@ def test_graph_rejects_non_spreadsheet_upload(tmp_path: Path):
             teacher, batch["batch_id"], "payload.exe", "application/octet-stream",
             io.BytesIO(b"MZ"), relative_path="图谱/payload.exe",
         )
+
+
+def test_same_title_sources_sync_independently_and_stay_synced(tmp_path: Path):
+    db, teacher, student, _, course, service = graph_scope(tmp_path)
+    course_id = course["course_id"]
+    for source_id, title in [("source-a", "6.4 逻辑结构设计"), ("source-b", "6.4逻辑结构设计")]:
+        db.execute(
+            """INSERT INTO knowledge_nodes(node_id,course_id,node_scope,node_type,title,markdown,status)
+               VALUES(?,?,'course','knowledge_point',?,?,'approved')""",
+            (source_id, course_id, title, source_id),
+        )
+    service.import_approved_nodes(teacher, course_id, ["source-a"])
+    original = service.workbench(teacher, course_id)["nodes"][0]
+    service.publish(teacher, course_id)
+    for _ in range(3):
+        diff = service.source_diff(teacher, course_id)
+        service.sync_sources(teacher, course_id, [], [r["source_knowledge_node_id"] for r in diff if r["state"] == "new"])
+        service.import_approved_nodes(teacher, course_id)
+        assert {r["state"] for r in service.source_diff(teacher, course_id)} == {"current"}
+        workbench = service.workbench(teacher, course_id)
+        assert len(workbench["nodes"]) == 2
+        assert {r["state"] for r in workbench["library_knowledge"]} == {"synced"}
+    by_source = {r["source_knowledge_node_id"]: r for r in workbench["nodes"]}
+    assert by_source["source-a"]["graph_node_id"] == original["graph_node_id"]
+    assert by_source["source-a"]["markdown"] == "source-a"
+    assert by_source["source-b"]["markdown"] == "source-b"
+    assert len(service.student_graph(student, course_id)["nodes"]) == 1
+    db.execute("UPDATE knowledge_nodes SET markdown='updated' WHERE node_id='source-b'")
+    service.sync_sources(teacher, course_id, [by_source["source-b"]["graph_node_id"]])
+    assert {r["state"] for r in service.source_diff(teacher, course_id)} == {"current"}
+    service.update_node(teacher, by_source["source-b"]["graph_node_id"], {"notes": "审核备注"})
+    assert len(service.workbench(teacher, course_id)["nodes"]) == 2
+
+
+def test_source_rename_to_existing_title_preserves_both_nodes(tmp_path: Path):
+    db, teacher, _, _, course, service = graph_scope(tmp_path)
+    course_id = course["course_id"]
+    for source_id in ["rename-a", "rename-b"]:
+        db.execute(
+            """INSERT INTO knowledge_nodes(node_id,course_id,node_scope,node_type,title,status)
+               VALUES(?,?,'course','knowledge_point',?,'approved')""",
+            (source_id, course_id, source_id),
+        )
+    service.import_approved_nodes(teacher, course_id)
+    before = {r["graph_node_id"] for r in service.workbench(teacher, course_id)["nodes"]}
+    db.execute("UPDATE knowledge_nodes SET title='rename-a' WHERE node_id='rename-b'")
+    service.sync_sources(teacher, course_id)
+    service.import_approved_nodes(teacher, course_id)
+    assert {r["graph_node_id"] for r in service.workbench(teacher, course_id)["nodes"]} == before
+    assert {r["state"] for r in service.source_diff(teacher, course_id)} == {"current"}
+
+
+def test_library_sync_keeps_node_identity_and_requires_approved_sources(tmp_path: Path):
+    db, teacher, student, _, course, service = graph_scope(tmp_path)
+    db.execute(
+        """INSERT INTO knowledge_nodes(node_id,course_id,node_scope,node_type,title,markdown,status)
+           VALUES('library-source',?,'course','knowledge_point','原名称','原正文','approved')""",
+        (course["course_id"],),
+    )
+    assert service.workbench(teacher, course["course_id"])["library_knowledge"][0]["title"] == "原名称"
+    service.import_approved_nodes(teacher, course["course_id"])
+    service.publish(teacher, course["course_id"])
+    db.execute("UPDATE knowledge_nodes SET title='新名称',status='draft' WHERE node_id='library-source'")
+    with pytest.raises(ValidationError, match="入库"):
+        service.publish(teacher, course["course_id"])
+    with pytest.raises(ValidationError):
+        service.sync_sources(teacher, course["course_id"], source_knowledge_node_ids=["library-source"])
+    assert service.student_graph(student, course["course_id"])["nodes"][0]["title"] == "原名称"
+    db.execute("UPDATE knowledge_nodes SET status='approved' WHERE node_id='library-source'")
+    with pytest.raises(ValidationError, match="同步"):
+        service.publish(teacher, course["course_id"])
+    service.import_approved_nodes(teacher, course["course_id"])
+    assert len(service.workbench(teacher, course["course_id"])["nodes"]) == 1
+    assert service.student_graph(student, course["course_id"])["nodes"][0]["title"] == "原名称"
+    service.publish(teacher, course["course_id"])
+    assert service.student_graph(student, course["course_id"])["nodes"][0]["title"] == "新名称"

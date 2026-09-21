@@ -40,7 +40,7 @@ ingestion = IngestionService(db, campus)
 teaching_archives = TeachingArchiveService(db, campus, ingestion)
 knowledge_graphs = KnowledgeGraphService(db, campus)
 question_banks = QuestionBankService(db, campus)
-study_room = BrowserStudyRoomService()
+study_room = BrowserStudyRoomService(campus=campus)
 app = FastAPI(title="智教伴学 API", version="1.0.0")
 allowed_origins = [value.strip() for value in os.environ.get(
     "ZHIJIAO_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
@@ -96,6 +96,11 @@ class StudyTelemetryPayload(BaseModel):
     head_score: float = Field(default=0.0, ge=0.0, le=1.0)
     calibrating: bool = False
     camera_available: bool = True
+
+
+class StudyStartPayload(BaseModel):
+    course_id: str | None = None
+    class_id: str | None = None
 
 
 class RuntimeAiSettingsPayload(BaseModel):
@@ -161,7 +166,14 @@ class WeeklyScheduleEntry(BaseModel):
     details: dict = Field(default_factory=dict)
 
 
+class CalendarAdjustmentEntry(BaseModel):
+    original_date: str
+    makeup_date: str | None = None
+    reason: str = Field(default="", max_length=120)
+
+
 class WeeklySchedulesPayload(BaseModel):
+    adjustments: list[CalendarAdjustmentEntry] | None = Field(default=None, max_length=100)
     schedules: list[WeeklyScheduleEntry] = Field(default_factory=list, max_length=20)
 
 
@@ -581,7 +593,8 @@ def teacher_class_weekly_schedules(class_id: str, payload: WeeklySchedulesPayloa
                                    user: dict = Depends(current_teacher)) -> list[dict]:
     try:
         return teachers.replace_weekly_schedules(
-            user, class_id, [row.model_dump() for row in payload.schedules]
+            user, class_id, [row.model_dump() for row in payload.schedules],
+            adjustments=[row.model_dump() for row in payload.adjustments] if payload.adjustments is not None else None
         )
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -986,8 +999,9 @@ def student_study_room_status(user: dict = Depends(current_student)) -> dict:
 
 
 @app.post("/api/v1/student/study-room/start")
-def student_study_room_start(user: dict = Depends(current_student)) -> dict:
-    return study_room.start(str(user["user_id"]))
+def student_study_room_start(payload: StudyStartPayload | None = None, user: dict = Depends(current_student)) -> dict:
+    from portrait_api import checked
+    return checked(study_room.start, str(user["user_id"]), **(payload.model_dump() if payload else {}))
 
 
 @app.post("/api/v1/student/study-room/telemetry")
@@ -1247,7 +1261,8 @@ def teacher_knowledge_candidate_reject(candidate_id: str, user: dict = Depends(c
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/teacher/documents/{document_id}/knowledge-review")
+@app.post("/api/v1/teacher/documents/{document_id}/approve-to-library")
+@app.post("/api/v1/teacher/documents/{document_id}/knowledge-review", deprecated=True)
 def teacher_document_knowledge_review(document_id: str, user: dict = Depends(current_teacher)) -> dict:
     try:
         return ingestion.approve_document_knowledge(user, document_id)
@@ -1724,6 +1739,23 @@ def student_question_submit(course_id: str, payload: QuestionBankSubmitPayload,
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/v1/teacher/courses/{course_id}/knowledge-workflow")
+def teacher_knowledge_workflow(course_id: str, user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return ingestion.knowledge_workflow(user, course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/knowledge-library/approve")
+def teacher_knowledge_library_approve(course_id: str, payload: BatchDeletePayload,
+                                      user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return ingestion.approve_documents_to_library(user, course_id, payload.ids)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/v1/teacher/courses/{course_id}/knowledge-versions/publish")
 def teacher_knowledge_publish(course_id: str, payload: KnowledgePublishPayload | None = None, user: dict = Depends(current_teacher)) -> dict:
     try:
@@ -1780,3 +1812,7 @@ def list_courses(user_id: str, role: str, user: dict = Depends(current_ready_use
         return campus.list_courses(user_id, role)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+from portrait_api import portrait_router
+app.include_router(portrait_router(campus, study_room, current_teacher, current_student))
