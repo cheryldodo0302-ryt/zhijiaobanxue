@@ -4,7 +4,12 @@
 html:is([data-portal="teacher"], [data-portal="student"]) {
   --el-font-family: var(--campus-font);
   --el-font-size-base: 14px;
-  --el-component-size: 36px;
+  --campus-control-height: 36px;
+  --campus-type-body: 14px;
+  --campus-type-caption: 12px;
+  --campus-type-label: 13px;
+  --campus-leading-body: 1.6;
+  --el-component-size: var(--campus-control-height);
   --el-component-size-small: 28px;
   --el-component-size-large: 40px;
   font-size: 14px;
@@ -53,11 +58,72 @@ html:is([data-portal="teacher"], [data-portal="student"]) :is(.upload-row, .uplo
 html:is([data-portal="teacher"], [data-portal="student"]) :is(.upload-row, .upload-actions, .block-actions, .bulk-actions, .question-actions, .teaching-actions, .archive-hero-actions, .resource-toolbar-actions, .api-settings-actions, .focus-actions, .graph-tools, .header-actions) > .el-button { margin-left: 0; }
 html:is([data-portal="teacher"], [data-portal="student"]) .upload-row { align-items: flex-start; }
 html:is([data-portal="teacher"], [data-portal="student"]) .el-upload { vertical-align: top; }
-html:is([data-portal="teacher"], [data-portal="student"]) .el-form-item__label { line-height: 1.5; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-form-item__label { align-items: center; line-height: 20px; }
 html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-dialog__body, .el-drawer__body, .el-alert__description, .el-form-item__content) { line-height: 1.6; }
 html:is([data-portal="teacher"], [data-portal="student"]) .el-textarea__inner { font-size: 14px; line-height: 1.65; }
 html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-tag, .el-form-item__label, .el-input__inner, .el-select__placeholder) { font-family: var(--campus-font); }
+
+/* Element Plus declares size variables on the controls themselves, so setting
+   only html leaves selects and inputs at 32px beside our 36px buttons. */
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-input, .el-select, .el-input-number, .el-date-editor) {
+  --el-component-size: var(--campus-control-height);
+  --el-component-size-small: 28px;
+  --el-component-size-large: 40px;
+  font-size: var(--campus-type-body);
+}
+html:is([data-portal="teacher"], [data-portal="student"]) .el-select__wrapper {
+  min-height: var(--campus-control-height);
+  font-size: var(--campus-type-body);
+  line-height: 20px;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) .el-select__wrapper.is-small { min-height: 28px; font-size: 12px; line-height: 18px; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-select__wrapper.is-large { min-height: 40px; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-form--label-top .el-form-item__label { height: auto; margin-bottom: 8px; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-form-item__label { font-size: var(--campus-type-label); }
+
+/* Action groups own their spacing; sibling margins otherwise double the gap.
+   Do not target button-group, pagination or table cells, which own their layout. */
+html:is([data-portal="teacher"], [data-portal="student"]) :is(
+  .tree-actions, .candidate-actions, .resource-header-actions,
+  .resource-release-actions, .resource-overview-actions, .upload-dialog-actions,
+  .trash-dialog-actions, .calendar-heading-actions, .study-room-actions,
+  .student-account, .practice-toolbar, .el-dialog__footer
+) { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(
+  .tree-actions, .candidate-actions, .resource-header-actions,
+  .resource-release-actions, .resource-overview-actions, .upload-dialog-actions,
+  .trash-dialog-actions, .calendar-heading-actions, .study-room-actions,
+  .student-account, .practice-toolbar, .el-dialog__footer
+) > .el-button { margin-left: 0; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-dialog__footer { justify-content: flex-end; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.card-header, .card-heading, .pane-title, .evaluation-heading) { gap: 12px; flex-wrap: wrap; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.card-header, .card-heading, .pane-title, .evaluation-heading) > :is(h2, h3) { margin: 0; }
+
+/* Content hierarchy, without changing rich lesson text, equations or metrics. */
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.page-title, .dashboard-heading, .workbench-hero, .archive > .hero) h1 {
+  font-size: 28px;
+  line-height: 1.4;
+  margin: 0 0 8px;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.page-title, .dashboard-heading, .workbench-hero, .archive > .hero) p {
+  font-size: var(--campus-type-body);
+  line-height: var(--campus-leading-body);
+  margin: 0;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-card__body > h2, .statistics-heading h2, .section-title) { font-size: 20px; line-height: 1.5; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-card__body > h3, .card-heading > h3, .evaluation-heading > h3) { font-size: 16px; line-height: 1.5; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.card-header, .card-heading, .pane-title) { font-size: var(--campus-type-body); line-height: var(--campus-leading-body); }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.form-field > label, .toolbar-label, .qa-composer > label, .course-selector > label) { font-size: var(--campus-type-label); line-height: 20px; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.course-nav-group p, .course-nav-art > span, .candidate-meta-grid small, .source-baseline-heading small, .source-block-list-heading small, .resource-overview-summary span, .material-partition small) { font-size: var(--campus-type-caption); line-height: var(--campus-leading-body); }
+html:is([data-portal="teacher"], [data-portal="student"]) .student-row { font-size: var(--campus-type-body); line-height: var(--campus-leading-body); }
+html:is([data-portal="teacher"], [data-portal="student"]) .student-row small { font-size: var(--campus-type-caption); margin-top: 4px; }
+
+/* Keep controls on the first row aligned with the course select, even when its
+   explanatory text occupies a second row. */
+html[data-portal="student"] .student-surface .course-strip-main { align-items: flex-start; }
+html[data-portal="student"] .student-surface .course-strip-main > .el-tag { margin-top: 6px; }
 @media (max-width: 760px) {
+  html:is([data-portal="teacher"], [data-portal="student"]) :is(.page-title, .dashboard-heading, .workbench-hero, .archive > .hero) h1 { font-size: 24px; }
   html:is([data-portal="teacher"], [data-portal="student"]) :is(.upload-row, .upload-actions, .bulk-actions, .question-actions) > :is(.el-button, .folder-picker, .file-picker) { flex-shrink: 0; }
   html:is([data-portal="teacher"], [data-portal="student"]) .el-dialog__footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
   html:is([data-portal="teacher"], [data-portal="student"]) .el-dialog__footer > .el-button { margin-left: 0; }

@@ -9,7 +9,7 @@ import StudentLearningFocus from "../components/StudentLearningFocus.vue";
 import PaperWorkspace from "../components/PaperWorkspace.vue";
 import ExpandableList from "../components/ExpandableList.vue";
 import { vStudyMotion } from "../study-motion";
-import { Setting, ArrowDown, Reading, Plus, Collection, Document, FullScreen, Close } from "@element-plus/icons-vue";
+import { Setting, Share, ArrowDown, Reading, Plus, Collection, Document, FullScreen, Close } from "@element-plus/icons-vue";
 import { saveStudentDraft, readStudentDraft, clearStudentDrafts } from "../student-navigation";
 import { createCardSpeech } from "../card-speech";
 import { useAuthStore } from "../stores/auth";
@@ -236,6 +236,9 @@ const materialPartitions = computed(
 );
 const trainingBlock = computed(() =>
   blocks.value.find((item) => item.block_id === trainingBlockId.value),
+);
+const trainingIndex = computed(() =>
+  trainingBlock.value ? blocks.value.findIndex((item) => item.block_id === trainingBlock.value.block_id) : -1,
 );
 const splitAt = computed(() =>
   Math.max(0, Math.min(editContent.value.length, Number(splitPosition.value || 0))),
@@ -1227,6 +1230,9 @@ async function logout() {
   await auth.logout();
   location.href = "/login";
 }
+function openSharingSettings() {
+  void router.push({ path: "/student/study-room", query: { sharing: "settings" } });
+}
 function updateAiStatus(settings: any) {
   aiStatus.value = settings;
 }
@@ -1320,7 +1326,7 @@ onUnmounted(async () => {
       <RouterLink to="/student/courses" class="student-brand"><el-icon><Reading/></el-icon><span>智教伴学<small>以知识陪伴成长</small></span></RouterLink>
       <nav aria-label="学生端导航"><RouterLink to="/student/courses">学习空间</RouterLink><RouterLink to="/student/study-room">自习室</RouterLink><RouterLink to="/student/tasks">班级作业 / 考试</RouterLink></nav>
       <el-dropdown trigger="click" placement="bottom-end"><el-button class="account-menu">{{ auth.user?.display_name || auth.user?.username }}<el-icon><ArrowDown/></el-icon></el-button>
-        <template #dropdown><el-dropdown-menu><el-dropdown-item :icon="Setting" @click="aiSettingsOpen = true">学习服务设置</el-dropdown-item><el-dropdown-item divided @click="logout">退出</el-dropdown-item></el-dropdown-menu></template>
+        <template #dropdown><el-dropdown-menu><el-dropdown-item :icon="Share" @click="openSharingSettings">自习数据共享</el-dropdown-item><el-dropdown-item :icon="Setting" @click="aiSettingsOpen = true">学习服务设置</el-dropdown-item><el-dropdown-item divided @click="logout">退出</el-dropdown-item></el-dropdown-menu></template>
       </el-dropdown>
     </header>
     <div class="student-app-grid">
@@ -1356,7 +1362,7 @@ onUnmounted(async () => {
             : 'info'
       "
       :closable="false"
-      class="upload-status"
+      :class="['upload-status', { 'is-processing': ['uploading', 'processing'].includes(uploadState.stage) }]"
     />
     <el-progress
       v-if="uploadState.stage === 'uploading'"
@@ -1775,10 +1781,11 @@ onUnmounted(async () => {
             <StudyCardDeck v-if="cardView === 'deck'" :cards="blocks" :course-id="courseId"/>
             <div v-else class="knowledge-card-grid">
             <el-card
-              v-for="block in blocks"
+              v-for="(block, index) in blocks"
               :key="block.block_id"
               shadow="never"
               class="knowledge-card"
+              :style="{ '--motion-index': index }"
               ><div class="knowledge-card-heading">
                 <div class="knowledge-card-title">
                   <b>{{ block.title }}</b>
@@ -1978,110 +1985,103 @@ onUnmounted(async () => {
           ></el-dialog
         ></el-tab-pane
       >
-      <el-tab-pane name="training" label="训练巩固"
-        ><el-card shadow="never"
-          ><template #header><b>选择一张知识卡片</b></template
-          ><el-select v-model="trainingBlockId" placeholder="选择训练卡片"
-            ><el-option
-              v-for="block in blocks"
-              :key="block.block_id"
-              :label="block.title"
-              :value="block.block_id" /></el-select
-        ></el-card>
-        <div v-if="trainingBlock" class="student-two-column training-columns">
-          <el-card shadow="never"
-            ><template #header><b>关键词挖空</b></template
-            ><el-input
-              v-model="extraKeywords"
-              placeholder="手动追加重点词，逗号分隔" /><el-button
-              type="primary"
-              class="form-button"
-              @click="generateCloze"
-              >生成挖空</el-button
-            >
-            <div v-if="cloze" class="cloze-panel">
-              <h3>{{ cloze.title }}</h3>
-              <el-alert
-                v-if="cloze.keyword_source === 'AI 分析重点'"
-                type="success"
-                :closable="false"
-                :title="`已提取 ${cloze.keywords?.length || 0} 个重点用于挖空`"
-              />
-              <p v-if="cloze.keywords?.length" class="muted small">
-                本次重点：{{ cloze.keywords.join("、") }}
-              </p>
-              <p class="cloze-text">
-                <template
-                  v-for="(segment, index) in cloze.segments"
-                  :key="index"
-                  ><span v-if="segment.type === 'text'">{{
-                    segment.value
-                  }}</span
-                  ><el-tag v-else type="warning"
-                    >第 {{ segment.index }} 空</el-tag
-                  ></template
-                >
-              </p>
-              <div class="cloze-inputs">
-                <el-input
-                  v-for="(_, index) in clozeResponses"
-                  :key="index"
-                  v-model="clozeResponses[Number(index)]"
-                  :placeholder="`第 ${Number(index) + 1} 空`"
-                />
+      <el-tab-pane name="training" label="训练巩固">
+        <section class="training-workspace" aria-label="训练巩固工作台">
+          <div class="training-context-card">
+            <div class="training-context-copy">
+              <div class="training-eyebrow"><span>学习训练台</span><span>ACTIVE SESSION</span></div>
+              <div class="training-context-title"><b>{{ trainingBlock?.title || "选择一张知识卡片" }}</b><el-tag v-if="trainingBlock" size="small" effect="plain">第 {{ trainingIndex + 1 }} / {{ blocks.length }} 张</el-tag></div>
+              <p>{{ trainingBlock ? "围绕当前知识点完成听读、复述和记忆提取。" : "先选择一张知识卡片，再开始训练。" }}</p>
+            </div>
+            <div class="training-context-select">
+              <label for="training-card-picker">训练卡片</label>
+              <el-select id="training-card-picker" v-model="trainingBlockId" placeholder="选择训练卡片">
+                <el-option v-for="block in blocks" :key="block.block_id" :label="block.title" :value="block.block_id" />
+              </el-select>
+            </div>
+          </div>
+
+          <div v-if="trainingBlock" class="training-layout">
+            <section class="training-panel recall-panel">
+              <div class="training-panel-heading">
+                <span class="training-step-mark">01</span>
+                <div><span class="training-panel-kicker">RECALL</span><h2>记忆提取</h2><p>先从重点词回想完整知识，再核对答案。</p></div>
+                <el-tag v-if="clozeResult" size="small" :type="clozeResult.score >= 60 ? 'success' : 'warning'">{{ clozeResult.score }}%</el-tag>
+                <el-tag v-else size="small" type="info">待开始</el-tag>
               </div>
-              <el-button type="primary" @click="submitCloze"
-                >提交并检测</el-button
-              >
-            </div>
-            <el-result
-              v-if="clozeResult"
-              :icon="clozeResult.score >= 60 ? 'success' : 'warning'"
-              :title="`正确率 ${clozeResult.score}%`"
-              :sub-title="`答对 ${clozeResult.correct_count} / ${clozeResult.total} 空`" /></el-card
-          ><el-card shadow="never"
-            ><template #header><b>听觉强化与跟读</b></template>
-            <p class="muted">
-              先听一遍，再用自己的话复述。自动切换中英文发音，音色取决于浏览器可用语音；跟读录音仅用于本地回听。
-            </p>
-            <el-slider
-              v-model="speechRate"
-              :min="0.75"
-              :max="2"
-              :step="0.25"
-              :disabled="speechState !== 'idle'"
-              aria-label="朗读速度"
-              show-stops />
-            <div class="speech-controls">
-              <el-button type="primary" :disabled="!speech" @click="speakBlock">{{ speechState === 'idle' ? '朗读当前卡片' : '重新朗读' }}</el-button>
-              <el-button :disabled="speechState === 'idle'" @click="speechState === 'paused' ? speech?.resume() : speech?.pause()">{{ speechState === 'paused' ? '继续朗读' : '暂停朗读' }}</el-button>
-              <el-button :disabled="speechState === 'idle'" @click="speech?.stop()">停止朗读</el-button>
-              <span class="muted" role="status">{{ speechState === 'paused' ? '已暂停' : speechState === 'speaking' ? '正在朗读' : '未朗读' }} · {{ speechRate }} 倍速</span>
-            </div>
-            <el-divider /><el-input
-              v-model="recitedText"
-              type="textarea"
-              :rows="6"
-              placeholder="输入你的复述内容，检查遗漏与理解偏差" /><el-button
-              class="form-button"
-              @click="evaluateRecitation"
-              >检测复述</el-button
-            ><el-result
-              v-if="recitationResult"
-              :title="`背诵评分 ${recitationResult.score}`"
-              :sub-title="recitationResult.feedback" /><el-divider /><el-button
-              plain
-              @click="toggleRecording"
-              >{{ recording ? "停止录音" : "录一段跟读" }}</el-button
-            ><audio
-              v-if="audioUrl"
-              :src="audioUrl"
-              controls
-              class="audio-player"
-          /></el-card>
-        </div>
-        <el-empty v-else description="请先在知识卡片中生成至少一张卡片"
-      /></el-tab-pane>
+
+              <div class="training-card-context">
+                <span>当前卡片</span>
+                <strong>{{ trainingBlock.title }}</strong>
+                <div class="training-keywords">
+                  <el-tag v-for="keyword in trainingBlock.keywords || []" :key="keyword" size="small" effect="plain">{{ keyword }}</el-tag>
+                  <small v-if="!trainingBlock.keywords?.length">暂无提取重点，可手动追加。</small>
+                </div>
+              </div>
+
+              <div class="training-form-block">
+                <div class="training-label-row"><span>追加重点词</span><small>可选 · 用逗号分隔</small></div>
+                <el-input v-model="extraKeywords" placeholder="例如：索引、范式、事务" />
+                <el-button type="primary" class="training-primary-action" @click="generateCloze">生成挖空</el-button>
+              </div>
+
+              <div v-if="cloze" class="cloze-panel training-result-panel">
+                <div class="training-result-heading"><span>挖空练习</span><small>{{ cloze.segments?.length || 0 }} 个内容片段</small></div>
+                <h3>{{ cloze.title }}</h3>
+                <el-alert v-if="cloze.keyword_source === 'AI 分析重点'" type="success" :closable="false" :title="`已提取 ${cloze.keywords?.length || 0} 个重点用于挖空`" />
+                <p v-if="cloze.keywords?.length" class="muted small">本次重点：{{ cloze.keywords.join("、") }}</p>
+                <p class="cloze-text"><template v-for="(segment, index) in cloze.segments" :key="index"><span v-if="segment.type === 'text'">{{ segment.value }}</span><el-tag v-else type="warning">第 {{ segment.index }} 空</el-tag></template></p>
+                <div class="cloze-inputs"><el-input v-for="(_, index) in clozeResponses" :key="index" v-model="clozeResponses[Number(index)]" :placeholder="`第 ${Number(index) + 1} 空`" /></div>
+                <el-button type="primary" @click="submitCloze">提交并检测</el-button>
+              </div>
+              <div v-else class="training-empty-state"><span class="training-empty-mark">回想</span><strong>生成一组挖空，开始检验记忆</strong><p>系统会根据当前卡片的重点内容生成练习。</p></div>
+              <el-result v-if="clozeResult" :icon="clozeResult.score >= 60 ? 'success' : 'warning'" :title="`正确率 ${clozeResult.score}%`" :sub-title="`答对 ${clozeResult.correct_count} / ${clozeResult.total} 空`" />
+            </section>
+
+            <section class="training-panel audio-panel">
+              <div class="training-panel-heading">
+                <span class="training-step-mark">02</span>
+                <div><span class="training-panel-kicker">LISTEN & SPEAK</span><h2>听觉强化与跟读</h2><p>听一遍、说一遍、录一遍，把知识点变成自己的表达。</p></div>
+                <span class="training-live-dot" :class="{ active: speechState !== 'idle' || recording }">{{ speechState !== 'idle' || recording ? '进行中' : '未开始' }}</span>
+              </div>
+
+              <div class="training-stage-list">
+                <article class="training-stage-item">
+                  <span class="training-stage-index">A</span>
+                  <div class="training-stage-content">
+                    <div class="training-stage-title"><strong>先听一遍</strong><small>自动切换中英文发音</small></div>
+                    <el-slider v-model="speechRate" :min="0.75" :max="2" :step="0.25" :disabled="speechState !== 'idle'" aria-label="朗读速度" show-stops />
+                    <div class="speech-controls">
+                      <el-button type="primary" :disabled="!speech" @click="speakBlock">{{ speechState === 'idle' ? '朗读当前卡片' : '重新朗读' }}</el-button>
+                      <el-button :disabled="speechState === 'idle'" @click="speechState === 'paused' ? speech?.resume() : speech?.pause()">{{ speechState === 'paused' ? '继续朗读' : '暂停朗读' }}</el-button>
+                      <el-button :disabled="speechState === 'idle'" @click="speech?.stop()">停止朗读</el-button>
+                      <span class="muted" role="status">{{ speechState === 'paused' ? '已暂停' : speechState === 'speaking' ? '正在朗读' : '未朗读' }} · {{ speechRate }} 倍速</span>
+                    </div>
+                  </div>
+                </article>
+                <article class="training-stage-item">
+                  <span class="training-stage-index">B</span>
+                  <div class="training-stage-content">
+                    <div class="training-stage-title"><strong>复述检查</strong><small>用自己的话写下理解</small></div>
+                    <el-input v-model="recitedText" type="textarea" :rows="5" placeholder="输入你的复述内容，检查遗漏与理解偏差" />
+                    <el-button class="training-secondary-action" @click="evaluateRecitation">检测复述</el-button>
+                    <el-result v-if="recitationResult" :title="`背诵评分 ${recitationResult.score}`" :sub-title="recitationResult.feedback" />
+                  </div>
+                </article>
+                <article class="training-stage-item">
+                  <span class="training-stage-index">C</span>
+                  <div class="training-stage-content">
+                    <div class="training-stage-title"><strong>跟读记录</strong><small>录音仅保存在当前浏览器</small></div>
+                    <el-button plain @click="toggleRecording">{{ recording ? "停止录音" : "录一段跟读" }}</el-button>
+                    <audio v-if="audioUrl" :src="audioUrl" controls class="audio-player" />
+                  </div>
+                </article>
+              </div>
+            </section>
+          </div>
+          <el-empty v-else description="请先在知识卡片中生成至少一张卡片" />
+        </section>
+      </el-tab-pane>
       <el-tab-pane name="practice" label="作答与测验"
         ><el-card
           v-if="selectedCourse?.course_type === 'shared_course'"
@@ -2416,7 +2416,7 @@ onUnmounted(async () => {
 @media(max-width:1100px){.student-header{align-items:flex-start}.student-grid{grid-template-columns:minmax(0,1fr) 240px}.course-selector{grid-template-columns:70px minmax(180px,1fr)}.course-selector>.muted{grid-column:2}.student-account{flex-wrap:wrap;justify-content:flex-end}}
 @media(max-width:760px){.student-grid{grid-template-columns:1fr}.student-header{display:block}.student-account{justify-content:flex-start}.course-strip-main{flex-wrap:wrap}}
 .source-jumps{display:grid;gap:8px;margin-top:10px}.source-jump{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px;border:1px solid #dce8e5;border-radius:8px;background:#f5faf8}.source-jump span{min-width:0;overflow-wrap:anywhere;font-size:13px;color:#47685f}.source-jump .el-button{flex-shrink:0}
-.speech-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.training-workspace{display:grid;gap:16px}.training-context-card{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,360px);align-items:stretch;gap:20px;padding:22px 24px;border:1px solid #dce1d4;border-radius:14px;background:#fcfcf8;box-shadow:0 12px 28px rgba(41,75,60,.06)}.training-context-copy{display:grid;align-content:center;gap:8px;min-width:0}.training-eyebrow{display:flex;align-items:center;gap:10px;color:#72806e;font-size:10px;letter-spacing:.12em}.training-eyebrow span:last-child{color:#9ba494;font-size:9px}.training-context-title{display:flex;align-items:center;gap:10px;min-width:0}.training-context-title b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#294b3c;font-size:22px;line-height:1.35}.training-context-title .el-tag{flex-shrink:0}.training-context-copy p{margin:0;color:#687563;font-size:12px;line-height:1.7}.training-context-select{display:grid;align-content:center;gap:7px;padding-left:20px;border-left:1px solid #dce1d4}.training-context-select label{color:#56634d;font-size:12px;font-weight:600}.training-context-select :deep(.el-select){width:100%}.training-layout{display:grid;grid-template-columns:minmax(320px,.86fr) minmax(0,1.14fr);gap:16px;align-items:start}.training-panel{min-width:0;border:1px solid #dce1d4;border-radius:14px;background:#fcfcf8;box-shadow:0 10px 24px rgba(41,75,60,.045);overflow:hidden}.training-panel-heading{display:grid;grid-template-columns:40px minmax(0,1fr) auto;align-items:start;gap:12px;padding:22px 24px 18px;border-bottom:1px solid #e3e8dd}.training-step-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:#e4e9da;color:#294b3c;font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}.training-panel-heading>div{display:grid;gap:3px;min-width:0}.training-panel-kicker{color:#81907d;font-size:9px;letter-spacing:.14em}.training-panel-heading h2{margin:0;color:#294b3c;font-size:18px;line-height:1.4}.training-panel-heading p{margin:1px 0 0;color:#687563;font-size:12px;line-height:1.65}.training-live-dot{align-self:center;white-space:nowrap;padding:5px 9px;border-radius:999px;background:#edf0e7;color:#74806e;font-size:11px}.training-live-dot.active{background:#e4e9da;color:#294b3c}.training-card-context{display:grid;gap:7px;margin:20px 24px 0;padding:15px 16px;border:1px solid #dce1d4;border-radius:10px;background:#f4f5ed}.training-card-context>span{color:#7b8776;font-size:11px}.training-card-context>strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#294b3c;font-size:15px}.training-keywords{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-height:22px}.training-keywords small{color:#7b8776;font-size:11px}.training-form-block{display:grid;gap:9px;margin:18px 24px 0}.training-label-row{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#56634d;font-size:12px;font-weight:600}.training-label-row small{color:#8b9586;font-size:11px;font-weight:400}.training-primary-action{width:max-content;min-width:104px;margin:0}.training-empty-state{display:grid;justify-items:center;gap:7px;min-height:190px;margin:20px 24px 24px;padding:28px 20px;border:1px dashed #ccd7c6;border-radius:12px;background:#f7f8f2;text-align:center}.training-empty-mark{display:grid;place-items:center;width:46px;height:46px;border-radius:50%;background:#e4e9da;color:#5d7350;font-size:12px}.training-empty-state strong{color:#294b3c;font-size:14px}.training-empty-state p{margin:0;color:#7b8776;font-size:12px}.training-result-panel{margin:20px 24px 0;padding:16px;border:1px solid #dce1d4;border-radius:10px;background:#f7f8f2}.training-result-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;color:#294b3c;font-size:13px;font-weight:600}.training-result-heading small{color:#7b8776;font-size:11px;font-weight:400}.training-result-panel h3{margin:0 0 12px;color:#294b3c;font-size:16px;line-height:1.5}.training-result-panel .cloze-text{margin:14px 0;line-height:2}.training-result-panel .cloze-inputs{display:grid;gap:8px;margin:14px 0}.recall-panel>.el-result{padding:18px 24px 24px}.training-stage-list{padding:0 24px 8px}.training-stage-item{display:grid;grid-template-columns:30px minmax(0,1fr);gap:14px;padding:22px 0;border-top:1px solid #e3e8dd}.training-stage-item:first-child{border-top:0}.training-stage-index{display:grid;place-items:center;width:28px;height:28px;border:1px solid #cbd7c9;border-radius:9px;color:#5d7350;font-size:11px;font-weight:700}.training-stage-content{display:grid;gap:11px;min-width:0}.training-stage-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.training-stage-title strong{color:#294b3c;font-size:14px}.training-stage-title small{color:#7b8776;font-size:11px}.training-stage-content :deep(.el-slider){margin:2px 5px 0}.training-stage-content :deep(.el-textarea__inner){min-height:112px}.training-secondary-action{width:max-content;margin:0}.training-stage-content :deep(.el-result){padding:10px 0 0;text-align:left}.training-stage-content :deep(.el-result__icon){display:none}.training-stage-content :deep(.el-result__title),.training-stage-content :deep(.el-result__subtitle){text-align:left}.audio-player{width:100%;max-width:420px}.speech-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .speech-controls .el-button + .el-button { margin-left: 0; }
 .knowledge-card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}.knowledge-card-title{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 160px;overflow-wrap:anywhere}.knowledge-card-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:auto}.knowledge-card-tools :deep(.el-button+.el-button){margin-left:0}
 .split-visual{display:grid;gap:10px;margin-top:14px;padding:14px;border:1px solid #dce8e5;border-radius:12px;background:#f7fbfa}.split-heading{display:flex;justify-content:space-between;gap:16px;color:#315b55}.split-heading span{font-size:12px;color:#718580}.split-preview{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:12px;align-items:stretch}.split-preview article{min-width:0;padding:12px;border:1px solid #dfe9e6;border-radius:9px;background:#fff}.split-preview pre{max-height:180px;margin:9px 0 0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;line-height:1.6;color:#45645f}.split-preview>i{display:grid;place-items:center;padding:0 4px;border-left:2px dashed #e69b48;color:#a75d16;font-size:12px;font-style:normal;writing-mode:vertical-rl}@media(max-width:700px){.split-preview{grid-template-columns:1fr}.split-preview>i{border-left:0;border-top:2px dashed #e69b48;writing-mode:horizontal-tb;padding:7px}}
@@ -2428,9 +2428,15 @@ onUnmounted(async () => {
 .student-topbar{height:78px;display:flex;align-items:center;gap:36px;border-bottom:1px solid #e0e8e3;margin-bottom:18px}.student-brand{display:flex;align-items:center;gap:12px;min-width:208px;text-decoration:none;color:#193e38;font-size:22px;font-weight:650}.student-brand>.el-icon{font-size:32px;color:#294b3c}.student-brand small{display:block;font-size:10px;font-weight:400;letter-spacing:.15em;color:#56634d;margin-top:3px}.student-topbar nav{display:flex;gap:32px;align-self:stretch;align-items:center;flex:1}.student-topbar nav a{font-size:14px;text-decoration:none;color:#56634d;height:100%;display:flex;align-items:center;position:relative;white-space:nowrap}.student-topbar nav a.router-link-active{color:#294b3c;font-weight:600}.student-topbar nav a.router-link-active::after{content:'';position:absolute;bottom:12px;left:0;right:0;height:2px;background:#294b3c;border-radius:2px}.account-menu{gap:12px;max-width:230px}.account-menu :deep(span){overflow:hidden;text-overflow:ellipsis}
 .student-app-grid{display:grid;grid-template-columns:210px minmax(0,1fr);gap:18px;align-items:start}.student-main{min-width:0}.student-course-nav{position:sticky;top:18px;min-height:calc(100dvh - 120px);max-height:calc(100dvh - 36px);display:flex;flex-direction:column;background:#fcfcf8;border:1px solid #dce1d4;border-radius:12px;padding:18px 10px 0;overflow:auto}.course-nav-heading{display:flex;align-items:center;justify-content:space-between;padding:0 6px 8px;gap:10px}.course-nav-toggle{border:0;background:none;font:inherit;font-size:15px;font-weight:600;color:#293c30;padding:4px;cursor:pointer}.course-nav-toggle .el-icon{display:none}.course-nav-group{padding:16px 0}.course-nav-group+.course-nav-group{border-top:1px solid #dce1d4}.course-nav-group h2{font-size:13px;margin:0 10px 7px}.course-nav-group p{font-size:11px;line-height:1.7;color:#56634d;margin:0 10px 12px}.course-nav-item{display:flex;align-items:center;text-align:left;gap:10px;width:100%;padding:12px 11px;border:0;border-radius:7px;margin:3px 0;background:transparent;color:#495741;font:inherit;font-size:13px;cursor:pointer;min-width:0}.course-nav-item span{overflow-wrap:anywhere;line-height:1.5}.course-nav-item .el-icon{font-size:17px;flex-shrink:0}.course-nav-item.selected{background:#e4e9da;color:#294b3c;font-weight:600}.course-nav-item:hover{background:#edf0e7}.course-nav-art{margin-top:auto;padding-top:26px;overflow:hidden}.course-nav-art>span{display:block;font-size:11px;color:#56634d;margin:0 10px 22px}.student-header{position:relative;display:flex;align-items:center;min-height:76px;margin:0 0 14px;padding:6px 16px;overflow:hidden}.student-header .page-title{display:flex;gap:20px;align-items:baseline;position:relative;z-index:1}.student-header h1{font-size:28px;letter-spacing:-.025em;margin:0}.student-header .study-artwork{position:absolute;right:0;top:-8px;width:138px;height:96px;opacity:.5}.student-header p{font-size:13px;max-width:40ch}.course-strip{margin-bottom:14px;border-color:#dce1d4;border-radius:10px}.course-strip :deep(.el-card__body){padding:12px 16px}.course-strip-main{display:flex;align-items:center;gap:12px}.course-selector{display:grid;grid-template-columns:auto minmax(150px,240px);gap:10px;align-items:center;flex:1}.course-selector>.muted{grid-column:1/-1;font-size:12px}.course-selector label{font-size:12px;font-weight:600}.learning-workspace{margin-top:0}.student-workspace-tabs :deep(.el-tabs__header){margin:0 0 14px;background:#fcfcf8;border:1px solid #dce1d4;border-radius:9px;padding:0 12px}.student-workspace-tabs :deep(.el-tabs__item){height:49px;font-size:13px;padding:0 16px}.student-workspace-tabs :deep(.el-tabs__nav-wrap::after){display:none}.student-workspace-tabs :deep(.el-tabs__active-bar){height:3px;background:#294b3c}.student-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,32%);gap:16px}.student-grid>*{min-width:0}.student-workspace-tabs :deep(.el-card){border-color:#dce1d4;border-radius:10px}.student-workspace-tabs :deep(.el-card__header){padding:16px 18px}.student-workspace-tabs :deep(.el-card__body){padding:18px}.qa-panel :deep(>.el-card__body){display:flex;flex-direction:column;min-height:480px}.qa-composer{order:5;margin-top:20px;padding-top:18px;border-top:1px solid #e4ece7}.qa-composer>label{display:block;font-size:12px;color:#56634d;margin-bottom:8px}.qa-composer>.el-select{margin-bottom:10px}.qa-composer>.form-button{margin-top:10px}.qa-welcome{margin:auto 0;padding:40px 22px;max-width:55ch}.qa-welcome>.el-icon{font-size:30px;color:#294b3c;margin-bottom:14px}.qa-welcome h2{font-size:24px;font-weight:600;margin:0 0 12px}.qa-welcome p{font-size:14px;line-height:1.8;margin:0 0 8px;color:#56634d}.qa-welcome>span{font-size:12px;color:#56634d}.dialogue{margin:0}.dialogue-row{padding:18px 16px;border-radius:8px}.dialogue-row p{font-size:14px;line-height:1.9}.dialogue-row.student{background:#eef5f2}.dialogue-row.assistant{background:transparent}.source-jump{border:1px solid #dce1d4;border-radius:8px;padding:12px;gap:12px;background:#fcfcf8}.source-jump>span{overflow-wrap:anywhere}.profile-column{display:flex;flex-direction:column;gap:16px}.profile-column :deep(.el-card){background:#fcfcf8}.source-inspector{border:1px solid #dce1d4;border-radius:10px;background:#fcfcf8;overflow:hidden}.source-inspector-heading{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:53px;padding:12px 16px;border-bottom:1px solid #e4ece7}.source-inspector-heading h2{font-size:14px;margin:0;font-weight:600}.source-inspector-heading .el-button{margin:0;padding:4px}.source-placeholder{padding:34px 22px;min-height:245px}.source-placeholder>.el-icon{font-size:32px;color:#729889}.source-placeholder h3{font-size:15px;margin:20px 0 10px}.source-placeholder p{font-size:13px;line-height:1.8;color:#56634d}.source-placeholder>span{font-size:11px;color:#56634d}.source-reference-list{padding:12px}.source-reference{width:100%;display:flex;align-items:center;gap:10px;text-align:left;font:inherit;font-size:12px;padding:14px 8px;background:transparent;border:0;border-bottom:1px solid #e4ece7;color:#294b3c;cursor:pointer}.source-reference>span:nth-child(2){flex:1;min-width:0}.source-reference strong,.source-reference small{display:block;overflow-wrap:anywhere;line-height:1.7}.source-reference small{color:#56634d}.source-inspector :deep(.student-material-preview){border:0;margin:0}.source-inspector :deep(.preview-body iframe){height:410px;min-height:260px}.source-inspector :deep(.preview-header){flex-wrap:wrap}.source-inspector :deep(.preview-header b){font-size:12px}.source-inspector :deep(.preview-pagination){flex-wrap:wrap;font-size:12px}.source-inspector :deep(.preview-toolbar){flex-wrap:wrap}.source-inspector :deep(.preview-toolbar .el-select){flex-basis:100%}.source-inspector :deep(.el-card__body){padding:14px}.card-view-switch{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}.card-view-switch>span{font-size:13px;color:#56634d}.student-workspace :deep(.learning-focus){margin-top:18px}.student-workspace :deep(.el-input__inner),.student-workspace :deep(.el-textarea__inner){caret-color:#294b3c}.student-workspace :deep(.el-textarea__inner::placeholder){color:#68705e}.student-workspace :deep(.el-input__inner::placeholder){color:#68705e}.student-workspace :deep(:focus-visible){outline:2px solid #294b3c;outline-offset:3px}.student-workspace ::selection{background:#dce3d3;color:#294b3c}
 @media(prefers-reduced-motion:no-preference){.course-nav-item{transition:background .18s,transform .22s var(--study-ease)}.course-nav-item:hover{transform:translateX(3px)}.student-workspace :deep(.el-button){transition:transform .18s var(--study-ease),background-color .18s}.student-workspace :deep(.el-button:active:not(:disabled)){transform:scale(.97)}.source-slide-enter-active,.source-slide-leave-active{transition:transform .24s var(--study-ease),opacity .18s}.source-slide-enter-from{transform:translateX(20px);opacity:0}.source-slide-leave-to{transform:translateX(8px);opacity:0}.knowledge-card{transition:transform .22s var(--study-ease)}.knowledge-card:hover{transform:translateY(-3px)}}
+@media(prefers-reduced-motion:no-preference){.upload-status.is-processing{animation:upload-status-pulse 1.8s ease-in-out infinite}.upload-status.is-processing :deep(.el-alert__title)::after{content:'';display:inline-block;width:5px;height:5px;margin-left:8px;vertical-align:middle;border-radius:50%;background:#5d7350;box-shadow:0 0 0 0 #5d735066;animation:upload-status-dot 1.4s ease-out infinite}.source-jump{transition:transform .2s var(--study-ease),border-color .18s,background-color .18s}.source-jump:hover{transform:translateY(-2px);border-color:#9dbba8;background:#f2faf5}.knowledge-card{animation:knowledge-card-enter .38s var(--study-ease) both;animation-delay:calc(var(--motion-index, 0) * 35ms)}}
+@keyframes upload-status-pulse{0%,100%{box-shadow:0 0 0 0 rgba(93,115,80,0)}50%{box-shadow:0 6px 18px -14px rgba(41,75,60,.58)}}
+@keyframes upload-status-dot{70%,100%{box-shadow:0 0 0 7px transparent}}
+@keyframes knowledge-card-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 @media(min-width:1500px){.course-selector{grid-template-columns:auto minmax(180px,260px) minmax(0,1fr)}.course-selector>.muted{grid-column:auto}}
 @media(max-width:1200px){.student-app-grid{grid-template-columns:180px minmax(0,1fr);gap:14px}.student-grid{grid-template-columns:minmax(0,1fr) 270px}.student-workspace{padding:0 16px 24px!important}.student-topbar{gap:20px}.student-brand{min-width:176px}.student-topbar nav{gap:20px}.student-header .page-title{display:block}.student-header p{margin-top:8px}.course-strip-main{flex-wrap:wrap}.course-selector{flex-basis:100%}.student-workspace-tabs :deep(.el-tabs__item){padding:0 12px}}
 @media(max-width:1000px){.student-grid{grid-template-columns:minmax(0,1fr)}.profile-column{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.student-topbar{flex-wrap:wrap;height:auto;min-height:76px;padding:12px 0;gap:14px}.student-topbar nav{order:3;flex-basis:100%;height:38px}.student-topbar nav a.router-link-active::after{bottom:0}.student-topbar .el-dropdown{margin-left:auto}.source-inspector :deep(.preview-body iframe){height:360px}}
 @media(max-width:760px){.student-workspace{padding:0 12px 20px!important}.student-app-grid{grid-template-columns:minmax(0,1fr);gap:12px}.student-course-nav{position:static;min-height:0;max-height:none;padding:10px 12px}.course-nav-heading{padding:0}.course-nav-toggle{display:flex;align-items:center;gap:10px}.course-nav-toggle .el-icon{display:inline-flex}.course-nav-groups{display:none}.course-nav-groups.is-open{display:block}.course-nav-art{display:none}.student-brand{font-size:19px;min-width:0}.student-brand>.el-icon{font-size:26px}.account-menu{max-width:160px}.student-topbar nav{gap:22px}.student-topbar nav a{font-size:13px}.student-header{padding:8px 2px;margin-bottom:10px;min-height:70px}.student-header h1{font-size:25px}.student-header p{font-size:12px}.student-header>.study-artwork{opacity:.3;right:-28px;width:112px;height:84px}.course-selector{grid-template-columns:auto minmax(0,1fr)}.course-strip-main>.el-tag{max-width:100%;white-space:normal;height:auto;min-height:24px}.profile-column{display:flex}.student-workspace-tabs :deep(.el-card__header),.student-workspace-tabs :deep(.el-card__body){padding:16px}.qa-panel :deep(>.el-card__body){min-height:420px}.qa-welcome{padding:26px 4px}.qa-welcome h2{font-size:22px}.source-jump{flex-wrap:wrap}.student-workspace-tabs :deep(.el-tabs__header){padding:0 8px}.card-view-switch{flex-wrap:wrap}.source-placeholder{min-height:0;padding:24px}.card-header{flex-wrap:wrap}}
+@media(max-width:980px){.training-context-card{grid-template-columns:1fr}.training-context-select{padding:16px 0 0;border-top:1px solid #dce1d4;border-left:0}.training-layout{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:760px){.training-context-card{padding:18px}.training-context-title{align-items:flex-start;flex-direction:column;gap:6px}.training-context-title b{white-space:normal;font-size:19px}.training-panel-heading{padding:18px 16px 16px;grid-template-columns:34px minmax(0,1fr)}.training-panel-heading>.el-tag,.training-live-dot{grid-column:2;justify-self:start}.training-card-context,.training-form-block,.training-empty-state,.training-result-panel{margin-left:16px;margin-right:16px}.training-stage-list{padding-inline:16px}.training-stage-title{align-items:flex-start;flex-direction:column;gap:4px}.training-panel-heading h2{font-size:17px}}
 
 </style>

@@ -126,7 +126,7 @@ zhijiao_banxue/
 
 ## 快速启动
 
-支持 Python 3.10、3.11 和 3.12；前端需要 Node.js 20 或更高版本。启动器会在项目目录创建隔离虚拟环境，不会替换系统 Python 或 Anaconda。
+支持 Python 3.10、3.11 和 3.12；前端推荐 Node.js 22.12+ 或 24。首次启动需要联网安装 Python 和 npm 依赖。启动器会在项目目录创建虚拟环境，不会替换系统 Python 或 Anaconda。
 
 ```powershell
 cd zhijiao_banxue

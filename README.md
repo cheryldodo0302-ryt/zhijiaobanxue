@@ -1,6 +1,6 @@
 # 智教伴学
 
-这是智教伴学当前发布仓库。正式的学生端 + 教师端统一系统位于 [`zhijiao_banxue/`](zhijiao_banxue/)，请以其中的 README、启动脚本和源码为准；仓库根目录保留早期版本文件用于兼容已有部署记录，不代表当前产品入口。
+这是智教伴学当前发布仓库。正式的学生端 + 教师端统一系统位于 [`zhijiao_banxue/`](zhijiao_banxue/)，请以其中的 README、启动脚本和源码为准。根目录的 `start.ps1` 转发到同一套启动器。
 
 当前版本已覆盖学生学习辅助与教师教学辅助：个人/共享课程、文档解析、知识中心审核发布、知识卡片 AI 语义拆分、课程练习、错题与学习画像、AI 自习室、教学班与教学档案、知识图谱、题库和匿名班级学情分析。项目不包含行政办公端。
 
@@ -35,12 +35,23 @@
 
 ## 快速启动
 
-请进入当前版本目录，要求 Python 3.10+、Node.js 20+。
+请先安装 Python 3.10、3.11 或 3.12（推荐 3.12），以及 Node.js 22.12+ 或 24。首次启动需要联网下载 Python 和 npm 依赖。
+
+使用 Git 下载：
+
+```powershell
+git clone --branch main https://github.com/cheryldodo0302-ryt/zhijiaobanxue.git
+cd zhijiaobanxue
+```
+
+也可以在 GitHub 选择 **Code → Download ZIP**，解压后进入包含本 README 的目录。Windows 启动：
 
 ```powershell
 cd zhijiao_banxue
 .\start.ps1 -Mode all
 ```
+
+若 Windows 提示脚本执行被禁用，可在同一目录运行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1 -Mode all`。macOS/Linux 使用 `cd zhijiao_banxue` 后执行 `sh start.sh all`。
 
 常用模式：
 
@@ -56,7 +67,9 @@ cd zhijiao_banxue
 
 默认 AI 模式是离线确定性 Mock，不需要 API Key；也可以在 `zhijiao_banxue` 中配置云中转、OpenAI 兼容接口、Gemini 或 Ollama。空数据库首次启动时生成的演示凭据写入本机 `zhijiao_banxue/data/demo_credentials.txt`，不会提交到 Git。
 
-学生端所有智能能力统一经过 `student_assistant` 编排轻量化 Skill；教师端能力统一经过 `teacher_assistant` 和服务层权限校验。共享课程中的学习反馈只以匿名聚合形式交给教师端，个人课程数据不会进入教师端。
+学生端智能能力通过 `student_assistant` 编排 Skill；教师端复用统一服务层权限校验。常规班级学情使用匿名聚合；任课教师可查看本班正式任务的实名画像及学生主动授权的自习汇总，个人课程和私人问答不进入教师端。
+
+本地教师功能默认关闭。需要使用教师端时，在 `zhijiao_banxue/server.env` 中设置 `ZHIJIAO_TEACHER_AGENT_ENABLED=1`，重启服务后使用本机生成的演示教师账号登录。该文件不上传到 GitHub；完整配置见项目内的 `server.env.example`。
 
 下载后可先执行以下命令验证云端模型：
 
@@ -86,19 +99,21 @@ python -m pytest -q
 
 ## 数据位置
 
-- SQLite：`data/learning.db`
-- 上传文件：`data/uploads/<course_id>/`
-- 演示原始资料：`course_materials/`
+- SQLite：`zhijiao_banxue/data/learning.db`
+- 上传文件：`zhijiao_banxue/data/uploads/<course_id>/`
+- 演示原始资料：`zhijiao_banxue/course_materials/`
 
 如需把运行数据放到其他位置，可设置环境变量 `ZHIJIAO_DATA_DIR`。
 
-个人课程不会进入教师统计；教师端的班级分析只读取共享课程数据且不返回学生 ID。Vue、FastAPI 和统一 Agent 接口均复用服务层，不能绕过这些规则。
+个人课程不会进入教师统计；班级匿名分析和正式任务实名画像遵守各自的授权范围。Vue、FastAPI 和统一 Agent 接口均复用服务层，不能绕过这些规则。
+
+源码包含启动脚本、依赖清单及前端锁文件、配置模板、示例课程和自习室浏览器模型。运行数据库、上传资料、真实密钥、虚拟环境、`node_modules` 和 `dist` 由下载者本机配置或生成，不随源码分发。
 
 ## GitHub 下载者共享云端 AI
 
 项目支持“云端中转”和“用户自定义 OpenAI 兼容接口”两种方式。真实千问
-`DASHSCOPE_API_KEY` 只放在中转服务器环境变量中，不进入 GitHub；下载者默认通过
-`relay_client.env` 连接中转服务，也可在学生端侧栏“AI 服务设置”中填写自己的
+`DASHSCOPE_API_KEY` 只放在中转服务器环境变量中，不进入 GitHub；下载者默认使用离线 Mock 演示模式。真实 AI 能力需要自行配置服务：可参考
+`zhijiao_banxue/relay_client.env.example` 创建本机 `relay_client.env` 连接中转服务，也可在“AI 服务设置”中填写自己的
 Base URL、API Key 和模型。本机自定义配置保存在已被 Git 排除的 `user_ai.env`。
 
-完整部署步骤见 [CLOUD_RELAY_DEPLOYMENT.md](CLOUD_RELAY_DEPLOYMENT.md)。
+完整部署步骤见 [云端 AI 中转部署说明](zhijiao_banxue/CLOUD_RELAY_DEPLOYMENT.md)。高级扫描件/公式解析所需的可选 Worker 见 [文档解析部署说明](zhijiao_banxue/docker/INGESTION.md)。

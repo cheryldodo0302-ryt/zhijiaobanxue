@@ -13,4 +13,5 @@ import './teacher-ui.css'
 import './campus-theme.css'
 import './campus-depth.css'
 import './campus-controls.css'
+import './login-scene.css'
 createApp(App).use(createPinia()).use(router).use(ElementPlus, { locale: zhCn }).mount('#app')

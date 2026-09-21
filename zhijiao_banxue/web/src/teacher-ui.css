@@ -149,3 +149,23 @@
 .teacher-surface .graph-canvas { background: #f4f5ed; }
 .teacher-surface .graph-side :is(h2, b), .teacher-surface .graph-side > button.active { color: #294b3c; }
 .teacher-surface .graph-side > button.active { background: #e4e9da; }
+
+/* Desktop navigation stays fully visible instead of creating a second scroll area. */
+@media (min-width: 761px) {
+  .teacher-surface .teacher-nav { overflow: hidden; }
+  .teacher-surface .teacher-nav nav { flex: 0 0 auto; overflow: visible; }
+  .teacher-surface .teacher-nav-group { gap: 2px; margin-bottom: 12px; }
+  .teacher-surface .teacher-nav .nav-section { padding: 0 10px 4px; }
+  .teacher-surface .teacher-nav nav a { min-height: 42px; padding: 9px 10px; }
+  .teacher-surface .teacher-nav-artwork { margin-top: auto; }
+}
+
+@media (min-width: 761px) and (max-height: 820px) {
+  .teacher-surface .teacher-nav { padding-top: 20px; padding-bottom: 10px; }
+  .teacher-surface .teacher-brand { padding-bottom: 16px; }
+  .teacher-surface .teacher-nav-group { margin-bottom: 8px; }
+  .teacher-surface .teacher-nav .nav-section { padding-bottom: 2px; }
+  .teacher-surface .teacher-nav nav a { min-height: 36px; padding: 6px 10px; font-size: 13px; }
+  .teacher-surface .teacher-nav-artwork { display: none; }
+  .teacher-surface .nav-user { padding-top: 10px; }
+}

@@ -1,16 +1,23 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { ArrowDown, Setting, Share } from '@element-plus/icons-vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
 import { useAuthStore } from '../stores/auth'
 import { BrowserStudyAnalyzer, type StudyAiResult } from '../studyRoomAi'
+import AiSettingsDialog from '../components/AiSettingsDialog.vue'
 
 const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
 const loading = ref(false)
 const status = ref<any>({ status: '等待开始', learning: false, score: 0, focus: 0, study_time: 0 })
 const records = ref<any[]>([])
 const sharingScopes = ref<any[]>([]), sharingGrants = ref<any[]>([]), sharingClass = ref(''), sharingEnabled = ref(false)
 const sharingBusy = ref(false)
+const sharingDialogOpen = ref(false)
+const aiSettingsOpen = ref(false)
 async function loadSharing() {
   try {
     const [scopes, grants] = await Promise.all([api.get('/student/task-scopes'), api.get('/student/study-room/grants')])
@@ -21,6 +28,19 @@ async function revokeSharing(id: string) {
   sharingBusy.value = true
   try { await api.delete(`/student/study-room/grants/${id}`); sharingEnabled.value = false; await loadSharing(); ElMessage.success('已撤销授权，相关教师评价已失效') }
   catch { ElMessage.error('撤销失败，请重试') } finally { sharingBusy.value = false }
+}
+async function saveSharingGrant() {
+  const scope = sharingScopes.value.find(s => s.class_id === sharingClass.value)
+  if (!scope) return ElMessage.warning('请选择要共享的课程与班级')
+  sharingBusy.value = true
+  try {
+    await api.post('/student/study-room/grants', { course_id: scope.course_id, class_id: scope.class_id })
+    sharingEnabled.value = true
+    await loadSharing()
+    ElMessage.success('自习共享授权已保存')
+  } catch (error: any) {
+    ElMessage.error(error.response?.data?.detail || '保存授权失败，请重试')
+  } finally { sharingBusy.value = false }
 }
 const statistics = ref<any>({ total_sessions: 0, total_study_time: 0, average_score: 0, average_focus: 0, best_score: 0 })
 const videoRef = ref<HTMLVideoElement | null>(null)
@@ -224,6 +244,13 @@ async function clearHistory() {
 
 async function logout() { await auth.logout(); location.href = '/login' }
 onMounted(() => { loadData(); loadSharing(); startPolling() })
+onMounted(async () => {
+  if (route.query.sharing === 'settings') {
+    sharingDialogOpen.value = true
+    const { sharing: _sharing, ...query } = route.query
+    await router.replace({ path: route.path, query })
+  }
+})
 onUnmounted(() => {
   if (poller) window.clearInterval(poller)
   stopStudyCamera()
@@ -233,15 +260,6 @@ onUnmounted(() => {
 
 <template>
   <main class="content student-study-room" :aria-busy="loading">
-    <el-card shadow="never">
-      <h3>自习数据共享（可选）</h3>
-      <p v-if="isLearning">当前会话：{{status.sharing_grant_id && sharingGrants.some(g=>g.grant_id===status.sharing_grant_id) ? '已关联课程并授权共享' : '仅自己可见'}}</p>
-      <p class="muted">默认仅自己可见。主动授权后，任课教师可查看关联课程的新自习汇总；不会共享历史私人记录或摄像头画面。</p>
-      <el-checkbox v-model="sharingEnabled" :disabled="isLearning || loading">本次关联课程，并授权任课教师查看汇总</el-checkbox>
-      <el-select v-if="sharingEnabled" v-model="sharingClass" placeholder="课程与教学班" :disabled="isLearning || loading"><el-option v-for="s in sharingScopes" :key="s.class_id" :value="s.class_id" :label="`${s.course_name} · ${s.class_name}`"/></el-select>
-      <p v-for="g in sharingGrants" :key="g.grant_id">已授权：{{sharingScopes.find(s=>s.class_id===g.class_id)?.class_name || '历史教学班'}} <el-button text type="danger" :loading="sharingBusy" @click="revokeSharing(g.grant_id)">撤销授权</el-button></p>
-      <small class="muted">撤销后教师不能再查看该授权的数据；重新授权不恢复旧记录。有效采样累计不足 60 秒时不生成专注参考值，未开启摄像头或采样不足不会计为低专注。</small>
-    </el-card>
     <header class="student-header">
       <div class="page-title">
         <h1>自习室</h1>
@@ -249,8 +267,16 @@ onUnmounted(() => {
       </div>
       <div class="student-account">
         <el-button plain @click="$router.push('/student/courses')">返回课程</el-button>
-        <span>{{ auth.user?.display_name || auth.user?.username }}</span>
-        <el-button @click="logout">退出</el-button>
+        <el-dropdown trigger="click" placement="bottom-end">
+          <el-button class="account-menu">{{ auth.user?.display_name || auth.user?.username }}<el-icon><ArrowDown /></el-icon></el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item :icon="Share" @click="sharingDialogOpen = true">自习数据共享</el-dropdown-item>
+              <el-dropdown-item :icon="Setting" @click="aiSettingsOpen = true">学习服务设置</el-dropdown-item>
+              <el-dropdown-item divided @click="logout">退出</el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
       </div>
     </header>
 
@@ -258,6 +284,7 @@ onUnmounted(() => {
       <div>
         <h2>{{ isLearning ? '保持自己的节奏，系统会记录本场变化' : '准备好后开始一场专注自习' }}</h2>
         <p class="study-room-warning">{{ cameraMessage }}</p>
+        <p class="study-room-privacy">{{ isLearning && status.sharing_grant_id ? '本场已关联授权课程，只共享新的脱敏汇总。' : '默认仅自己可见，可在姓名菜单中管理共享授权。' }}</p>
       </div>
       <div class="study-room-actions">
         <el-button v-if="!isLearning" type="primary" size="large" :loading="loading" @click="startStudy">开始自习</el-button>
@@ -303,5 +330,52 @@ onUnmounted(() => {
         <el-table-column prop="evaluation" label="评价" min-width="260" />
       </el-table>
     </el-card>
+
+    <el-dialog v-model="sharingDialogOpen" title="自习数据共享" width="min(640px, 94vw)" append-to-body class="sharing-dialog">
+      <div class="sharing-dialog-body">
+        <div class="sharing-dialog-intro">
+          <span class="sharing-dialog-kicker">隐私边界</span>
+          <h2>只共享你主动关联的新记录</h2>
+          <p>默认仅自己可见。授权后，任课教师只能在对应课程和教学班查看自习汇总，不会看到私人问答、个人课程、摄像头画面或逐帧信号。</p>
+        </div>
+        <el-alert title="撤销授权会使相关旧评价失效，再次授权也不会恢复撤销前的记录。" type="info" :closable="false" />
+        <div class="sharing-dialog-section">
+          <div class="sharing-section-heading"><b>本次自习</b><span class="muted small">开始前可选择关联范围</span></div>
+          <el-checkbox v-model="sharingEnabled" :disabled="isLearning || loading">本次关联课程，并授权任课教师查看汇总</el-checkbox>
+          <el-select v-if="sharingEnabled" v-model="sharingClass" class="sharing-scope-select" placeholder="选择课程与教学班" :disabled="isLearning || loading">
+            <el-option v-for="scope in sharingScopes" :key="scope.class_id" :value="scope.class_id" :label="`${scope.course_name} · ${scope.class_name}`" />
+          </el-select>
+        </div>
+        <div class="sharing-dialog-section">
+          <div class="sharing-section-heading"><b>当前授权</b><span class="muted small">{{ sharingGrants.length ? `${sharingGrants.length} 项有效授权` : '暂无有效授权' }}</span></div>
+          <el-empty v-if="!sharingGrants.length" :image-size="64" description="还没有授权的课程与教学班" />
+          <div v-else class="sharing-grants-list">
+            <div v-for="grant in sharingGrants" :key="grant.grant_id" class="sharing-grant-row">
+              <div><strong>{{ sharingScopes.find(scope => scope.class_id === grant.class_id)?.course_name || '历史课程' }}</strong><span>{{ sharingScopes.find(scope => scope.class_id === grant.class_id)?.class_name || '历史教学班' }}</span></div>
+              <el-button text type="danger" :loading="sharingBusy" @click="revokeSharing(grant.grant_id)">撤销授权</el-button>
+            </div>
+          </div>
+        </div>
+        <p class="sharing-dialog-note">有效采样累计不足 60 秒时不生成专注参考值。未开启摄像头或未采集到有效信号，不会被计算为低专注。</p>
+      </div>
+      <template #footer>
+        <el-button @click="sharingDialogOpen = false">关闭</el-button>
+        <el-button v-if="sharingEnabled && sharingClass" type="primary" :loading="sharingBusy" :disabled="isLearning" @click="saveSharingGrant">保存授权</el-button>
+      </template>
+    </el-dialog>
+    <AiSettingsDialog v-model="aiSettingsOpen" />
   </main>
 </template>
+
+<style scoped>
+.student-study-room{--study-ink:#294b3c;--study-muted:#657268;--study-line:#d7e0d5;max-width:1320px;margin:0 auto;padding:34px clamp(16px,4vw,42px) 56px}
+.student-study-room>.student-header{display:flex;align-items:center;justify-content:space-between;gap:28px;margin:0 0 18px;padding:24px 28px;border:1px solid var(--study-line);border-radius:16px;background:rgba(252,252,248,.88);box-shadow:0 12px 28px -22px rgba(41,75,60,.48)}
+.student-study-room>.student-header .page-title{min-width:0}.student-study-room>.student-header h1{margin:0 0 8px;color:var(--study-ink);font-size:clamp(30px,4vw,42px);letter-spacing:-.035em;line-height:1.12}.student-study-room>.student-header p{max-width:62ch;margin:0;color:var(--study-muted);font-size:14px;line-height:1.8}.student-account{display:flex;align-items:center;gap:10px;flex-shrink:0}.account-menu{gap:9px;max-width:180px}.account-menu :deep(span){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.study-room-hero{margin:0 0 24px!important;padding:30px 32px!important;border-radius:16px!important;background:linear-gradient(135deg,#f1f6f0 0%,#fcfcf8 72%)!important;box-shadow:0 18px 34px -28px rgba(41,75,60,.6)!important}.study-room-hero h2{margin:0 0 9px!important;font-size:clamp(22px,3vw,30px)!important;line-height:1.35!important;letter-spacing:-.02em}.study-room-warning{margin:0!important;color:#8b5b28!important;font-size:14px;line-height:1.75}.study-room-privacy{margin:6px 0 0;color:#657268;font-size:12px;line-height:1.7}.study-room-actions{padding-top:2px}.study-room-actions :deep(.el-button){min-width:118px;min-height:42px}
+.study-room-layout{gap:24px!important}.study-camera-card,.study-summary-card,.study-history-card{border-radius:14px!important;overflow:hidden}.study-camera-card :deep(.el-card__header),.study-summary-card :deep(.el-card__header),.study-history-card :deep(.el-card__header){padding:18px 22px;border-bottom-color:#e5ebe3}.study-camera-card :deep(.el-card__body),.study-summary-card :deep(.el-card__body),.study-history-card :deep(.el-card__body){padding:22px}.study-video-placeholder{min-height:300px}.study-metrics>div,.study-summary-grid>div{padding:16px!important;border:1px solid #e3ebe3;background:#f4f8f4!important}.study-history-card{margin-top:24px!important}.study-history-card :deep(.el-table th.el-table__cell){background:#f4f7f1;color:#52665a}.study-history-card :deep(.el-table td.el-table__cell),.study-history-card :deep(.el-table th.el-table__cell){padding:13px 0}
+.sharing-dialog-body{display:grid;gap:18px}.sharing-dialog-intro{padding:4px 2px 0}.sharing-dialog-kicker{display:block;margin-bottom:8px;color:#657f67;font-size:11px;letter-spacing:.12em;font-weight:700}.sharing-dialog-intro h2{margin:0 0 8px;color:#294b3c;font-size:22px;line-height:1.35}.sharing-dialog-intro p,.sharing-dialog-note{margin:0;color:#657268;font-size:13px;line-height:1.85}.sharing-dialog-section{display:grid;gap:12px;padding-top:16px;border-top:1px solid #e5ebe3}.sharing-section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.sharing-scope-select{width:100%}.sharing-grants-list{display:grid;gap:8px}.sharing-grant-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 14px;border:1px solid #dce6dc;border-radius:10px;background:#f8fbf7}.sharing-grant-row>div{display:grid;gap:3px;min-width:0}.sharing-grant-row strong{color:#294b3c;font-size:14px}.sharing-grant-row span{color:#657268;font-size:12px}.sharing-dialog-note{padding:12px 14px;border-radius:10px;background:#f4f6ee;color:#68705e;font-size:12px}
+@media(prefers-reduced-motion:no-preference){.student-study-room>.student-header,.study-room-hero,.study-room-layout,.study-history-card{animation:study-room-enter .42s cubic-bezier(.16,1,.3,1) both}.study-room-hero{animation-delay:.04s}.study-room-layout{animation-delay:.08s}.study-history-card{animation-delay:.12s}.sharing-grant-row{transition:transform .2s cubic-bezier(.16,1,.3,1),border-color .18s,background-color .18s}.sharing-grant-row:hover{transform:translateY(-2px);border-color:#9dbba8;background:#f4faf4}}
+@keyframes study-room-enter{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:760px){.student-study-room{padding:20px 14px 36px}.student-study-room>.student-header{display:block;padding:20px 18px}.student-account{justify-content:flex-start;margin-top:16px;flex-wrap:wrap}.student-study-room>.student-header h1{font-size:30px}.study-room-hero{padding:24px 20px!important}.study-room-actions{margin-top:18px}.study-room-layout{grid-template-columns:1fr}.study-camera-card :deep(.el-card__body),.study-summary-card :deep(.el-card__body),.study-history-card :deep(.el-card__body){padding:16px}.sharing-grant-row{align-items:flex-start;flex-direction:column;gap:8px}}
+@media(prefers-reduced-motion:reduce){.student-study-room>.student-header,.study-room-hero,.study-room-layout,.study-history-card{animation:none}}
+</style>
