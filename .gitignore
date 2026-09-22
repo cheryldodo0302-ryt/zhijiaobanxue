@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.pytest-basetemp*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -11,6 +12,8 @@ htmlcov/
 
 # Virtual environments and packaging output
 .venv/
+.venv-windows/
+.venv-posix/
 venv/
 env/
 build/
@@ -21,12 +24,20 @@ relay-deploy.zip
 relay-deploy-ready.zip
 relay-deploy-linux-x64.zip
 *.egg-info/
+web/node_modules/
+web/dist/
+web/dist-card-preview/
+web/.npm-cache/
+*.tsbuildinfo
+vendor/
+docker/mineru.Dockerfile
 
 # Runtime data and local logs
 data/
 exports/
 tmp/
 temp/
+test_runtime/
 *.db
 *.sqlite
 *.sqlite3
@@ -42,7 +53,9 @@ server.env
 server.env.*
 !server.env.example
 user_ai.env
-.streamlit/secrets.toml
+relay_client.env
+*.pem
+*.key
 
 # Editors and operating-system files
 .idea/

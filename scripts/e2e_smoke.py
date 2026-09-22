@@ -66,7 +66,7 @@ def main() -> int:
     os.environ["NO_PROXY"] = env["NO_PROXY"]
     os.environ["no_proxy"] = env["no_proxy"]
     env["PYTHONPATH"] = os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")])
-    subprocess.run([sys.executable, str(ROOT / "scripts" / "bootstrap_demo.py"), "--if-empty"], env=env, check=True)
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "bootstrap_demo.py"), "--if-empty", "--with-demo-course"], env=env, check=True)
     teacher_password, student_password = credentials(data_dir / "demo_credentials.txt")
     npm = "npm.cmd" if os.name == "nt" else "npm"
     api_log = (data_dir / ".e2e-api.log").open("w", encoding="utf-8")

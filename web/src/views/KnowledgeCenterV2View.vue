@@ -12,6 +12,7 @@ import{buildCompactKnowledgeTree,normalizeTreeTitle,visibleBranchIdentity}from'.
 import {useTeacherWorkspace} from '../teacher-workspace'
 import {useCoursePreferences} from '../course-preferences'
 import { vCardHover } from '../card-hover'
+import { termLabel } from '../term-label'
 
 const courses=ref<any[]>([]),jobs=ref<any[]>([]),trash=ref<any[]>([]),courseId=ref(''),selectedDoc=ref<any>(null),analysis=ref<any>(null),readiness=ref<any>(null)
 const {restoreCourse}=useTeacherWorkspace(courses,courseId)
@@ -111,7 +112,7 @@ const knowledgeNodeStatusLabel=(value:string)=>({draft:'待审核',pending:'待�
 const knowledgeNodeTypeLabel=(value:string)=>({chapter:'章',section:'节',knowledge_point:'知识点'} as Record<string,string>)[String(value||'').toLowerCase()]||value||'知识节点'
 const relationTypeLabel=(value:string)=>({part_of:'整体—部分',prerequisite:'前置关系',progression:'后续进阶',parallel:'并列关系',related:'相关关系'} as Record<string,string>)[String(value||'').toLowerCase()]||value||'关联关系'
 const candidateChapterPath=(candidate:any)=>Array.isArray(candidate?.chapter_path)&&candidate.chapter_path.length?candidate.chapter_path.join(' / '):'未分配章节'
-const teachingLevelLabel=(item:any)=>`${item.academic_year||''} ${item.teaching_period||item.term_name||''} · ${item.class_variant||item.class_name}`.trim()
+const teachingLevelLabel=(item:any)=>`${termLabel(item)} · ${item.class_variant||item.class_name}`.trim()
 const rememberedTeachingScopeLabel=computed(()=>rememberedTeachingScopeIds.value.map(id=>teachingLevels.value.find(item=>item.class_id===id)).filter(Boolean).map(teachingLevelLabel).join('、'))
 const selectedNodeIsCourseWide=computed(()=>Boolean(selectedNode.value&&selectedNode.value.node_type==='knowledge_point'&&!selectedNode.value.class_ids?.length))
 const materialTypes=[

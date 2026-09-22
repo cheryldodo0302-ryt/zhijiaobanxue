@@ -25,6 +25,7 @@ def random_password(length: int = 18) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="创建完全虚构的本地演示账号和课程")
     parser.add_argument("--if-empty", action="store_true", help="数据库已有用户时不修改任何账号")
+    parser.add_argument("--with-demo-course", action="store_true", help="仅供 E2E 验收创建虚构演示课程")
     args = parser.parse_args()
     db = LearningDatabase(DB_PATH)
     auth = AuthService(db)
@@ -46,7 +47,8 @@ def main() -> int:
             except Exception:
                 credentials_match = False
         if credentials_match:
-            campus.seed_demo(MATERIALS_DIR)
+            if args.with_demo_course:
+                campus.seed_demo(MATERIALS_DIR)
             print("[DEMO] 演示账号、密码文件和课程资料一致，无需重置。")
             return 0
         print("[DEMO] 演示账号与本机密码文件不一致，只重建虚构演示账号。")
@@ -65,18 +67,19 @@ def main() -> int:
                VALUES('demo_student_001','demo_student',?,'student','演示学生','DEMO2026','active',0)""",
             (auth.passwords.hash(student_password),),
         )
-    campus.seed_demo(MATERIALS_DIR)
-    campus.enroll_student("virtual_ai_101", "demo_teacher_001", "demo_student_001")
-    with db.connect() as conn:
-        conn.execute("INSERT OR IGNORE INTO terms(term_id,term_name,owner_id) VALUES('term_demo_2026','演示学期','demo_teacher_001')")
-        conn.execute(
-            """INSERT OR IGNORE INTO classes(class_id,course_id,term_id,class_name,teacher_id)
-               VALUES('class_demo_2026','virtual_ai_101','term_demo_2026','演示班','demo_teacher_001')"""
-        )
-        conn.execute(
-            """INSERT OR IGNORE INTO class_memberships(class_id,student_id,anonymous_id,status)
-               VALUES('class_demo_2026','demo_student_001','demo_anonymous_001','active')"""
-        )
+    if args.with_demo_course:
+        campus.seed_demo(MATERIALS_DIR)
+        campus.enroll_student("virtual_ai_101", "demo_teacher_001", "demo_student_001")
+        with db.connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO terms(term_id,term_name,owner_id) VALUES('term_demo_2026','第一学期','demo_teacher_001')")
+            conn.execute(
+                """INSERT OR IGNORE INTO classes(class_id,course_id,term_id,class_name,teacher_id)
+                   VALUES('class_demo_2026','virtual_ai_101','term_demo_2026','演示班','demo_teacher_001')"""
+            )
+            conn.execute(
+                """INSERT OR IGNORE INTO class_memberships(class_id,student_id,anonymous_id,status)
+                   VALUES('class_demo_2026','demo_student_001','demo_anonymous_001','active')"""
+            )
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     credential_file.write_text(
@@ -89,7 +92,9 @@ def main() -> int:
         credential_file.chmod(0o600)
     except OSError:
         pass
-    print("[DEMO] 已创建虚构演示课程和账号。")
+    print("[DEMO] 已创建虚构演示账号。")
+    if args.with_demo_course:
+        print("[DEMO] 已创建仅供验收使用的虚构演示课程。")
     print(f"[DEMO] 账号文件：{credential_file.resolve()}")
     return 0
 

@@ -17,7 +17,7 @@ from account_ai_service import AccountAiService
 from auth_service import AuthService
 from campus_service import CampusError, CampusService, NotFound
 from config import (
-    DB_PATH, MATERIALS_DIR, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB,
+    DB_PATH, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB,
     student_import_config_status,
 )
 from database import LearningDatabase
@@ -32,7 +32,6 @@ from knowledge_graph_service import KnowledgeGraphService
 
 db = LearningDatabase(DB_PATH)
 campus = CampusService(db)
-campus.seed_demo(MATERIALS_DIR)
 agents = CampusAgentService(campus)
 auth = AuthService(db)
 teachers = TeacherService(db, campus)

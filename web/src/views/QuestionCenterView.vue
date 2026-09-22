@@ -5,6 +5,7 @@ import { api } from '../api'
 import { questionAnswerLabel } from '../question-display'
 import { useTeacherWorkspace } from '../teacher-workspace'
 import { useCoursePreferences } from '../course-preferences'
+import { termLabel } from '../term-label'
 
 const courses = ref<any[]>([])
 const courseId = ref('')
@@ -32,6 +33,20 @@ const aiProvider = ref('openai_compatible')
 const aiBaseUrl = ref('')
 const aiModel = ref('')
 const aiApiKey = ref('')
+const taskDialogOpen = ref(false)
+const classes = ref<any[]>([])
+const classId = ref('')
+const taskSources = ref<any[]>([])
+const taskVersionId = ref('')
+const taskSelectedItems = ref<any[]>([])
+const taskTitle = ref('')
+const taskKind = ref('homework')
+const taskDue = ref('')
+const taskPoints = ref<Record<string, number>>({})
+const classTasks = ref<any[]>([])
+const taskLoading = ref(false)
+const taskPublishing = ref(false)
+const taskPublishAttempted = ref(false)
 const fail = (error: any, fallback: string) =>
   ElMessage.error(error.response?.data?.detail || fallback)
 const hasIssue = (item: any) => item.status === 'draft' && (
@@ -59,6 +74,21 @@ const folderGroups = computed(() => ([
   { type: 'chapter', title: '章节练习', subtitle: '按章节组织的练习集', folders: folders.value.filter(folder => !['exam','homework'].includes(folder.folder_type)) },
 ]))
 const allVisibleSelected = computed(() => filteredItems.value.length > 0 && filteredItems.value.every(item => selectedItems.value.some(value => value.item_id === item.item_id)))
+const taskSourceItems = computed(() => taskSources.value.find(source => source.version_id === taskVersionId.value)?.items || [])
+const selectedClass = computed(() => classes.value.find(item => item.class_id === classId.value))
+const classLabel = (item: any) => [item.class_name, item.class_variant, termLabel(item)].filter(Boolean).join(' · ')
+
+function resetTaskWorkspace() {
+  classId.value = ''
+  taskSources.value = []
+  taskVersionId.value = ''
+  taskSelectedItems.value = []
+  taskTitle.value = ''
+  taskDue.value = ''
+  taskPoints.value = {}
+  classTasks.value = []
+  taskPublishAttempted.value = false
+}
 
 async function loadBase() {
   loading.value = true
@@ -77,25 +107,58 @@ async function changeCourse(switched = false) {
     selectedItems.value = []
     importFolderId.value = ''
     moveTargetFolder.value = ''
+    resetTaskWorkspace()
   }
   if (!courseId.value) {
     items.value = []
     imports.value = []
     folders.value = []
+    classes.value = []
     return
   }
   loading.value = true
   try {
-    const [questions, importHistory, folderList] = await Promise.all([
+    const [questions, importHistory, folderList, classList] = await Promise.all([
       api.get(`/teacher/courses/${courseId.value}/question-bank`),
       api.get(`/teacher/courses/${courseId.value}/question-bank/imports`),
       api.get(`/teacher/courses/${courseId.value}/question-folders`),
+      api.get('/teacher/classes', { params: { course_id: courseId.value } }),
     ])
     items.value = questions.data
     imports.value = importHistory.data
     folders.value = folderList.data
+    classes.value = classList.data.filter((item: any) => item.status === 'active')
     if(!['all','unfiled'].includes(folderFilter.value) && !folders.value.some(row=>row.folder_id===folderFilter.value))folderFilter.value='all'
   } catch (error) { fail(error, '题库加载失败') } finally { loading.value = false }
+}
+async function changeClass() {
+  taskVersionId.value = ''
+  taskSelectedItems.value = []
+  taskPoints.value = {}
+  taskSources.value = []
+  classTasks.value = []
+  if (!courseId.value || !classId.value) return
+  taskLoading.value = true
+  try {
+    const [sources, tasks] = await Promise.all([
+      api.get(`/teacher/courses/${courseId.value}/classes/${classId.value}/task-sources`),
+      api.get(`/teacher/courses/${courseId.value}/classes/${classId.value}/tasks`),
+    ])
+    taskSources.value = sources.data
+    classTasks.value = tasks.data
+  } catch (error) { fail(error, '班级任务加载失败') } finally { taskLoading.value = false }
+}
+function changeTaskVersion() {
+  taskSelectedItems.value = []
+  taskPoints.value = {}
+}
+async function openTaskPublish() {
+  if (!courseId.value) return ElMessage.warning('请先选择课程')
+  taskDialogOpen.value = true
+  if (!classes.value.length) await changeCourse()
+}
+function focusQuestionBank() {
+  document.getElementById('question-bank-import')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 function chooseUpload(file: any) { uploadFile.value = file.raw }
 function chooseFolderUpload(event: Event) {
@@ -271,9 +334,34 @@ async function publish(folderId = importFolderId.value) {
     const result = (await api.post(`/teacher/courses/${courseId.value}/question-bank/publish`, null, {
       params: folderId ? { folder_id: folderId } : {},
     })).data
-    ElMessage.success(`题库 v${result.version_number} 已发布给学生`)
+    ElMessage.success(`题库 v${result.version_number} 已发布到课程学生端`)
     await changeCourse()
   } catch (error) { fail(error, '题库发布失败') }
+}
+async function publishTask() {
+  taskPublishAttempted.value = true
+  if (!courseId.value || !classId.value || !taskTitle.value.trim() || !taskVersionId.value || !taskDue.value || !taskSelectedItems.value.length) {
+    return ElMessage.warning('请完成教学班、任务名称、题库、截止时间和题目选择')
+  }
+  const dueAt = new Date(taskDue.value)
+  if (Number.isNaN(dueAt.getTime())) return ElMessage.warning('截止时间格式无效，请重新选择')
+  taskPublishing.value = true
+  try {
+    await api.post(`/teacher/courses/${courseId.value}/classes/${classId.value}/tasks`, {
+      title: taskTitle.value.trim(),
+      kind: taskKind.value,
+      version_id: taskVersionId.value,
+      due_at: dueAt.toISOString(),
+      items: taskSelectedItems.value.map(item => ({ item_id: item.item_id, points: taskPoints.value[item.item_id] ?? 1 })),
+    })
+    ElMessage.success(`已向“${selectedClass.value?.class_name || '当前教学班'}”发布${taskKind.value === 'exam' ? '考试' : '作业'}`)
+    taskTitle.value = ''
+    taskDue.value = ''
+    taskSelectedItems.value = []
+    taskPoints.value = {}
+    taskPublishAttempted.value = false
+    await changeClass()
+  } catch (error) { fail(error, '班级任务发布失败') } finally { taskPublishing.value = false }
 }
 onMounted(loadBase)
 </script>
@@ -281,9 +369,7 @@ onMounted(loadBase)
 <template>
   <main class="content question-center" v-loading="loading">
     <div class="page-title workbench-hero">
-      <span class="eyebrow">题库审核与发布</span>
       <h1>习题中心</h1>
-      <p class="muted">教师导入任意常见 Excel 题库并审核，学生只作答已发布版本；教材例题不会自动进入正式题库。</p>
     </div>
     <el-card shadow="never" class="toolbar-card">
       <div class="toolbar">
@@ -291,7 +377,11 @@ onMounted(loadBase)
           <el-option v-for="course in courses" :key="course.course_id"
                      :label="course.course_name" :value="course.course_id" />
         </el-select>
-        <el-button :disabled="!courseId" @click="$router.push({ path: '/analytics', query: { course: courseId }, hash: '#question-statistics' })">到教学诊断查看学习统计</el-button>
+        <div class="toolbar-actions">
+          <el-button :disabled="!courseId" @click="focusQuestionBank">教师审核题库</el-button>
+          <el-button type="primary" :disabled="!courseId" @click="openTaskPublish">发布班级作业 / 考试</el-button>
+          <el-button :disabled="!courseId" @click="$router.push({ path: '/analytics', query: { course: courseId }, hash: '#question-statistics' })">查看学习统计</el-button>
+        </div>
       </div>
     </el-card>
     <el-alert v-if="!loading && !courses.length" type="warning" :closable="false" show-icon
@@ -310,7 +400,7 @@ onMounted(loadBase)
     <div class="question-organizer-layout">
     <aside class="question-sidebar">
     <el-card shadow="never" class="folder-card">
-      <template #header><div class="card-title"><div><h3>试卷 / 作业 / 章节练习</h3><p>每个文件夹独立导入、审核和发布；未归档题目可批量移动。</p></div></div></template>
+      <template #header><div class="card-title"><div><h3>题库内分组</h3></div></div></template>
       <div class="folder-create">
         <el-select v-model="newFolderType">
           <el-option label="新试卷" value="exam"/><el-option label="新作业" value="homework"/>
@@ -338,11 +428,10 @@ onMounted(loadBase)
     </el-card>
     </aside>
     <section class="question-main">
-    <el-alert title="先创建分组，再拖入题目或勾选后批量移动；审核通过后发布给学生。" type="info" :closable="false" />
-    <el-card shadow="never" class="import-card">
+    <el-card id="question-bank-import" shadow="never" class="import-card">
       <template #header>
         <div class="card-title">
-          <div><h3>导入 Excel 题库</h3><p>无需固定列号或固定首行，系统会扫描所有工作表并按内容识别字段。</p></div>
+          <div><h3>教师审核题库</h3></div>
           <el-select v-model="importFolderId" clearable placeholder="选择导入目标文件夹">
             <el-option v-for="folder in folders" :key="folder.folder_id"
                        :label="folder.folder_name" :value="folder.folder_id"/>
@@ -467,6 +556,53 @@ onMounted(loadBase)
     </el-card>
     </section>
     </div>
+    <el-dialog v-model="taskDialogOpen" title="发布班级作业 / 考试" width="min(1080px, 94vw)" top="5vh" :close-on-click-modal="false" destroy-on-close>
+      <div class="task-dialog-intro">
+        <div><h3>从已发布题库组建班级任务</h3></div>
+        <el-tag type="warning" effect="plain">班级级发布</el-tag>
+      </div>
+      <el-alert v-if="!classes.length && !taskLoading" type="warning" :closable="false" show-icon title="当前课程还没有可用教学班，请先到“教学管理”创建教学班并添加学生。" />
+      <el-form v-else label-position="top" class="task-dialog-form" :disabled="taskPublishing">
+        <el-form-item label="发布到教学班" required :error="taskPublishAttempted && !classId ? '请选择教学班' : ''">
+          <el-select v-model="classId" filterable placeholder="选择具体教学班" @change="changeClass">
+            <el-option v-for="item in classes" :key="item.class_id" :label="classLabel(item)" :value="item.class_id">
+              <span>{{ classLabel(item) }}</span><small class="class-option-meta">{{ item.member_count || 0 }} 名学生</small>
+            </el-option>
+          </el-select>
+        </el-form-item>
+        <el-form-item label="任务类型">
+          <el-select v-model="taskKind"><el-option label="作业（允许订正和补交）" value="homework" /><el-option label="考试（一次正式提交）" value="exam" /></el-select>
+        </el-form-item>
+        <el-form-item label="任务名称" required :error="taskPublishAttempted && !taskTitle.trim() ? '请输入任务名称' : ''">
+          <el-input v-model="taskTitle" maxlength="160" placeholder="例如：第三章课后作业" />
+        </el-form-item>
+        <el-form-item label="截止时间" required :error="taskPublishAttempted && !taskDue ? '请选择截止时间' : ''">
+          <el-date-picker v-model="taskDue" type="datetime" value-format="YYYY-MM-DDTHH:mm:ss" placeholder="选择日期与时间" />
+        </el-form-item>
+      </el-form>
+      <el-divider />
+      <div class="task-selection-heading">
+        <div><h3>选择题目</h3></div>
+        <el-select v-model="taskVersionId" filterable clearable placeholder="先选择已发布题库" :disabled="!classId || taskLoading" @change="changeTaskVersion">
+          <el-option v-for="source in taskSources" :key="source.version_id" :value="source.version_id" :label="`${source.folder_name || '题库'} · 版本 ${source.version_number}`" />
+        </el-select>
+      </div>
+      <el-alert v-if="classId && !taskSources.length && !taskLoading" type="info" :closable="false" title="当前班级暂无可用题库版本，请先在“教师审核题库”中审核并发布题库。" />
+      <el-table v-else :key="taskVersionId" v-loading="taskLoading" :data="taskSourceItems" max-height="330" empty-text="请选择已发布题库；暂无可用题目时请先审核并发布客观题" @selection-change="taskSelectedItems=$event">
+        <el-table-column type="selection" width="52" />
+        <el-table-column prop="stem_markdown" label="题目" min-width="360" show-overflow-tooltip />
+        <el-table-column label="分值" width="150"><template #default="scope"><el-input-number :model-value="taskPoints[scope.row.item_id] ?? 1" :min="0.01" :max="1000" :precision="2" @update:model-value="taskPoints[scope.row.item_id]=$event ?? 1" /></template></el-table-column>
+      </el-table>
+      <div v-if="classId && taskSelectedItems.length" class="task-selection-summary">已选择 {{ taskSelectedItems.length }} 道题，将发布到“{{ selectedClass?.class_name }}”。</div>
+      <el-divider v-if="classId" />
+      <div v-if="classId" class="published-task-list">
+        <div class="task-selection-heading"><div><h3>当前班级已发布任务</h3></div></div>
+        <el-table :data="classTasks" size="small" max-height="180" empty-text="当前班级还没有已发布任务">
+          <el-table-column prop="title" label="名称" min-width="180" /><el-table-column label="类型" width="100"><template #default="scope">{{ scope.row.kind === 'exam' ? '考试' : '作业' }}</template></el-table-column><el-table-column prop="expected_count" label="应完成人数" width="110" /><el-table-column prop="due_at" label="截止时间" min-width="180" />
+        </el-table>
+      </div>
+      <template #footer><el-button @click="taskDialogOpen=false">取消</el-button><el-button type="primary" :loading="taskPublishing" :disabled="!classId || !taskSelectedItems.length" @click="publishTask">发布到当前教学班（{{ taskSelectedItems.length }} 题）</el-button></template>
+    </el-dialog>
   </main>
 </template>
 
@@ -474,6 +610,7 @@ onMounted(loadBase)
 .question-center{display:grid;gap:18px}.toolbar-card,.import-card,.question-card{border-radius:16px}
 .toolbar,.card-title,.upload-row,.question-head,.question-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .toolbar,.card-title{justify-content:space-between}.card-title h3,.card-title p{margin:0}
+.toolbar-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .card-title p{margin-top:5px;color:#687d77}.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
 .metric{padding:18px;background:#f2faf8;border:1px solid #dce9e5;border-radius:14px}.metric span{display:block;color:#687d77;font-size:13px}
 .metric strong{display:block;margin-top:8px;font-size:30px;color:#173e49}.metric.success strong{color:#23746f}
@@ -490,13 +627,14 @@ onMounted(loadBase)
 .import-record-summary{display:flex;align-items:center;gap:8px;flex-shrink:0;font-weight:400}
 .import-record-summary :deep(.el-tag){height:25px;padding:0 9px;font-size:12px;border-color:transparent;border-radius:6px}
 .import-record-method{margin-left:4px;color:var(--text-secondary);font-size:12px;white-space:nowrap}
-@media(max-width:1000px){.import-record{align-items:flex-start;flex-direction:column;gap:10px}.import-record-summary{flex-wrap:wrap;flex-shrink:1}.import-history :deep(.el-collapse-item__arrow){align-self:center}}.question-card{border-left:4px solid #378f81}
+@media(max-width:1000px){.import-record{align-items:flex-start;flex-direction:column;gap:10px}.import-record-summary{flex-wrap:wrap;flex-shrink:1}.import-history :deep(.el-collapse-item__arrow){align-self:center}}
 .question-card label{display:block;margin:14px 0 6px;color:#47655e;font-size:13px;font-weight:600}
 .question-index{display:grid;place-items:center;width:30px;height:30px;border-radius:50%;background:#d9eee8;color:#23746f;font-weight:700}
 .type-select{width:130px}.options-editor{margin-top:12px;display:grid;gap:8px}.option-row{display:grid;grid-template-columns:28px 1fr;align-items:center;gap:8px}
 .answer-grid{display:grid;grid-template-columns:1.4fr .7fr .7fr;gap:12px}.question-actions{justify-content:flex-end;margin-top:16px}
 .muted{color:#687d77;font-size:13px}
 .question-center{background:#f3f7f7;min-height:100vh}.folder-card,.import-card{border-color:#dce9e5}
+.publish-route-hint{border:1px solid #cfe4df;background:#eef8f5}.publish-route-hint :deep(.el-alert__title){font-weight:700;color:#173e49}.publish-route-hint :deep(.el-alert__description){color:#47655e}
 .organizer-head{display:flex;gap:10px;margin:15px 0 12px}.organizer-head button{display:grid;grid-template-columns:1fr auto;gap:4px 14px;min-width:160px;padding:11px 14px;border:1px solid #d4e3df;border-radius:11px;background:#fff;color:#365b55;text-align:left;cursor:pointer}.organizer-head button small{grid-column:1/-1;color:#81938f}.organizer-head button.active{border-color:#378f81;background:#eaf6f2;color:#173e49}.folder-board{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:14px}.folder-column{display:grid;align-content:start;gap:8px;min-height:142px;padding:12px;border:1px solid #dbe8e5;border-radius:13px;background:#f7fbfa}.folder-column>header{display:grid;margin-bottom:2px}.folder-column>header b{color:#173e49}.folder-column>header span{font-size:12px;color:#7b8e89}.folder-drop{display:grid;grid-template-columns:1fr auto;gap:5px 10px;padding:11px;border:1px solid #dce8e5;border-radius:10px;background:#fff;color:#365b55;text-align:left;cursor:pointer;transition:.16s ease}.folder-drop small{grid-column:1/-1;color:#84948f}.folder-drop.active{border-color:#378f81;background:#edf8f5}.folder-drop.over,.organizer-head button.over{border-color:#23746f;background:#dcefe9;box-shadow:0 0 0 3px #378f8126;transform:translateY(-2px)}.empty-folder{padding:17px 8px;border:1px dashed #c8dbd6;border-radius:9px;color:#879792;text-align:center;font-size:12px}.selected-count{padding:6px 10px;border-radius:9px;background:#dcefe9;color:#173e49}.drag-handle{display:grid;place-items:center;width:26px;height:30px;border-radius:7px;color:#5e7c75;font-size:22px;cursor:grab;user-select:none}.drag-handle:active{cursor:grabbing}.question-card.selected{border-color:#378f81;background:#fbfefd;box-shadow:0 0 0 2px #378f811c}
 @media(max-width:900px){.metric-grid{grid-template-columns:repeat(2,1fr)}.answer-grid,.ai-grid{grid-template-columns:1fr}}
 @media(max-width:900px){.folder-board{grid-template-columns:1fr}.organizer-head{flex-wrap:wrap}}
@@ -504,4 +642,8 @@ onMounted(loadBase)
 .question-organizer-layout{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:18px;align-items:start}.question-sidebar{grid-column:2;grid-row:1;position:sticky;top:12px;max-height:calc(100dvh - 24px);overflow:auto;min-width:0}.question-main{grid-column:1;grid-row:1;display:grid;gap:18px;min-width:0}.question-sidebar .folder-board{grid-template-columns:1fr}.question-sidebar .organizer-head{flex-wrap:wrap}.question-sidebar .organizer-head button{min-width:0;flex:1}.question-sidebar .folder-create .el-input,.question-sidebar .folder-create .el-select,.question-sidebar .bulk-actions .el-select{width:100%;max-width:100%}
 @media(max-width:1150px){.question-organizer-layout{grid-template-columns:minmax(0,1fr)}.question-sidebar,.question-main{grid-column:1;grid-row:auto}.question-sidebar{position:static;max-height:none}.question-sidebar .folder-board{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:700px){.question-sidebar .folder-board{grid-template-columns:1fr}.question-head{gap:8px}.upload-row>*{max-width:100%}}
+
+.task-dialog-intro,.task-selection-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.task-dialog-intro h3,.task-dialog-intro p,.task-selection-heading h3,.task-selection-heading p{margin:0}.task-dialog-intro p,.task-selection-heading p{margin-top:6px;color:#687d77;font-size:13px;line-height:1.6}.task-dialog-form{display:grid;grid-template-columns:1.2fr .8fr 1.2fr .9fr;gap:14px;margin-top:18px}.task-dialog-form :deep(.el-form-item){min-width:0;margin-bottom:0}.task-dialog-form :deep(.el-select),.task-dialog-form :deep(.el-date-editor){width:100%}.class-option-meta{float:right;margin-left:24px;color:#81938f}.task-selection-heading{align-items:center;margin-bottom:12px}.task-selection-heading>.el-select{width:310px;max-width:100%}.task-selection-summary{margin-top:12px;padding:10px 12px;border-radius:9px;background:#edf8f5;color:#365b55;font-size:13px}.published-task-list{display:grid;gap:10px}.published-task-list .task-selection-heading{margin-bottom:0}.task-dialog-intro+.el-alert{margin-top:18px}
+@media(max-width:900px){.task-dialog-form{grid-template-columns:1fr 1fr}.task-selection-heading{align-items:flex-start;flex-direction:column}.task-selection-heading>.el-select{width:100%}}
+@media(max-width:560px){.task-dialog-form{grid-template-columns:1fr}.task-dialog-intro{flex-direction:column}}
 </style>

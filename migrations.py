@@ -1423,6 +1423,43 @@ MIGRATIONS += (("038_student_portraits", """
     CREATE INDEX idx_portrait_evaluation_scope ON student_portrait_evaluations(course_id,class_id,student_id,start_at,end_at);
 """),)
 
+MIGRATIONS += (("039_remove_default_virtual_course", """
+    UPDATE courses SET visibility='private',updated_at=CURRENT_TIMESTAMP
+     WHERE course_id='virtual_ai_101' AND is_virtual=1;
+"""),)
+
+MIGRATIONS += (("040_detach_legacy_virtual_course", """
+    DELETE FROM course_enrollments WHERE course_id='virtual_ai_101';
+    DELETE FROM classes WHERE course_id='virtual_ai_101';
+"""),)
+
+MIGRATIONS += (("041_purge_legacy_virtual_course", """
+    DELETE FROM knowledge_version_blocks
+     WHERE version_id IN (SELECT version_id FROM knowledge_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM knowledge_version_nodes
+     WHERE version_id IN (SELECT version_id FROM knowledge_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM knowledge_version_relations
+     WHERE version_id IN (SELECT version_id FROM knowledge_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM question_bank_version_items
+     WHERE version_id IN (SELECT version_id FROM question_bank_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM question_bank_attempts WHERE course_id='virtual_ai_101';
+    DELETE FROM question_bank_attachments
+     WHERE item_id IN (SELECT item_id FROM question_bank_items WHERE course_id='virtual_ai_101');
+    DELETE FROM knowledge_node_sources
+     WHERE node_id IN (SELECT node_id FROM knowledge_nodes WHERE course_id='virtual_ai_101');
+    DELETE FROM courses WHERE course_id='virtual_ai_101' AND is_virtual=1;
+"""),)
+
+MIGRATIONS += (("042_normalize_default_term_label", """
+    UPDATE terms
+       SET term_name='第一学期', teaching_period='第一学期'
+     WHERE term_name='默认学期'
+       AND NOT EXISTS (
+           SELECT 1 FROM terms existing
+            WHERE existing.owner_id=terms.owner_id AND existing.term_name='第一学期'
+       );
+"""),)
+
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
     conn.commit()

@@ -48,7 +48,7 @@ def main():
     env = {**os.environ, 'ZHIJIAO_DATA_DIR': str(data_dir), 'ZHIJIAO_AI_MODE': 'mock', 'ZHIJIAO_AI_PROVIDER': 'mock',
            'ZHIJIAO_TEACHER_AGENT_ENABLED': '1', 'NO_PROXY': '127.0.0.1,localhost', 'no_proxy': '127.0.0.1,localhost', 'PYTHONUTF8': '1'}
     env['PYTHONPATH'] = os.pathsep.join([str(ROOT), env.get('PYTHONPATH', '')])
-    subprocess.run([sys.executable, str(ROOT/'scripts/bootstrap_demo.py'), '--if-empty'], env=env, check=True)
+    subprocess.run([sys.executable, str(ROOT/'scripts/bootstrap_demo.py'), '--if-empty', '--with-demo-course'], env=env, check=True)
     teacher_password, student_password = credentials(data_dir/'demo_credentials.txt')
     logs = [(data_dir/name).open('w', encoding='utf-8') for name in ('api.log','web.log')]
     processes = []

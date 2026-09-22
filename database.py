@@ -233,7 +233,7 @@ class LearningDatabase:
             class_id = f"class_legacy_{course_key}"
             conn.execute(
                 "INSERT OR IGNORE INTO terms(term_id,term_name,owner_id) VALUES(?,?,?)",
-                (term_id, "默认学期", course["owner_id"]),
+                (term_id, "第一学期", course["owner_id"]),
             )
             conn.execute(
                 """INSERT OR IGNORE INTO classes(class_id,course_id,term_id,class_name,teacher_id)
