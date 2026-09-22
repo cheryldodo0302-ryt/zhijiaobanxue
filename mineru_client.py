@@ -6,6 +6,7 @@ import os
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -26,6 +27,11 @@ class MinerUClient:
         self.verify_tls = get_runtime_setting("ZHIJIAO_MINERU_VERIFY_TLS", "1").lower() not in {
             "0", "false", "no", "off",
         }
+        self.session = requests.Session()
+        if urlparse(self.base_url).hostname in {"127.0.0.1", "localhost", "::1"}:
+            # Codex/VS Code commonly inject system proxy variables. Loopback
+            # parser traffic must never be sent through that proxy.
+            self.session.trust_env = False
 
     @property
     def headers(self) -> dict[str, str]:
@@ -38,7 +44,7 @@ class MinerUClient:
     def health(self) -> dict[str, Any]:
         if not self.enabled:
             return {"enabled": False, "status": "disabled"}
-        response = requests.get(
+        response = self.session.get(
             f"{self.base_url}/health", headers=self.headers, timeout=10, verify=self.verify_tls,
         )
         response.raise_for_status()
@@ -46,19 +52,20 @@ class MinerUClient:
         return {"enabled": True, "status": "ok", **payload}
 
     def parse(self, path: Path, *, method: str = "auto", asset_dir: Path | None = None,
-              raw_dir: Path | None = None) -> dict[str, Any]:
+              raw_dir: Path | None = None, formula_enable: bool = True,
+              table_enable: bool = True) -> dict[str, Any]:
         if not self.enabled:
             raise MinerUError("MinerU worker is not configured")
         with path.open("rb") as stream:
-            response = requests.post(
+            response = self.session.post(
                 f"{self.base_url}/file_parse",
                 files={"files": (path.name, stream, "application/octet-stream")},
                 data={
                     "backend": get_runtime_setting("ZHIJIAO_MINERU_BACKEND", "pipeline"),
                     "parse_method": method,
                     "lang_list": get_runtime_setting("ZHIJIAO_MINERU_LANG", "ch"),
-                    "formula_enable": "true",
-                    "table_enable": "true",
+                    "formula_enable": str(bool(formula_enable)).lower(),
+                    "table_enable": str(bool(table_enable)).lower(),
                     "return_md": "true",
                     "return_middle_json": "true",
                     "return_content_list": "true",

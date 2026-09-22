@@ -650,3 +650,13 @@ def test_remote_clients_attach_bearer_tokens_and_verify_tls(monkeypatch):
     assert mineru.headers == {"Authorization": "Bearer mineru-secret"}
     assert formula.headers == {"Authorization": "Bearer formula-secret"}
     assert mineru.verify_tls is True and formula.verify_tls is True
+
+
+def test_loopback_parser_clients_ignore_injected_system_proxy():
+    mineru = MinerUClient("http://127.0.0.1:18000")
+    formula = Pix2TextClient("http://localhost:18100")
+    remote = MinerUClient("https://mineru.example.edu")
+
+    assert mineru.session.trust_env is False
+    assert formula.session.trust_env is False
+    assert remote.session.trust_env is True

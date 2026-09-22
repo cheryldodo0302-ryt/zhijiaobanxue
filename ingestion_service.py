@@ -63,6 +63,22 @@ MATERIAL_LABELS = {
     "knowledge_graph": "知识图谱", "teaching_schedule": "教学进度", "other": "其他",
 }
 MATERIAL_ORDER = tuple(MATERIAL_LABELS)
+
+# Exercises and their answer material belong to the question workflow.  They
+# must never become publishable knowledge points, even when an AI response
+# incorrectly places their source blocks in ``knowledge_points``.
+_NON_PUBLISHABLE_KNOWLEDGE_REGIONS = frozenset({
+    "example", "case", "exercise", "solution", "question", "answer",
+})
+_NON_PUBLISHABLE_KNOWLEDGE_ROLES = frozenset({
+    "question", "answer", "solution", "question_attachment", "exercise",
+})
+_QUESTION_LIKE_TEXT = re.compile(
+    r"(?:习题|练习题|课后题|思考题|作业题|选择题|填空题|判断题|简答题|"
+    r"参考答案|答案解析|题目解析|解答|例题|练习|exercise|quiz|question\s*\d*|"
+    r"answer\s*key|solution\s*\d*)",
+    re.IGNORECASE,
+)
 TEACHING_CATEGORY_LABELS = {
     "course_profile": "课程基本信息",
     "objectives": "培养与学习目标",
@@ -135,9 +151,10 @@ class IngestionService:
             "" if provider == "ollama" else
             encrypt_job_secret(api_key) if api_key else
             str((existing or {}).get("api_key_encrypted") or "")
+            if existing and existing["provider"] == provider and existing["base_url"] == base_url else ""
         )
         if provider != "ollama" and not encrypted:
-            raise ValidationError("首次保存时必须填写 API Key")
+            raise ValidationError("首次保存或更换接口地址时必须填写 API Key")
         changed = not existing or any((
             str((existing or {}).get("provider") or "") != provider,
             str((existing or {}).get("base_url") or "") != base_url,
@@ -217,13 +234,15 @@ class IngestionService:
             if not saved:
                 raise ValidationError("尚未保存教师自有 API 配置")
         custom_key = str(settings.get("api_key") or "").strip()
-        if not custom_key and saved:
-            custom_key = decrypt_job_secret(str(saved.get("api_key_encrypted") or ""))
         custom_base = str(settings.get("base_url") or (saved or {}).get("base_url") or "").strip().rstrip("/")
         custom_model = str(settings.get("model") or (saved or {}).get("model") or "").strip()
         custom_provider = str(
             settings.get("provider") or (saved or {}).get("provider") or "openai_compatible"
         ).strip()
+        if not custom_key and saved:
+            if custom_provider != saved["provider"] or custom_base != saved["base_url"]:
+                raise ValidationError("更换接口地址时请填写该接口的 API Key，不能沿用原接口密钥")
+            custom_key = decrypt_job_secret(str(saved.get("api_key_encrypted") or ""))
         if custom_key or custom_base or custom_model or use_saved:
             self._validate_custom_ai_fields(custom_provider, custom_base, custom_model)
             if custom_provider != "ollama" and not custom_key:
@@ -831,6 +850,7 @@ class IngestionService:
             return
         self.db.execute("UPDATE ingestion_jobs SET status='running',updated_at=CURRENT_TIMESTAMP WHERE job_id=?", (job_id,))
         self.db.execute("UPDATE course_documents SET status='processing' WHERE document_id=?", (job["document_id"],))
+        self._reset_document_knowledge_review(str(job["document_id"]))
         try:
             path = Path(job["stored_path"])
             suffix = path.suffix.lower()
@@ -1288,6 +1308,7 @@ class IngestionService:
             raise PermissionDenied("仅教师可以启动共享资料语义分析")
         if analysis_mode not in {"api", "local"}:
             raise ValidationError("资料分析方式必须是 api 或 local")
+        self._reset_document_knowledge_review(document_id)
         settings = self._resolve_ai_settings(actor, ai_settings)
         custom_key = settings["api_key"]
         custom_base = settings["base_url"]
@@ -1355,6 +1376,102 @@ class IngestionService:
     @staticmethod
     def _clean_title(value: Any, fallback: str) -> str:
         return str(value or fallback).strip()[:180] or fallback
+
+    @staticmethod
+    def _block_content(block: dict[str, Any]) -> str:
+        return str(
+            block.get("markdown") or block.get("latex") or block.get("plain_text") or ""
+        ).strip()
+
+    @classmethod
+    def _non_publishable_knowledge_reason(cls, block: dict[str, Any]) -> str:
+        """Explain why a source block cannot enter the knowledge version.
+
+        This is intentionally conservative.  A question-like block is still
+        retained in DocumentIR for teacher inspection, but it belongs to the
+        separate question workflow and is never eligible for knowledge
+        approval or publication.
+        """
+        region = str(block.get("region_type") or "").strip().lower()
+        destination = str(block.get("content_destination") or "").strip().lower()
+        role = str(block.get("semantic_role") or "").strip().lower()
+        content = cls._block_content(block)
+        if region in _NON_PUBLISHABLE_KNOWLEDGE_REGIONS:
+            return "习题、例题、答案或解析类内容不能批准为知识点"
+        if destination == "question_bank":
+            return "该内容已分类为习题库，不进入知识库发布"
+        if role in _NON_PUBLISHABLE_KNOWLEDGE_ROLES:
+            return "题目、答案或解析类内容不能批准为知识点"
+        if _QUESTION_LIKE_TEXT.search(content):
+            return "原文命中习题/答案类文字，不进入知识库发布"
+        return ""
+
+    @classmethod
+    def _sanitize_knowledge_points(
+        cls, points: list[dict[str, Any]], known_blocks: dict[str, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Remove question-like evidence from model-generated knowledge points."""
+        sanitized: list[dict[str, Any]] = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            source_ids = list(dict.fromkeys(
+                str(value) for value in point.get("block_ids") or []
+                if str(value) in known_blocks
+            ))
+            source_ids = [
+                block_id for block_id in source_ids
+                if not cls._non_publishable_knowledge_reason(known_blocks[block_id])
+            ]
+            if not source_ids:
+                continue
+            sanitized.append({**point, "block_ids": source_ids})
+        return sanitized
+
+    @classmethod
+    def _candidate_publish_policy(
+        cls, candidate: dict[str, Any], source_blocks: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        reason = ""
+        candidate_region = str(candidate.get("region_type") or "").strip().lower()
+        if candidate_region in _NON_PUBLISHABLE_KNOWLEDGE_REGIONS:
+            reason = "习题、例题、答案或解析类候选不能批准为知识点"
+        if not reason:
+            revision = str(candidate.get("teacher_revision") or "")
+            body = revision if revision.strip() else str(candidate.get("markdown_content") or "")
+            candidate_text = f"{candidate.get('title') or ''} {body}"
+            if _QUESTION_LIKE_TEXT.search(candidate_text):
+                reason = "候选标题或正文命中习题/答案类文字，不进入知识库发布"
+        if not reason:
+            for block in source_blocks:
+                reason = cls._non_publishable_knowledge_reason(block)
+                if reason:
+                    break
+        return {
+            "publishable": not bool(reason),
+            "non_publishable_reason": reason,
+        }
+
+    def _node_non_publishable_reason(self, node_id: str) -> str:
+        node = self.db.fetch_one(
+            "SELECT title,markdown FROM knowledge_nodes WHERE node_id=?", (node_id,)
+        ) or {}
+        node_text = f"{node.get('title') or ''} {node.get('markdown') or ''}"
+        if _QUESTION_LIKE_TEXT.search(node_text):
+            return "知识点标题或正文命中习题/答案类文字"
+        source_blocks = self.db.fetch_all(
+            """SELECT b.* FROM knowledge_node_sources s
+               JOIN document_blocks b ON b.block_id=s.block_id
+               WHERE s.node_id=?""",
+            (node_id,),
+        )
+        for block in source_blocks:
+            if not self._candidate_source_is_eligible(block):
+                continue
+            reason = self._non_publishable_knowledge_reason(block)
+            if reason:
+                return reason
+        return ""
 
     def _process_local_semantic_analysis(self, job: dict[str, Any],
                                          blocks: list[dict[str, Any]]) -> None:
@@ -1638,6 +1755,8 @@ class IngestionService:
                             confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
                         except (TypeError, ValueError):
                             confidence = None
+                        known[block_id]["content_destination"] = destination
+                        known[block_id]["semantic_role"] = role
                         conn.execute(
                             """UPDATE document_blocks SET content_destination=?,semantic_role=?,question_group_key=?,
                                analysis_confidence=?,analysis_reason=?,verification_status=?,updated_at=CURRENT_TIMESTAMP
@@ -1645,7 +1764,9 @@ class IngestionService:
                             (destination, role, group, confidence, str(item.get("reason") or "")[:500],
                              "rejected" if destination == "excluded" else "review_required", block_id),
                         )
-                    for point in ([] if has_explicit_outline else result.get("knowledge_points", [])):
+                    for point in ([] if has_explicit_outline else self._sanitize_knowledge_points(
+                        result.get("knowledge_points", []), known
+                    )):
                         source_ids = [str(x) for x in point.get("block_ids", []) if str(x) in known]
                         if not source_ids:
                             continue
@@ -1747,12 +1868,6 @@ class IngestionService:
             "json", "格式不符合", "响应缺少", "未返回有效", "必须返回",
             "遗漏候选", "遗漏来源", "证据不能", "标题层级分析", "标题分组",
         ))
-
-    @staticmethod
-    def _block_content(block: dict[str, Any]) -> str:
-        return str(
-            block.get("markdown") or block.get("latex") or block.get("plain_text") or ""
-        ).strip()
 
     def _prepare_semantic_blocks(
         self, blocks: list[dict[str, Any]]
@@ -2124,6 +2239,7 @@ class IngestionService:
         are retained. Only pending rows are replaced by the newest
         evidence-backed semantic boundaries.
         """
+        points = self._sanitize_knowledge_points(points, known_blocks)
         protected = self.db.fetch_all(
             """SELECT * FROM knowledge_candidates WHERE document_id=?
                AND review_status IN ('APPROVED','MODIFIED','REJECTED')""",
@@ -2685,6 +2801,8 @@ class IngestionService:
                         "文档归并 JSON 被截断，保留分批原文结构供教师审核"
                     )
             points.extend(syllabus_points)
+        known = {str(row["block_id"]): row for row in blocks}
+        points = self._sanitize_knowledge_points(points, known)
         checkpoint["document_points"] = points
         self.db.execute(
             """UPDATE semantic_analysis_jobs SET current_batch=?,result_json=?,updated_at=CURRENT_TIMESTAMP
@@ -2693,7 +2811,6 @@ class IngestionService:
              json.dumps(checkpoint, ensure_ascii=False), analysis_job_id),
         )
 
-        known = {str(row["block_id"]): row for row in blocks}
         with self.db.connect() as conn:
             conn.execute(
                 """DELETE FROM knowledge_nodes WHERE analysis_job_id=?
@@ -2719,6 +2836,8 @@ class IngestionService:
                 group = str(item.get("question_group_key") or "")[:100]
                 if destination == "question_bank" and not group:
                     group = f"page-{known[block_id]['page_number'] or 1}-item-{known[block_id]['block_order']}"
+                known[block_id]["content_destination"] = destination
+                known[block_id]["semantic_role"] = str(item.get("semantic_role") or "")[:64]
                 try:
                     confidence = max(0.0, min(1.0, float(item.get("confidence", 0))))
                 except (TypeError, ValueError):
@@ -2729,8 +2848,9 @@ class IngestionService:
                        WHERE block_id=?""",
                     (destination, str(item.get("semantic_role") or "")[:64], group, confidence,
                      str(item.get("reason") or "")[:500],
-                     "rejected" if destination == "excluded" else "review_required", block_id),
+                      "rejected" if destination == "excluded" else "review_required", block_id),
                 )
+            points = self._sanitize_knowledge_points(points, known)
             chapter_ids: dict[str, str] = {}
             section_ids: dict[tuple[str, str], str] = {}
             order = 0
@@ -2880,7 +3000,7 @@ class IngestionService:
                 if destination == "question_bank" and not group:
                     group = f"page-{known[block_id]['page_number'] or 1}-item-{known[block_id]['block_order']}"
                 conn.execute(
-                    """UPDATE document_blocks SET content_destination=?,semantic_role=?,question_group_key=?,
+                 """UPDATE document_blocks SET content_destination=?,semantic_role=?,question_group_key=?,
                        analysis_confidence=NULL,analysis_reason=?,verification_status=?,updated_at=CURRENT_TIMESTAMP
                        WHERE block_id=?""",
                     (
@@ -2892,6 +3012,9 @@ class IngestionService:
                         block_id,
                     ),
                 )
+                known[block_id]["content_destination"] = destination
+                known[block_id]["semantic_role"] = str(item.get("semantic_role") or "")[:64]
+            points = self._sanitize_knowledge_points(points, known)
             chapter_ids: dict[str, str] = {}
             section_ids: dict[tuple[str, str], str] = {}
             order = 0
@@ -3993,14 +4116,15 @@ class IngestionService:
                 )] = row
 
         def preserved_values(prior: dict[str, Any] | None, *, title: str,
-                             markdown: str = "", keywords_json: str = "[]") -> tuple[Any, ...]:
+                             markdown: str = "", keywords_json: str = "[]",
+                             default_status: str = "draft") -> tuple[Any, ...]:
             preserve = bool(prior and (prior.get("reviewed_by") or prior.get("status") == "approved"))
             if preserve:
                 return (
                     prior["title"], prior["markdown"], prior["keywords_json"],
                     prior["status"], prior.get("reviewed_by"), prior.get("reviewed_at"),
                 )
-            return title, markdown, keywords_json, "draft", None, None
+            return title, markdown, keywords_json, default_status, None, None
 
         generation_id = f"kog_{uuid.uuid4().hex}"
         with self.db.connect() as conn:
@@ -4102,6 +4226,11 @@ class IngestionService:
                     previous_by_fingerprint.get(point_fingerprint),
                     title=self._clean_title(suggestion.get("title"), "知识点"),
                     markdown=markdown, keywords_json=keywords_json,
+                    default_status=(
+                        "approved" if source_rows and all(
+                            row.get("status") == "approved" for row in source_rows
+                        ) else "draft"
+                    ),
                 )
                 order += 1
                 conn.execute(
@@ -4290,6 +4419,8 @@ class IngestionService:
             raise PermissionDenied("无权查看该课程任务")
         rows = self.db.fetch_all(
             """SELECT j.*,d.original_name,d.mime_type,d.size_bytes,d.student_file_visible,
+                      d.knowledge_review_mode,d.knowledge_review_status,
+                      d.knowledge_reviewed_by,d.knowledge_reviewed_at,
                       COALESCE(m.material_type,'other') material_type,
                       COALESCE(m.suggested_material_type,'other') suggested_material_type,
                       COALESCE(m.classification_status,'suggested') classification_status,
@@ -4301,8 +4432,12 @@ class IngestionService:
                        (SELECT s.error_message FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_error,
                        (SELECT s.current_batch FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_current_batch,
                        (SELECT s.total_batches FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_total_batches,
-                       (SELECT s.api_calls FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_api_calls,
-                       (SELECT COUNT(*) FROM document_blocks b WHERE b.document_id=j.document_id) document_block_count
+                        (SELECT s.api_calls FROM semantic_analysis_jobs s WHERE s.document_id=j.document_id ORDER BY s.created_at DESC LIMIT 1) analysis_api_calls,
+                        (SELECT COUNT(*) FROM document_blocks b WHERE b.document_id=j.document_id) document_block_count,
+                        (SELECT COUNT(*) FROM knowledge_candidates k WHERE k.document_id=j.document_id
+                         AND k.review_status NOT IN ('APPROVED','REJECTED')) knowledge_candidate_pending_count,
+                        (SELECT COUNT(*) FROM knowledge_candidates k WHERE k.document_id=j.document_id
+                         AND k.review_status='APPROVED') knowledge_candidate_approved_count
                FROM ingestion_jobs j JOIN course_documents d USING(document_id)
                LEFT JOIN document_material_metadata m USING(document_id)
                WHERE j.course_id=? ORDER BY j.created_at DESC""", (course_id,),
@@ -4420,8 +4555,9 @@ class IngestionService:
                       b.region_type,b.region_confidence,b.region_reason,b.chapter_path_json
                FROM knowledge_candidate_blocks cb
                JOIN document_blocks b ON b.block_id=cb.block_id
-               WHERE cb.candidate_id=? ORDER BY cb.sort_order""",
-            (row["candidate_id"],),
+               WHERE cb.candidate_id=? AND cb.block_id IN ({})
+               ORDER BY cb.sort_order""".format(",".join("?" for _ in source_ids)),
+            (row["candidate_id"], *source_ids),
         ) if source_ids else []
         if not row["source_blocks"] and source_ids:
             # Keep older candidate rows readable if their link rows were created
@@ -4443,6 +4579,7 @@ class IngestionService:
                     block[field[:-5]] = json.loads(block.pop(field) or "[]")
                 except json.JSONDecodeError:
                     block[field[:-5]] = []
+        row.update(self._candidate_publish_policy(row, row["source_blocks"]))
         row["source_markdown"] = "\n\n".join(
             str(block.get("markdown") or block.get("latex") or block.get("plain_text") or "").strip()
             for block in row["source_blocks"]
@@ -4460,12 +4597,16 @@ class IngestionService:
 
     def _candidate_source_ids(self, candidate: dict[str, Any]) -> list[str]:
         linked = self.db.fetch_all(
-            """SELECT block_id FROM knowledge_candidate_blocks
+            """SELECT cb.block_id,b.* FROM knowledge_candidate_blocks cb
+               LEFT JOIN document_blocks b ON b.block_id=cb.block_id
                WHERE candidate_id=? ORDER BY sort_order""",
             (candidate["candidate_id"],),
         )
         if linked:
-            return [str(row["block_id"]) for row in linked]
+            return [
+                str(row["block_id"]) for row in linked
+                if row.get("document_id") and self._candidate_source_is_eligible(row)
+            ]
         if "source_block_ids" in candidate:
             value = candidate.get("source_block_ids") or []
         else:
@@ -4473,7 +4614,54 @@ class IngestionService:
                 value = json.loads(candidate.get("source_block_ids_json") or "[]")
             except json.JSONDecodeError:
                 value = []
-        return list(dict.fromkeys(str(item) for item in value if str(item).strip()))
+        raw_ids = list(dict.fromkeys(str(item) for item in value if str(item).strip()))
+        if not raw_ids:
+            return []
+        rows = self.db.fetch_all(
+            "SELECT * FROM document_blocks WHERE block_id IN ({})".format(
+                ",".join("?" for _ in raw_ids)
+            ),
+            tuple(raw_ids),
+        )
+        eligible = {
+            str(row["block_id"]): row for row in rows
+            if self._candidate_source_is_eligible(row)
+        }
+        return [block_id for block_id in raw_ids if block_id in eligible]
+
+    def _node_source_ids(self, node_id: str) -> set[str]:
+        rows = self.db.fetch_all(
+            """SELECT s.block_id,b.* FROM knowledge_node_sources s
+               LEFT JOIN document_blocks b ON b.block_id=s.block_id
+               WHERE s.node_id=?""",
+            (node_id,),
+        )
+        return {
+            str(row["block_id"]) for row in rows
+            if row.get("document_id") and self._candidate_source_is_eligible(row)
+        }
+
+    @classmethod
+    def _candidate_source_is_eligible(cls, block: dict[str, Any]) -> bool:
+        """Return whether a source block can remain evidence for a knowledge candidate."""
+        if not bool(block.get("include_as_knowledge", 1)):
+            return False
+        if str(block.get("region_type") or "").strip().lower() != "knowledge":
+            return False
+        if str(block.get("content_destination") or "").strip().lower() in {
+            "excluded", "question_bank",
+        }:
+            return False
+        return True
+
+    def _reset_document_knowledge_review(self, document_id: str) -> None:
+        """Invalidate a whole-document decision whenever its content is rebuilt or edited."""
+        self.db.execute(
+            """UPDATE course_documents SET knowledge_review_mode='point_by_point',
+               knowledge_review_status='pending',knowledge_reviewed_by=NULL,
+               knowledge_reviewed_at=NULL WHERE document_id=?""",
+            (document_id,),
+        )
 
     def _candidate_document_node(self, candidate: dict[str, Any]) -> dict[str, Any] | None:
         """Return the current document-tree leaf with the exact same evidence set."""
@@ -4495,12 +4683,7 @@ class IngestionService:
             (candidate["document_id"], latest.get("analysis_job_id")),
         )
         for node in nodes:
-            linked = {
-                str(row["block_id"]) for row in self.db.fetch_all(
-                    "SELECT block_id FROM knowledge_node_sources WHERE node_id=?",
-                    (node["node_id"],),
-                )
-            }
+            linked = self._node_source_ids(str(node["node_id"]))
             if linked != source_ids:
                 continue
             node_map = {
@@ -4546,11 +4729,7 @@ class IngestionService:
             )
             if not node:
                 continue
-            node_sources = {
-                str(row["block_id"]) for row in self.db.fetch_all(
-                    "SELECT block_id FROM knowledge_node_sources WHERE node_id=?", (node_id,)
-                )
-            }
+            node_sources = self._node_source_ids(node_id)
             if not node_sources:
                 continue
             for candidate in self.db.fetch_all(
@@ -4568,6 +4747,198 @@ class IngestionService:
                 (review_status, actor_id, *candidate_ids),
             )
         return candidate_ids
+
+    def _sync_course_nodes_from_document_node(
+        self, document_node_id: str, *, reset_approval: bool = False,
+        actor_id: str | None = None,
+    ) -> None:
+        """Keep the current course outline in step with an edited document leaf."""
+        document_node = self.db.fetch_one(
+            """SELECT course_id,title,markdown FROM knowledge_nodes
+               WHERE node_id=? AND node_scope='document'""",
+            (document_node_id,),
+        )
+        if not document_node:
+            return
+        source_ids = self._node_source_ids(document_node_id)
+        if not source_ids:
+            return
+        course_nodes = self.db.fetch_all(
+            """SELECT n.* FROM knowledge_nodes n
+               WHERE n.course_id=? AND n.node_scope='course'
+                 AND n.node_type='knowledge_point' AND n.status!='rejected'
+                 AND (n.generation_id IN (
+                        SELECT generation_id FROM course_outline_generations
+                        WHERE course_id=? AND status='current'
+                     ) OR (n.generation_id IS NULL AND NOT EXISTS (
+                        SELECT 1 FROM course_outline_generations
+                        WHERE course_id=? AND status='current'
+                     )))""",
+            (document_node["course_id"], document_node["course_id"], document_node["course_id"]),
+        )
+        for course_node in course_nodes:
+            if self._node_source_ids(str(course_node["node_id"])) != source_ids:
+                continue
+            if reset_approval and course_node["status"] == "approved":
+                self.db.execute(
+                    """UPDATE knowledge_nodes SET title=?,markdown=?,status='draft',reviewed_by=? ,
+                       reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=?""",
+                    (document_node["title"], document_node["markdown"], actor_id, course_node["node_id"]),
+                )
+            else:
+                self.db.execute(
+                    """UPDATE knowledge_nodes SET title=?,markdown=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE node_id=?""",
+                    (document_node["title"], document_node["markdown"], course_node["node_id"]),
+                )
+
+    def _refresh_document_review_state(self, document_id: str, actor_id: str) -> None:
+        """Close teacher review and mirror approved evidence into the current course tree."""
+        document = self.db.fetch_one(
+            """SELECT course_id,knowledge_review_mode,knowledge_review_status
+               FROM course_documents WHERE document_id=?""", (document_id,)
+        )
+        if not document:
+            return
+        reviewable = 0
+        pending = 0
+        leaves = self.db.fetch_all(
+            """SELECT node_id,title,markdown,status FROM knowledge_nodes
+               WHERE document_id=? AND node_scope='document'
+                 AND node_type='knowledge_point' AND content_domain='knowledge'""",
+            (document_id,),
+        )
+        for leaf in leaves:
+            if not self._has_substantive_node_markdown(leaf["title"], leaf["markdown"]):
+                continue
+            reviewable += 1
+            pending += int(leaf["status"] == "draft")
+        all_document_leaves = self.db.fetch_all(
+            """SELECT node_id,document_id,title,markdown,status FROM knowledge_nodes
+               WHERE course_id=? AND node_scope='document'
+                 AND node_type='knowledge_point' AND content_domain='knowledge'
+                 AND status!='rejected'""",
+            (document["course_id"],),
+        )
+        approved_source_ids_by_document: dict[str, set[str]] = {}
+        document_has_reviewable_leaves: set[str] = set()
+        for leaf in all_document_leaves:
+            if not self._has_substantive_node_markdown(leaf["title"], leaf["markdown"]):
+                continue
+            leaf_document_id = str(leaf["document_id"])
+            document_has_reviewable_leaves.add(leaf_document_id)
+            if leaf["status"] == "approved":
+                approved_source_ids_by_document.setdefault(leaf_document_id, set()).update(
+                    self._node_source_ids(str(leaf["node_id"]))
+                )
+        if not reviewable:
+            candidates = self.db.fetch_all(
+                "SELECT review_status FROM knowledge_candidates WHERE document_id=?",
+                (document_id,),
+            )
+            reviewable = len(candidates)
+            pending = sum(
+                row["review_status"] not in {"APPROVED", "REJECTED"} for row in candidates
+            )
+
+        course_nodes = self.db.fetch_all(
+            """SELECT n.node_id,n.status FROM knowledge_nodes n
+               WHERE n.course_id=? AND n.node_scope='course'
+                 AND n.node_type='knowledge_point' AND n.status='draft'
+                 AND (n.generation_id IN (
+                        SELECT generation_id FROM course_outline_generations
+                        WHERE course_id=? AND status='current'
+                     ) OR (n.generation_id IS NULL AND NOT EXISTS (
+                        SELECT 1 FROM course_outline_generations
+                        WHERE course_id=? AND status='current'
+                     )))
+                 AND EXISTS (
+                     SELECT 1 FROM knowledge_node_sources s
+                     WHERE s.node_id=n.node_id AND s.document_id=?
+                 )""",
+            (document["course_id"], document["course_id"], document["course_id"], document_id),
+        )
+        course_documents = {
+            str(row["document_id"]): row for row in self.db.fetch_all(
+                """SELECT document_id,knowledge_review_mode,knowledge_review_status
+                   FROM course_documents WHERE course_id=?""",
+                (document["course_id"],),
+            )
+        }
+        approved_course_ids: list[str] = []
+        for node in course_nodes:
+            source_states = self.db.fetch_all(
+                """SELECT DISTINCT b.verification_status FROM knowledge_node_sources s
+                   JOIN document_blocks b ON b.block_id=s.block_id
+                   WHERE s.node_id=? AND b.include_as_knowledge=1
+                     AND b.region_type='knowledge'
+                     AND b.content_destination NOT IN ('excluded','question_bank')""",
+                (node["node_id"],),
+            )
+            if source_states and all(
+                row["verification_status"] in {"auto_verified", "teacher_verified"}
+                for row in source_states
+            ):
+                source_rows = self.db.fetch_all(
+                    """SELECT s.block_id,s.document_id,b.include_as_knowledge,b.region_type,
+                              b.content_destination
+                       FROM knowledge_node_sources s JOIN document_blocks b ON b.block_id=s.block_id
+                       WHERE s.node_id=?""",
+                    (node["node_id"],),
+                )
+                source_ids_by_document: dict[str, set[str]] = {}
+                for source in source_rows:
+                    if self._candidate_source_is_eligible(source):
+                        source_ids_by_document.setdefault(str(source["document_id"]), set()).add(
+                            str(source["block_id"])
+                        )
+                review_complete = True
+                for source_document_id, source_ids in source_ids_by_document.items():
+                    review = course_documents.get(source_document_id) or {}
+                    if (
+                        review.get("knowledge_review_mode") == "whole_document"
+                        and review.get("knowledge_review_status") == "approved"
+                    ):
+                        continue
+                    if source_document_id not in document_has_reviewable_leaves:
+                        # Legacy block-level approvals predate document leaves.
+                        continue
+                    if not source_ids.issubset(
+                        approved_source_ids_by_document.get(source_document_id, set())
+                    ):
+                        review_complete = False
+                        break
+                if review_complete:
+                    approved_course_ids.append(str(node["node_id"]))
+        if approved_course_ids:
+            placeholders = ",".join("?" for _ in approved_course_ids)
+            self.db.execute(
+                f"""UPDATE knowledge_nodes SET status='approved',reviewed_by=?,
+                    reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                    WHERE node_id IN ({placeholders})""",
+                (actor_id, *approved_course_ids),
+            )
+        if reviewable and not pending:
+            self.db.execute(
+                "UPDATE ingestion_jobs SET status='ready',updated_at=CURRENT_TIMESTAMP WHERE document_id=? AND status='review_required'",
+                (document_id,),
+            )
+            self.db.execute(
+                "UPDATE course_documents SET status='ready' WHERE document_id=? AND status='review_required'",
+                (document_id,),
+            )
+            latest = self.db.fetch_one(
+                """SELECT analysis_job_id,status FROM semantic_analysis_jobs
+                   WHERE document_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1""",
+                (document_id,),
+            )
+            if latest and latest["status"] == "review_required":
+                self.db.execute(
+                    """UPDATE semantic_analysis_jobs SET status='completed',
+                       current_stage='completed',updated_at=CURRENT_TIMESTAMP
+                       WHERE analysis_job_id=?""",
+                    (latest["analysis_job_id"],),
+                )
 
     def list_knowledge_candidates(self, actor: dict[str, Any], document_id: str) -> list[dict[str, Any]]:
         document = self.require_document_access(actor, document_id)
@@ -4606,8 +4977,14 @@ class IngestionService:
             )
             response["class_ids"] = [item["class_id"] for item in response["teaching_scopes"]]
             response["is_course_wide"] = not response["class_ids"]
+            response["document_review_mode"] = document.get("knowledge_review_mode") or "point_by_point"
+            response["document_review_status"] = document.get("knowledge_review_status") or "pending"
             response["review_status"] = (
-                "APPROVED" if node["status"] == "approved" else "PENDING"
+                response["review_status"] if response["document_review_mode"] == "whole_document"
+                and response["document_review_status"] == "approved" else
+                "APPROVED" if node["status"] == "approved"
+                else response["review_status"] if response["review_status"] in {"MODIFIED", "REJECTED"}
+                else "PENDING"
             )
             aligned.append(response)
         # Before semantic-tree generation there is no leaf to align with yet;
@@ -4625,27 +5002,68 @@ class IngestionService:
         candidate = self._candidate_access(actor, candidate_id)
         if candidate["review_status"] == "REJECTED":
             raise ValidationError("已驳回的候选不能直接修改")
+        self._reset_document_knowledge_review(str(candidate["document_id"]))
+        source_ids = self._candidate_source_ids(candidate)
+        source_rows = self.db.fetch_all(
+            "SELECT * FROM document_blocks WHERE block_id IN ({})".format(
+                ",".join("?" for _ in source_ids) or "NULL"
+            ),
+            tuple(source_ids),
+        ) if source_ids else []
         title = str(updates.get("title", candidate["title"])).strip()[:160]
         knowledge_type = str(updates.get("knowledge_type", candidate["knowledge_type"])).strip()[:64]
-        teacher_revision = str(updates.get("teacher_revision", candidate.get("teacher_revision") or ""))[:50000]
+        teacher_revision = str(
+            updates.get("teacher_revision", candidate.get("teacher_revision") or "") or ""
+        )[:50000]
         if not title:
             raise ValidationError("知识点标题不能为空")
-        status = "MODIFIED" if teacher_revision else candidate["review_status"]
+        policy = self._candidate_publish_policy(
+            {**candidate, "title": title, "knowledge_type": knowledge_type,
+             "teacher_revision": teacher_revision},
+            source_rows,
+        )
+        previous_revision = str(candidate.get("teacher_revision") or "")
+        revision_changed = (teacher_revision != previous_revision
+                            or title != candidate["title"]
+                            or knowledge_type != candidate["knowledge_type"])
+        if revision_changed:
+            status = "MODIFIED" if (teacher_revision or title != candidate["title"]
+                                    or knowledge_type != candidate["knowledge_type"]) else "PENDING"
+        else:
+            status = candidate["review_status"]
         self.db.execute(
-            """UPDATE knowledge_candidates SET title=?,knowledge_type=?,teacher_revision=?,review_status=?,
-               reviewed_by=?,updated_at=CURRENT_TIMESTAMP WHERE candidate_id=?""",
-            (title, knowledge_type, teacher_revision, status, actor["user_id"], candidate_id),
+            """UPDATE knowledge_candidates SET title=?,knowledge_type=?,teacher_revision=?,
+               source_block_ids_json=?,review_status=?,reviewed_by=?,updated_at=CURRENT_TIMESTAMP
+               WHERE candidate_id=?""",
+            (title, knowledge_type, teacher_revision,
+             json.dumps(source_ids, ensure_ascii=False), status, actor["user_id"], candidate_id),
         )
         node = self._candidate_document_node(candidate)
         if node:
+            node_markdown = teacher_revision or str(candidate.get("markdown_content") or node["markdown"])
+            node_status = "draft" if revision_changed and node["status"] == "approved" else node["status"]
             self.db.execute(
-                """UPDATE knowledge_nodes SET title=?,markdown=?,reviewed_by=?,
+                """UPDATE knowledge_nodes SET title=?,markdown=?,status=?,reviewed_by=?,
                    reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE node_id=?""",
-                (title, teacher_revision or node["markdown"], actor["user_id"], node["node_id"]),
+                (title, node_markdown, node_status, actor["user_id"], node["node_id"]),
             )
-        return self._candidate_response(self.db.fetch_one(
+            self._sync_course_nodes_from_document_node(
+                str(node["node_id"]), reset_approval=revision_changed,
+                actor_id=str(actor["user_id"]),
+            )
+        if revision_changed and source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            self.db.execute(
+                f"UPDATE document_blocks SET verification_status='review_required' WHERE block_id IN ({placeholders})",
+                tuple(source_ids),
+            )
+            self._sync_approved_source_blocks(str(candidate["document_id"]))
+        response = self._candidate_response(self.db.fetch_one(
             "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
         ) or candidate)
+        if not policy["publishable"]:
+            response["edit_notice"] = f"{policy['non_publishable_reason']}；内容仍可编辑保存，但不能批准或发布"
+        return response
 
     def approve_knowledge_candidate(self, actor: dict[str, Any], candidate_id: str) -> dict[str, Any]:
         candidate = self._candidate_access(actor, candidate_id)
@@ -4655,7 +5073,7 @@ class IngestionService:
         if not source_ids:
             raise ValidationError("候选没有可追溯的原始 block")
         source_rows = self.db.fetch_all(
-            """SELECT block_id,document_id,include_as_knowledge,region_type
+            """SELECT *
                FROM document_blocks WHERE document_id=? AND block_id IN ({})""".format(
                 ",".join("?" for _ in source_ids)
             ),
@@ -4665,6 +5083,9 @@ class IngestionService:
             raise ValidationError("候选包含无法追溯到当前资料的原始 block")
         if any(not row["include_as_knowledge"] or row["region_type"] != "knowledge" for row in source_rows):
             raise ValidationError("候选包含已被排除的非知识区域，不能批准")
+        policy = self._candidate_publish_policy(candidate, source_rows)
+        if not policy["publishable"]:
+            raise ValidationError(f"{policy['non_publishable_reason']}；请在习题中心单独审核")
         node = self._candidate_document_node(candidate)
         has_document_leaves = bool(self.db.fetch_one(
             """SELECT 1 ok FROM knowledge_nodes WHERE document_id=?
@@ -4694,6 +5115,7 @@ class IngestionService:
                 )
                 conn.execute("DELETE FROM knowledge_node_trash WHERE node_id=?", (node["node_id"],))
         self._sync_approved_source_blocks(candidate["document_id"])
+        self._refresh_document_review_state(candidate["document_id"], str(actor["user_id"]))
         return self._candidate_response(self.db.fetch_one(
             "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
         ) or candidate)
@@ -4727,9 +5149,163 @@ class IngestionService:
                     reason="知识点候选审核未通过", action_type="candidate_rejected",
                 )
         self._sync_approved_source_blocks(candidate["document_id"])
+        self._refresh_document_review_state(candidate["document_id"], str(actor["user_id"]))
         return self._candidate_response(self.db.fetch_one(
             "SELECT * FROM knowledge_candidates WHERE candidate_id=?", (candidate_id,)
         ) or candidate)
+
+    def approve_document_knowledge(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
+        """Approve safe document content into the teacher library; never publish it."""
+        document = self.require_document_access(actor, document_id)
+        if (actor.get("role") != "teacher" or document["owner_id"] != actor["user_id"]
+                or document["course_type"] != "shared_course"):
+            raise PermissionDenied("无权审核该资料")
+        job = self.db.fetch_one(
+            "SELECT * FROM ingestion_jobs WHERE document_id=? ORDER BY created_at DESC LIMIT 1",
+            (document_id,),
+        )
+        if not job or str(job.get("status") or "") not in {"ready", "review_required"}:
+            raise ValidationError("资料尚未完成解析，不能进行整本审核")
+        latest = self.db.fetch_one(
+            """SELECT * FROM semantic_analysis_jobs WHERE document_id=?
+               ORDER BY created_at DESC,rowid DESC LIMIT 1""",
+            (document_id,),
+        )
+        if latest and str(latest.get("status") or "") in {"queued", "running", "retry_wait"}:
+            raise ValidationError("语义分析仍在运行中，完成分析后才能进行整本审核")
+        if latest and str(latest.get("status") or "") == "failed":
+            raise ValidationError("语义分析失败，不能跳过失败分析直接整本发布；请先重新分析")
+        unclassified = self.db.fetch_one(
+            """SELECT COUNT(*) n FROM document_blocks
+               WHERE document_id=? AND content_destination='unclassified'""",
+            (document_id,),
+        ) or {"n": 0}
+        if int(unclassified["n"] or 0):
+            raise ValidationError("仍有原文块等待人工分类，不能进行整本审核")
+        reviewable_blocks = [
+            row for row in self.db.fetch_all(
+                """SELECT * FROM document_blocks
+                   WHERE document_id=? AND include_as_knowledge=1
+                     AND region_type='knowledge'
+                     AND content_destination NOT IN ('excluded','question_bank')""",
+                (document_id,),
+            )
+            if not self._non_publishable_knowledge_reason(row)
+        ]
+        with self.db.connect() as conn:
+            if reviewable_blocks:
+                placeholders = ",".join("?" for _ in reviewable_blocks)
+                conn.execute(
+                    f"""UPDATE document_blocks SET verification_status='teacher_verified',
+                       reviewed_by=?,reviewed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                       WHERE block_id IN ({placeholders})""",
+                    (actor["user_id"], *(row["block_id"] for row in reviewable_blocks)),
+                )
+            conn.execute(
+                """UPDATE course_documents SET knowledge_review_mode='whole_document',
+                   knowledge_review_status='approved',knowledge_reviewed_by=?,
+                   knowledge_reviewed_at=CURRENT_TIMESTAMP,status=CASE
+                     WHEN status='review_required' THEN 'ready' ELSE status END
+                   WHERE document_id=?""",
+                (actor["user_id"], document_id),
+            )
+            if job and str(job.get("status") or "") == "review_required":
+                conn.execute(
+                    """UPDATE ingestion_jobs SET status='ready',updated_at=CURRENT_TIMESTAMP
+                       WHERE document_id=? AND status='review_required'""",
+                    (document_id,),
+                )
+            if latest and str(latest.get("status") or "") == "review_required":
+                conn.execute(
+                    """UPDATE semantic_analysis_jobs SET status='completed',current_stage='completed',
+                       updated_at=CURRENT_TIMESTAMP WHERE analysis_job_id=?""",
+                    (latest["analysis_job_id"],),
+                )
+        self._sync_approved_source_blocks(document_id)
+        self._refresh_document_review_state(document_id, str(actor["user_id"]))
+        counts = self.db.fetch_one(
+            """SELECT
+                 (SELECT COUNT(*) FROM document_blocks WHERE document_id=?
+                    AND include_as_knowledge=1 AND region_type='knowledge'
+                    AND content_destination NOT IN ('excluded','question_bank')) knowledge_block_count,
+                 (SELECT COUNT(*) FROM knowledge_candidates WHERE document_id=?
+                    AND review_status NOT IN ('APPROVED','REJECTED')) pending_candidate_count""",
+            (document_id, document_id),
+        ) or {}
+        result = self.db.fetch_one(
+            """SELECT document_id,knowledge_review_mode,knowledge_review_status,
+                      knowledge_reviewed_by,knowledge_reviewed_at
+               FROM course_documents WHERE document_id=?""",
+            (document_id,),
+        ) or {"document_id": document_id}
+        result.update({
+            "review_mode_label": "整本批准到知识库",
+            "library_status": "approved",
+            "knowledge_block_count": int(counts.get("knowledge_block_count") or 0),
+            "pending_candidate_count": int(counts.get("pending_candidate_count") or 0),
+        })
+        return result
+
+    def approve_documents_to_library(
+        self, actor: dict[str, Any], course_id: str, document_ids: list[str]
+    ) -> dict[str, Any]:
+        """Course-scoped approval with explicit per-document results, without release."""
+        self._require_knowledge_workflow_course(actor, course_id)
+        ids = list(dict.fromkeys(document_ids))
+        if not ids or len(ids) > 100:
+            raise ValidationError("请选择 1 至 100 份资料批准到知识库")
+        # Validate the entire scope before any writes, including mixed-course input.
+        for document_id in ids:
+            document = self.require_document_access(actor, document_id)
+            if document["course_id"] != course_id:
+                raise PermissionDenied("只能批准当前课程的资料到知识库")
+        approved, failed = [], []
+        for document_id in ids:
+            try:
+                self.approve_document_knowledge(actor, document_id)
+                approved.append(document_id)
+            except ValidationError as exc:
+                failed.append({"document_id": document_id, "message": str(exc)})
+        return {"approved": approved, "failed": failed}
+
+    def _require_knowledge_workflow_course(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
+        if actor.get("role") != "teacher":
+            raise PermissionDenied("仅教师可管理课程知识库")
+        course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
+        if course["course_type"] != "shared_course" or course["owner_id"] != actor["user_id"]:
+            raise PermissionDenied("只能管理自己的共享课程知识库")
+        return course
+
+    def knowledge_workflow(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
+        """Keep working-library approval separate from the frozen student release."""
+        self._require_knowledge_workflow_course(actor, course_id)
+        readiness = self.publish_readiness(actor, course_id)
+        from published_knowledge import publication
+        version, nodes, blocks = publication(self.db, course_id)
+        published_documents = {str(block["document_id"]) for block in blocks}
+        for node in nodes:
+            published_documents.update(str(source["document_id"]) for source in node.get("sources", []))
+        documents = []
+        for job in self.list_jobs(actor, course_id):
+            approved = int(job.get("knowledge_candidate_approved_count") or 0)
+            pending = int(job.get("knowledge_candidate_pending_count") or 0)
+            whole = job.get("knowledge_review_status") == "approved"
+            library_status = "approved" if whole or (approved and not pending) else (
+                "partial" if approved else "pending"
+            )
+            can_approve = (job["status"] in {"ready", "review_required"}
+                           and job.get("analysis_status") not in {"queued", "running", "retry_wait", "failed"})
+            documents.append({
+                "document_id": job["document_id"], "library_status": library_status,
+                "approved_candidates": approved, "pending_candidates": pending,
+                "can_approve": can_approve and not whole,
+                "student_version": version["version_number"] if version and str(job["document_id"]) in published_documents else None,
+            })
+        student_version = {key: version[key] for key in (
+            "version_id", "version_number", "status", "published_at"
+        )} if version else None
+        return {**readiness, "documents": documents, "student_publication": student_version,
+                "student_knowledge_points": sum(n["node_type"] == "knowledge_point" for n in nodes)}
 
     def require_document_access(self, actor: dict[str, Any], document_id: str) -> dict[str, Any]:
         document = self.db.fetch_one(
@@ -4744,6 +5320,10 @@ class IngestionService:
             if document["owner_id"] != user_id:
                 raise PermissionDenied("无权查看该课程原始资料")
         elif role == "student":
+            if document["course_type"] == "personal_course":
+                if document["owner_id"] != user_id:
+                    raise PermissionDenied("无权查看他人的个人资料")
+                return document
             if document["course_type"] != "shared_course" or not document["student_file_visible"]:
                 raise PermissionDenied("教师尚未向学生开放该原始资料")
             published = self.db.fetch_one(
@@ -4755,6 +5335,9 @@ class IngestionService:
             )
             if not published:
                 raise PermissionDenied("该资料尚未随知识库发布")
+            from published_knowledge import document_allowed
+            if not document_allowed(self.db, document['course_id'], document_id, user_id):
+                raise PermissionDenied('该原始资料包含未授权教学班的内容')
         else:
             raise PermissionDenied("用户角色不合法")
         return document
@@ -5116,19 +5699,7 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         course = self.campus.require_access(course_id, str(actor["user_id"]), "student")
         if course["course_type"] != "shared_course":
             return []
-        return self.db.fetch_all(
-            """SELECT d.document_id,d.original_name,d.mime_type,d.size_bytes,d.created_at
-               FROM course_documents d
-               WHERE d.course_id=? AND d.student_file_visible=1
-                 AND EXISTS (
-                   SELECT 1 FROM document_blocks b
-                   JOIN knowledge_version_blocks vb USING(block_id)
-                   JOIN knowledge_versions v USING(version_id)
-                   WHERE b.document_id=d.document_id AND v.course_id=d.course_id AND v.status='published'
-                 )
-               ORDER BY d.created_at DESC""",
-            (course_id,),
-        )
+        return self.campus.list_documents(course_id, str(actor["user_id"]), "student")
 
     def cancel_job(self, actor: dict[str, Any], job_id: str) -> dict[str, Any]:
         job = self.get_job(actor, job_id)
@@ -5227,10 +5798,14 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             raise PermissionDenied("无权查看该课程体检单")
         rows = self.db.fetch_all(
             """SELECT p.status,p.parse_method,p.page_type,p.parse_level,p.validation_issues_json,
-                      (SELECT COUNT(*) FROM document_blocks b WHERE b.page_id=p.page_id AND b.block_type='formula') formulas,
-                      (SELECT COUNT(*) FROM document_blocks b WHERE b.page_id=p.page_id AND b.block_type='table') tables,
-                      (SELECT COUNT(*) FROM document_blocks b WHERE b.page_id=p.page_id AND b.verification_status='review_required') pending
-               FROM document_pages p JOIN course_documents d USING(document_id) WHERE d.course_id=?""", (course_id,)
+                      SUM(CASE WHEN b.block_type='formula' THEN 1 ELSE 0 END) formulas,
+                      SUM(CASE WHEN b.block_type='table' THEN 1 ELSE 0 END) tables,
+                      SUM(CASE WHEN b.verification_status='review_required' THEN 1 ELSE 0 END) pending
+               FROM document_pages p
+               JOIN course_documents d USING(document_id)
+               LEFT JOIN document_blocks b ON b.page_id=p.page_id
+               WHERE d.course_id=?
+               GROUP BY p.page_id,p.status,p.parse_method,p.page_type,p.parse_level,p.validation_issues_json""", (course_id,)
         )
         total = len(rows)
         native = sum(1 for row in rows if row["parse_method"] == "native")
@@ -5406,6 +5981,7 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             raise ValidationError("图片和表格不能直接进入知识库，可进入习题附件或排除")
         if destination == "knowledge" and not bool(block.get("include_as_knowledge", 1)):
             raise ValidationError("导航、封面和装饰页不能进入知识库")
+        self._reset_document_knowledge_review(str(block["document_id"]))
         group = question_group_key.strip()[:100]
         if destination == "question_bank" and not group:
             group = f"page-{block['page_number'] or 1}-item-{block['block_order']}"
@@ -5563,6 +6139,8 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             )
             conn.executemany("INSERT INTO question_bank_version_items(version_id,item_id) VALUES(?,?)",
                              [(version_id, row["item_id"]) for row in items])
+            from published_knowledge import capture_question_publication
+            capture_question_publication(conn,version_id)
             conn.execute(
                 """UPDATE question_bank_imports SET status='published',updated_at=CURRENT_TIMESTAMP
                    WHERE course_id=? AND import_id IN (
@@ -5756,6 +6334,13 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
     def update_node(self, actor: dict[str, Any], node_id: str, updates: dict[str, Any]) -> dict[str, Any]:
         node = self._require_node(actor, node_id)
         status = str(updates.get("status", node["status"]))
+        # Saving a revision is not a new approval. Explicit approval may save and
+        # approve together, but ordinary edits must return to the review queue.
+        content_changed = any(
+            key in updates and updates[key] != node[key] for key in ("title", "markdown")
+        )
+        if "status" not in updates and content_changed:
+            status = "draft"
         if status not in {"draft", "approved", "rejected"}:
             raise ValidationError("知识节点审核状态无效")
         parent_id = updates.get("parent_id", node["parent_id"])
@@ -5768,6 +6353,34 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                 or parent.get("generation_id") != node.get("generation_id")
             ):
                 raise ValidationError("父节点必须位于同一课程和同一目录范围")
+        if status == "approved":
+            proposed_text = (
+                f"{updates.get('title', node['title'])} "
+                f"{updates.get('markdown', node['markdown'])}"
+            )
+            if _QUESTION_LIKE_TEXT.search(proposed_text):
+                raise ValidationError("知识点标题或正文命中习题/答案类文字；文档目录中的习题类内容不能批准")
+            if node["node_scope"] == "document":
+                descendants = self.db.fetch_all(
+                    """WITH RECURSIVE descendants(node_id) AS (
+                           SELECT node_id FROM knowledge_nodes WHERE node_id=?
+                           UNION ALL
+                           SELECT n.node_id FROM knowledge_nodes n JOIN descendants d ON n.parent_id=d.node_id
+                       ) SELECT node_id,node_type FROM knowledge_nodes WHERE node_id IN (SELECT node_id FROM descendants)""",
+                    (node_id,),
+                )
+                blocked = next(
+                    (
+                        self._node_non_publishable_reason(str(row["node_id"]))
+                        for row in descendants
+                        if row["node_type"] == "knowledge_point"
+                    ),
+                    "",
+                )
+            else:
+                blocked = self._node_non_publishable_reason(node_id)
+            if blocked:
+                raise ValidationError(f"{blocked}；文档目录中的习题类内容不能批准")
         with self.db.connect() as conn:
             conn.execute(
                 """UPDATE knowledge_nodes SET title=?,summary='',markdown=?,keywords_json=?,parent_id=?,sort_order=?,
@@ -5818,6 +6431,15 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                     WHERE node_id IN ({placeholders}))""",
                 (verification, actor["user_id"], *affected_ids),
             )
+        if content_changed and status != "approved":
+            for source in self.db.fetch_all(
+                "SELECT DISTINCT document_id FROM knowledge_node_sources WHERE node_id=?", (node_id,),
+            ):
+                self._reset_document_knowledge_review(str(source["document_id"]))
+        if node["node_scope"] == "document" and content_changed:
+            self._sync_course_nodes_from_document_node(
+                node_id, reset_approval=status != "approved", actor_id=str(actor["user_id"]),
+            )
         updated = self.db.fetch_one("SELECT * FROM knowledge_nodes WHERE node_id=?", (node_id,)) or {}
         if "class_ids" in updates:
             scope_ids = affected_ids
@@ -5836,9 +6458,14 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                 actor, scope_ids, list(updates.get("class_ids") or [])
             )
         if node["node_scope"] == "document":
+            if node.get("document_id"):
+                self._reset_document_knowledge_review(str(node["document_id"]))
             self._sync_candidates_for_nodes(affected_ids, status, str(actor["user_id"]))
             if node.get("document_id"):
                 self._sync_approved_source_blocks(str(node["document_id"]))
+                self._refresh_document_review_state(
+                    str(node["document_id"]), str(actor["user_id"])
+                )
         updated.pop("summary", None)
         return updated
 
@@ -5875,6 +6502,17 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                 expanded[str(row["node_id"])] = row
         if not expanded:
             raise ValidationError("勾选范围没有可批准的知识节点")
+        blocked = next(
+            (
+                self._node_non_publishable_reason(node_id)
+                for node_id, row in expanded.items()
+                if row["node_type"] == "knowledge_point"
+                and self._node_non_publishable_reason(node_id)
+            ),
+            "",
+        )
+        if blocked:
+            raise ValidationError(f"{blocked}；文档目录中的习题类内容不能批准")
         all_ids = list(expanded)
         leaf_ids = [
             node_id for node_id, row in expanded.items()
@@ -5903,6 +6541,9 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             leaf_ids, "approved", str(actor["user_id"]),
         )
         self._sync_approved_source_blocks(str(first["document_id"]))
+        self._refresh_document_review_state(
+            str(first["document_id"]), str(actor["user_id"])
+        )
         return {
             "document_id": first["document_id"],
             "approved_node_ids": all_ids,
@@ -6492,6 +7133,16 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         if course["course_type"] != "shared_course" or course["owner_id"] != actor["user_id"]:
             raise PermissionDenied("只能检查自己的共享课程")
         self._ensure_partitioned_course_outline(course_id)
+        document_reviews = self.db.fetch_all(
+            """SELECT document_id,original_name,knowledge_review_mode,knowledge_review_status,
+                      knowledge_reviewed_by,knowledge_reviewed_at
+               FROM course_documents WHERE course_id=? ORDER BY created_at,document_id""",
+            (course_id,),
+        )
+        for review in document_reviews:
+            if review.get("knowledge_review_mode") == "whole_document" \
+                    and review.get("knowledge_review_status") == "approved":
+                self._refresh_document_review_state(str(review["document_id"]), str(actor["user_id"]))
         nodes = self.db.fetch_all(
             """SELECT * FROM knowledge_nodes WHERE course_id=? AND node_scope='course'
                AND content_domain='knowledge'
@@ -6502,6 +7153,11 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                     )))""",
             (course_id, course_id, course_id),
         )
+        whole_reviewed_documents = {
+            str(row["document_id"]): row for row in document_reviews
+            if row.get("knowledge_review_mode") == "whole_document"
+            and row.get("knowledge_review_status") == "approved"
+        }
         legacy_verified_blocks = int((self.db.fetch_one(
             """SELECT COUNT(*) n FROM document_blocks b JOIN course_documents d USING(document_id)
                WHERE d.course_id=? AND b.content_destination='knowledge'
@@ -6522,6 +7178,19 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                   for status in ("draft", "approved", "rejected")}
         approved_points = [node for node in nodes
                            if node["node_type"] == "knowledge_point" and node["status"] == "approved"]
+        whole_reviewed_points = []
+        for node in nodes:
+            if node["node_type"] != "knowledge_point" or node["status"] == "rejected":
+                continue
+            source_documents = {
+                str(row["document_id"]) for row in self.db.fetch_all(
+                    "SELECT DISTINCT document_id FROM knowledge_node_sources WHERE node_id=?",
+                    (node["node_id"],),
+                )
+            }
+            if source_documents and source_documents.issubset(whole_reviewed_documents):
+                if not self._node_non_publishable_reason(str(node["node_id"])):
+                    whole_reviewed_points.append(node)
         source_less = [node for node in approved_points if not self.db.fetch_one(
             "SELECT 1 ok FROM knowledge_node_sources WHERE node_id=? LIMIT 1", (node["node_id"],)
         )]
@@ -6583,7 +7252,8 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         )
         blockers: list[dict[str, Any]] = []
         for code, count, message, target in (
-            ("no_approved_points", int(not approved_points and not legacy_block_mode), "没有已批准知识点", "/knowledge"),
+            ("no_approved_points", int(not approved_points and not whole_reviewed_documents and not legacy_block_mode),
+             "没有逐条批准知识点或整本审核通过的资料", "/knowledge"),
             ("active_analysis", 0 if legacy_block_mode else active_jobs, "仍有语义分析任务运行中", "/knowledge"),
             ("failed_analysis", 0 if legacy_block_mode else failed_jobs, "存在尚未处理的分析失败", "/knowledge"),
             ("unclassified_blocks", unclassified, "仍有原文块等待人工分类", "/knowledge"),
@@ -6607,7 +7277,16 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             "course_id": course_id, "can_publish": not blockers, "publication": version,
             "document_count": document_count, "node_counts": counts,
             "approved_knowledge_points": len(approved_points),
-            "publication_mode": "verified_blocks" if legacy_block_mode else "knowledge_tree",
+            "whole_reviewed_documents": len(whole_reviewed_documents),
+            "whole_reviewed_document_ids": sorted(whole_reviewed_documents),
+            "whole_reviewed_knowledge_points": len(whole_reviewed_points),
+            "document_reviews": document_reviews,
+            "publication_mode": (
+                "verified_blocks" if legacy_block_mode else
+                "whole_document" if whole_reviewed_documents and not approved_points else
+                "mixed" if whole_reviewed_documents and approved_points else
+                "knowledge_tree"
+            ),
             "legacy_verified_blocks": legacy_verified_blocks,
             "unclassified_blocks": unclassified, "active_analysis_jobs": active_jobs,
             "failed_analysis_jobs": failed_jobs, "blockers": blockers,
@@ -6631,21 +7310,11 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             )
             if not class_scope:
                 raise PermissionDenied("无权查看该教学班")
-        analysis = self.campus.class_analysis(course_id, str(actor["user_id"]))
+        analysis = self.campus.class_analysis(course_id, str(actor["user_id"]), class_id)
         readiness = self.publish_readiness(actor, course_id)
         health = self.course_health(actor, course_id)
-        people = self.db.fetch_one(
-            """SELECT COUNT(DISTINCT user_id) active_students FROM (
-                   SELECT user_id FROM course_questions WHERE course_id=?
-                   UNION ALL SELECT user_id FROM course_attempts WHERE course_id=?
-               )""", (course_id, course_id),
-        ) or {"active_students": 0}
-        attempts = self.db.fetch_all("SELECT score,total FROM course_attempts WHERE course_id=?", (course_id,))
-        buckets = {"0-59": 0, "60-69": 0, "70-79": 0, "80-89": 0, "90-100": 0}
-        for attempt in attempts:
-            score = 100 * float(attempt["score"]) / max(1.0, float(attempt["total"]))
-            key = "0-59" if score < 60 else "60-69" if score < 70 else "70-79" if score < 80 else "80-89" if score < 90 else "90-100"
-            buckets[key] += 1
+        people = {"active_students":analysis["active_students"]}
+        buckets = analysis["score_buckets"]
         priorities: list[dict[str, Any]] = []
         for blocker in readiness["blockers"]:
             priorities.append({"severity": "high", "type": blocker["code"], "title": blocker["message"],
@@ -6660,19 +7329,24 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         return {
             "course": {"course_id": course_id, "course_name": course["course_name"]},
             "requested_class": class_scope,
-            "data_scope": "course_only" if class_id else "course",
-            "scope_note": ("历史学习事件没有 class_id，已安全回退为课程匿名聚合，未猜测班级归属"
-                           if class_id else "共享课程匿名聚合"),
+            "data_scope": analysis['data_scope'],
+            "scope_note": analysis['scope_note'],
             "knowledge": {"readiness": readiness, "health": health},
             "learning": {**analysis, "active_students": int(people["active_students"]),
                          "score_buckets": buckets},
             "priorities": priorities,
         }
 
-    def publish(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
-        course = self.campus.require_access(course_id, str(actor["user_id"]), "teacher")
-        if course["owner_id"] != actor["user_id"]:
-            raise PermissionDenied("无权发布该课程知识库")
+    def publish(self, actor: dict[str, Any], course_id: str, request_id: str | None = None) -> dict[str, Any]:
+        self._require_knowledge_workflow_course(actor, course_id)
+        if request_id is not None and (not isinstance(request_id,str) or not 1<=len(request_id)<=100):
+            raise ValidationError('发布操作标识无效')
+        if request_id:
+            previous = self.db.fetch_one("SELECT course_id,result_json FROM submission_receipts WHERE user_id=? AND kind='knowledge_publish' AND request_id=?", (actor['user_id'],request_id))
+            if previous:
+                if previous['course_id'] != course_id:
+                    raise ValidationError('发布操作标识已用于其他课程')
+                return json.loads(previous['result_json'])
         readiness = self.publish_readiness(actor, course_id)
         if not readiness["can_publish"]:
             messages = "；".join(item["message"] for item in readiness["blockers"])
@@ -6690,8 +7364,35 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                    WHEN 'knowledge_graph' THEN 7 WHEN 'teaching_schedule' THEN 8 ELSE 9 END,
                    sort_order""", (course_id, course_id, course_id),
         )
-        approved_ids = {node["node_id"] for node in outline_nodes if node["status"] == "approved"}
-        if approved_ids:
+        whole_reviewed_documents = set(readiness.get("whole_reviewed_document_ids") or [])
+        whole_reviewed_point_ids: set[str] = set()
+        for node in outline_nodes:
+            if node["node_type"] != "knowledge_point" or node["status"] == "rejected":
+                continue
+            source_documents = {
+                str(row["document_id"]) for row in self.db.fetch_all(
+                    "SELECT DISTINCT document_id FROM knowledge_node_sources WHERE node_id=?",
+                    (node["node_id"],),
+                )
+            }
+            if source_documents and source_documents.issubset(whole_reviewed_documents):
+                if not self._node_non_publishable_reason(str(node["node_id"])):
+                    whole_reviewed_point_ids.add(str(node["node_id"]))
+        approved_ids = {
+            node["node_id"] for node in outline_nodes if node["status"] == "approved"
+        } | whole_reviewed_point_ids
+        blocked = next(
+            (
+                self._node_non_publishable_reason(str(node["node_id"]))
+                for node in outline_nodes
+                if node["node_type"] == "knowledge_point"
+                and node["node_id"] in approved_ids
+            ),
+            "",
+        )
+        if blocked:
+            raise ValidationError(f"{blocked}；习题类内容不能发布到知识库")
+        if approved_ids or whole_reviewed_documents:
             node_map = {node["node_id"]: node for node in outline_nodes}
             node_ids = set(approved_ids)
             for node_id in list(approved_ids):
@@ -6722,11 +7423,36 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                     f"来源：{source_text}" if source_text else "",
                 ])
             approved_list = sorted(approved_ids)
-            blocks = self.db.fetch_all(
-                f"""SELECT DISTINCT block_id FROM knowledge_node_sources
-                     WHERE node_id IN ({','.join('?' for _ in approved_list)})""",
-                tuple(approved_list),
-            )
+            block_ids: set[str] = set()
+            if approved_list:
+                blocks = self.db.fetch_all(
+                    """SELECT DISTINCT s.block_id FROM knowledge_node_sources s
+                       JOIN document_blocks b ON b.block_id=s.block_id
+                       WHERE s.node_id IN ({}) AND b.include_as_knowledge=1
+                         AND b.region_type='knowledge'
+                         AND b.content_destination NOT IN ('excluded','question_bank')""".format(
+                        ",".join("?" for _ in approved_list)
+                    ),
+                    tuple(approved_list),
+                )
+                block_ids.update(str(row["block_id"]) for row in blocks)
+            if whole_reviewed_documents:
+                whole_placeholders = ",".join("?" for _ in whole_reviewed_documents)
+                blocks = self.db.fetch_all(
+                    """SELECT DISTINCT b.* FROM document_blocks b
+                       WHERE b.document_id IN ({}) AND b.include_as_knowledge=1
+                         AND b.region_type='knowledge'
+                         AND b.content_destination NOT IN ('excluded','question_bank')
+                         AND b.verification_status IN ('auto_verified','teacher_verified')""".format(
+                        whole_placeholders
+                    ),
+                    tuple(sorted(whole_reviewed_documents)),
+                )
+                block_ids.update(
+                    str(row["block_id"]) for row in blocks
+                    if not self._non_publishable_knowledge_reason(row)
+                )
+            blocks = [{"block_id": block_id} for block_id in sorted(block_ids)]
             relations = self.db.fetch_all(
                 """SELECT relation_id FROM knowledge_relations WHERE course_id=? AND status='approved'
                    AND (generation_id IN (SELECT generation_id FROM course_outline_generations
@@ -6735,10 +7461,18 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                             SELECT 1 FROM course_outline_generations WHERE course_id=? AND status='current'
                         )))""",
                 (course_id, course_id, course_id),
-            )
+            ) if approved_list else []
             current = self.db.fetch_one("SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?", (course_id,))
             version_id = f"kv_{uuid.uuid4().hex}"
             with self.db.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if request_id:
+                    previous = conn.execute("SELECT course_id,result_json FROM submission_receipts WHERE user_id=? AND kind='knowledge_publish' AND request_id=?", (actor['user_id'],request_id)).fetchone()
+                    if previous:
+                        if previous['course_id'] != course_id:
+                            raise ValidationError('发布操作标识已用于其他课程')
+                        return json.loads(previous['result_json'])
+                current = conn.execute('SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?',(course_id,)).fetchone()
                 conn.execute("UPDATE knowledge_versions SET status='superseded' WHERE course_id=? AND status='published'", (course_id,))
                 conn.execute(
                     """INSERT INTO knowledge_versions(version_id,course_id,version_number,status,created_by,published_at,markdown_snapshot)
@@ -6751,6 +7485,11 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                                  [(version_id, row["block_id"]) for row in blocks])
                 conn.executemany("INSERT INTO knowledge_version_relations(version_id,relation_id) VALUES(?,?)",
                                  [(version_id, row["relation_id"]) for row in relations])
+                from published_knowledge import capture_publication
+                capture_publication(conn, version_id)
+                if request_id:
+                    result = dict(conn.execute('SELECT * FROM knowledge_versions WHERE version_id=?',(version_id,)).fetchone())
+                    conn.execute('INSERT INTO submission_receipts VALUES(?,?,?,?,?,?)',(actor['user_id'],'knowledge_publish',request_id,course_id,'{}',json.dumps(result,ensure_ascii=False)))
             return self.db.fetch_one("SELECT * FROM knowledge_versions WHERE version_id=?", (version_id,)) or {}
 
         pending = self.db.fetch_one(
@@ -6770,6 +7509,14 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         current = self.db.fetch_one("SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?", (course_id,))
         version_id = f"kv_{uuid.uuid4().hex}"
         with self.db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            if request_id:
+                previous = conn.execute("SELECT course_id,result_json FROM submission_receipts WHERE user_id=? AND kind='knowledge_publish' AND request_id=?", (actor['user_id'],request_id)).fetchone()
+                if previous:
+                    if previous['course_id'] != course_id:
+                        raise ValidationError('发布操作标识已用于其他课程')
+                    return json.loads(previous['result_json'])
+            current = conn.execute('SELECT COALESCE(MAX(version_number),0) n FROM knowledge_versions WHERE course_id=?',(course_id,)).fetchone()
             conn.execute("UPDATE knowledge_versions SET status='superseded' WHERE course_id=? AND status='published'", (course_id,))
             conn.execute(
                 """INSERT INTO knowledge_versions(version_id,course_id,version_number,status,created_by,published_at)
@@ -6778,4 +7525,9 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
             )
             conn.executemany("INSERT INTO knowledge_version_blocks(version_id,block_id) VALUES(?,?)",
                              [(version_id, row["block_id"]) for row in blocks])
+            from published_knowledge import capture_publication
+            capture_publication(conn, version_id)
+            if request_id:
+                result = dict(conn.execute('SELECT * FROM knowledge_versions WHERE version_id=?',(version_id,)).fetchone())
+                conn.execute('INSERT INTO submission_receipts VALUES(?,?,?,?,?,?)',(actor['user_id'],'knowledge_publish',request_id,course_id,'{}',json.dumps(result,ensure_ascii=False)))
         return self.db.fetch_one("SELECT * FROM knowledge_versions WHERE version_id=?", (version_id,)) or {}

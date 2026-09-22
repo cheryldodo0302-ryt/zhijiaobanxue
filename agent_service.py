@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from campus_service import CampusError, CampusService, ValidationError
-from config import TEACHER_PORTAL_ENABLED
+import config
 from question_bank_service import QuestionBankService
 from skills.class_analysis_skill import ClassAnalysisInput, ClassAnalysisSkill
 from skills.contracts import SkillContext
@@ -25,7 +25,9 @@ STUDENT_ACTIONS = {
     "course_qa", "quiz_generate", "quiz_submit", "learning_profile",
     "wrong_question_list", "weak_point_analysis", "personal_data_export",
     "image_text_extract", "knowledge_blocks_build", "knowledge_blocks_list",
+    "published_knowledge_list", "published_knowledge_import",
     "knowledge_block_update", "knowledge_block_split", "knowledge_block_merge",
+    "knowledge_block_ai_split", "knowledge_block_ai_split_apply",
     "cloze_generate", "recitation_evaluate", "memory_summary",
     "memory_questions_generate", "memory_workbook_export",
     "cloze_submit", "memory_questions_submit", "student_dashboard",
@@ -37,6 +39,7 @@ TEACHER_ACTIONS = {
     "document_status", "course_knowledge_status", "class_question_analysis",
     "class_weak_point_analysis", "uncovered_question_analysis",
     "class_quiz_analysis", "teaching_report", "class_data_export",
+    "student_portrait", "student_portrait_evaluate",
 }
 
 
@@ -90,7 +93,7 @@ class CampusAgentService:
         try:
             if req.agent not in {"student_assistant", "teacher_assistant"}:
                 raise ValidationError("Agent 不合法")
-            if req.agent == "teacher_assistant" and not TEACHER_PORTAL_ENABLED:
+            if req.agent == "teacher_assistant" and not config.TEACHER_PORTAL_ENABLED:
                 return AgentResponse(req.request_id, "disabled", message="教师端当前已禁用，学生端最小闭环稳定后再开放")
             actions = STUDENT_ACTIONS if req.agent == "student_assistant" else TEACHER_ACTIONS
             expected_role = "student" if req.agent == "student_assistant" else "teacher"
@@ -100,7 +103,10 @@ class CampusAgentService:
             role = str(req.actor.get("role", "")).strip()
             if not user_id or role != expected_role:
                 raise ValidationError("用户角色不合法")
-            data = self._dispatch(req, user_id, role)
+            from account_ai_service import AccountAiService
+            from config import use_request_ai_settings
+            with use_request_ai_settings(AccountAiService(self.campus.db).resolve(user_id)):
+                data = self._dispatch(req, user_id, role)
             return AgentResponse(req.request_id, "success", data=data)
         except CampusError as exc:
             return AgentResponse(req.request_id, "error", message=str(exc))
@@ -124,6 +130,16 @@ class CampusAgentService:
 
     def _dispatch(self, req: AgentRequest, user_id: str, role: str) -> Any:
         action, inp, scope = req.action, req.input, req.scope
+        if action in {"student_portrait", "student_portrait_evaluate"}:
+            from browser_study_room_service import BrowserStudyRoomService
+            from student_portrait_service import StudentPortraitService
+            room = BrowserStudyRoomService(self.campus.db.db_path.parent / "study_room.db", campus=self.campus)
+            try:
+                service = StudentPortraitService(self.campus, room)
+                method = service.get if action == "student_portrait" else service.evaluate
+                return method(req.actor, scope["course_id"], scope["class_id"], inp["student_id"], inp["start_at"], inp["end_at"])
+            finally:
+                room.engine.dispose()
         skill_context = SkillContext(user_id=user_id, role=role, course_id=scope.get("course_id") or "unscoped")
         if action == "personal_course_create":
             return self.campus.create_course(inp["course_name"], "personal_course", user_id, role, inp.get("description", ""))
@@ -174,8 +190,9 @@ class CampusAgentService:
                     inp["version_id"],
                     [{"item_id": item["item_id"], "response": response}
                      for item, response in zip(inp["items"], inp["responses"])],
+                    request_id=inp.get('submission_id'),
                 )
-            return self.campus.submit_quiz(scope["course_id"], user_id, role, inp.get("question_id"), inp["items"], inp["responses"])
+            return self.campus.submit_quiz(scope["course_id"], user_id, role, inp.get("question_id"), inp.get("items",[]), inp["responses"], inp.get('paper_id'))
         if action in {"learning_profile", "wrong_question_list", "weak_point_analysis"}:
             profile = self.learning_profile_skill.run(skill_context, LearningProfileInput()).data
             return profile if action == "learning_profile" else profile["wrong_questions" if action == "wrong_question_list" else "weak_points"]
@@ -192,6 +209,12 @@ class CampusAgentService:
             return self.memory.build_blocks(scope["course_id"], user_id, inp.get("document_id"))
         if action == "knowledge_blocks_list":
             return self.memory.list_blocks(scope["course_id"], user_id)
+        if action == "published_knowledge_list":
+            return self.memory.list_published_knowledge(scope["course_id"], user_id)
+        if action == "published_knowledge_import":
+            return self.memory.import_published_knowledge(
+                scope["course_id"], user_id, inp.get("node_ids", []),
+            )
         if action == "knowledge_block_update":
             return self.memory.update_block(int(inp["block_id"]), user_id, inp["title"], inp.get("keywords", []),
                                             inp["content"], inp.get("favorite"))
@@ -199,12 +222,16 @@ class CampusAgentService:
             return self.memory.split_block(int(inp["block_id"]), user_id, int(inp["position"]))
         if action == "knowledge_block_merge":
             return self.memory.merge_next(int(inp["block_id"]), user_id)
+        if action == "knowledge_block_ai_split":
+            return self.memory.ai_split_preview(int(inp["block_id"]), user_id)
+        if action == "knowledge_block_ai_split_apply":
+            return self.memory.apply_ai_split(int(inp["block_id"]), user_id, inp.get("parts", []))
         if action == "cloze_generate":
             return self.memory.cloze(int(inp["block_id"]), user_id, inp.get("extra_keywords", []))
         if action == "cloze_submit":
-            return self.memory.submit_cloze(int(inp["block_id"]), user_id, inp.get("extra_keywords", []), inp["responses"])
+            return self.memory.submit_cloze(int(inp["block_id"]), user_id, inp.get("extra_keywords", []), inp["responses"], inp.get('paper_id'))
         if action == "recitation_evaluate":
-            return self.memory.evaluate_recitation(int(inp["block_id"]), user_id, inp["recited_text"])
+            return self.memory.evaluate_recitation(int(inp["block_id"]), user_id, inp["recited_text"], inp.get('submission_id'))
         if action == "memory_summary":
             return self.memory.memory_summary(scope["course_id"], user_id)
         if action == "memory_questions_generate":
@@ -230,19 +257,19 @@ class CampusAgentService:
             content = self.memory.export_workbook(inp.get("course_name", "课程"), inp["questions"])
             return {"file_name": "memory_workbook.docx", "content_base64": base64.b64encode(content).decode("ascii")}
         if action in {"class_question_analysis", "class_weak_point_analysis", "uncovered_question_analysis", "class_quiz_analysis"}:
-            result = self.class_analysis_skill.run(skill_context, ClassAnalysisInput()).data
+            result = self.class_analysis_skill.run(skill_context, ClassAnalysisInput(class_id=inp.get('class_id') or scope.get('class_id'))).data
             keys = {"class_question_analysis":"frequent_questions", "class_weak_point_analysis":"weak_points",
                     "uncovered_question_analysis":"uncovered_questions"}
             return result if action == "class_quiz_analysis" else result[keys[action]]
         if action == "teaching_report":
-            return self.teaching_report_skill.run(skill_context, TeachingReportInput()).data
+            return self.teaching_report_skill.run(skill_context, TeachingReportInput(class_id=inp.get('class_id') or scope.get('class_id'))).data
         if action == "class_data_export":
             file_format = str(inp.get("format", "csv")).lower()
             exporters = {"csv": self.campus.export_class_csv, "xlsx": self.campus.export_class_excel,
                          "docx": self.campus.export_class_word}
             if file_format not in exporters:
                 raise ValidationError("导出格式仅支持 csv、xlsx 或 docx")
-            content = exporters[file_format](scope["course_id"], user_id)
+            content = exporters[file_format](scope["course_id"], user_id, inp.get('class_id') or scope.get('class_id'))
             return {"file_name": f"class_report.{file_format}",
                     "content_base64": base64.b64encode(content).decode("ascii")}
         return {"status": "not_implemented", "message": "该功能暂未实现"}

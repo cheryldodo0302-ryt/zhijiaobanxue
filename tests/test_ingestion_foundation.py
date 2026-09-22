@@ -59,6 +59,20 @@ def test_vault_is_never_in_published_student_retrieval(setup):
     assert campus._retriever(course["course_id"]).rows == []
 
 
+def test_publication_retry_uses_the_same_saved_version(setup):
+    db,campus,ingestion,teacher,course = setup
+    job = ingestion.queue_document(teacher,course['course_id'],'retry.txt','text/plain','关系模型使用二维表表达数据关系。'.encode(),analysis_mode='local')
+    ingestion.process_job(job['job_id'])
+    analysis = db.fetch_one('SELECT analysis_job_id FROM semantic_analysis_jobs WHERE document_id=?',(job['document_id'],))
+    if analysis:
+        ingestion.process_semantic_analysis(analysis['analysis_job_id'])
+    ingestion.approve_document_knowledge(teacher,job['document_id'])
+    first = ingestion.publish(teacher,course['course_id'],'one-operation')
+    second = ingestion.publish(teacher,course['course_id'],'one-operation')
+    assert second==first
+    assert db.fetch_one('SELECT COUNT(*) n FROM knowledge_versions WHERE course_id=?',(course['course_id'],))['n']==1
+
+
 def test_document_ir_preserves_formula_bbox_and_database_aliases():
     payload = {
         "_version_name": "test",
@@ -88,6 +102,18 @@ def test_cancel_retry_and_health_report(setup):
     assert health["total_pages"] == 1
     assert health["native_pages"] == 1
     assert health["cloud_model_calls"] == health["cloud_tokens"] == 0
+
+
+def test_teaching_overview_loads_without_learning_events(setup):
+    _, _, ingestion, teacher, course = setup
+
+    overview = ingestion.teaching_overview(teacher, course["course_id"])
+
+    assert overview["course"]["course_id"] == course["course_id"]
+    assert overview["learning"]["active_students"] == 0
+    assert overview["learning"]["question_count"] == 0
+    assert overview["learning"]["quiz_count"] == 0
+    assert isinstance(overview["priorities"], list)
 
 
 def test_empty_review_document_can_be_reparsed(setup):

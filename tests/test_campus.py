@@ -49,10 +49,19 @@ def campus(tmp_path):
 
 
 def add_shared(campus):
+    from ingestion_service import IngestionService
     course = campus.create_course("共享课", "shared_course", "teacher_1", "teacher", visibility="enrolled")
     campus.enroll_student(course["course_id"], "teacher_1", "student_1")
-    campus.upload_document(course["course_id"], "teacher_1", "teacher", "lesson.md", "text/markdown",
-                           "# 监督学习\n监督学习使用带标签样本训练模型。".encode())
+    ingestion = IngestionService(campus.db, campus)
+    teacher = {"user_id":"teacher_1", "role":"teacher"}
+    job = ingestion.queue_document(teacher, course["course_id"], "lesson.md", "text/markdown",
+                                    "# 监督学习\n监督学习使用带标签样本训练模型。".encode(), analysis_mode="local")
+    ingestion.process_job(job["job_id"])
+    analysis = campus.db.fetch_one("SELECT analysis_job_id FROM semantic_analysis_jobs WHERE document_id=?", (job["document_id"],))
+    if analysis:
+        ingestion.process_semantic_analysis(analysis["analysis_job_id"])
+    ingestion.approve_document_knowledge(teacher, job["document_id"])
+    ingestion.publish(teacher, course["course_id"])
     return course
 
 
@@ -177,6 +186,38 @@ def test_agent_uploads_and_extracts_pdf_docx_pptx(campus):
     assert all(row["text_preview"] for row in documents)
 
 
+def test_textless_student_pdf_uses_local_ocr(monkeypatch, campus):
+    from pypdf import PdfWriter
+
+    course = campus.create_course("扫描资料", "personal_course", "student_1", "student")
+    stream = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=595, height=842)
+    writer.write(stream)
+
+    class LocalMinerU:
+        base_url = "http://127.0.0.1:18000"
+        enabled = True
+
+        def parse(self, _path, **_kwargs):
+            return {"pdf_info": [{"page_idx": 0, "para_blocks": [{
+                "type": "text", "lines": [{"spans": [{
+                    "content": "数据库系统由数据、数据库管理系统和用户组成。",
+                }]}],
+            }]}]}
+
+    monkeypatch.setattr("campus_service.MinerUClient", LocalMinerU)
+    uploaded = campus.upload_document(
+        course["course_id"], "student_1", "student", "扫描教材.pdf",
+        "application/pdf", stream.getvalue(),
+    )
+    assert uploaded["parser_method"] == "ocr"
+    rows = campus.db.fetch_all(
+        "SELECT content FROM document_chunks WHERE document_id=?", (uploaded["document_id"],),
+    )
+    assert "数据库管理系统" in rows[0]["content"]
+
+
 def test_qwen_provider_uses_real_compatible_endpoint_contract():
     class FakeResponse:
         status_code = 200
@@ -222,6 +263,11 @@ def test_student_memory_minimum_loop_and_teacher_disabled(campus):
                            "actor":{"user_id":"student_1","role":"student"},"scope":{"course_id":course["course_id"]},
                            "input":{"questions":questions.data,"responses":["带标签样本"]}})
     assert graded.status == "success" and graded.data["score"] == 100
+    repeated = agent.invoke({"request_id":"repeat","agent":"student_assistant","action":"memory_questions_submit",
+        "actor":{"user_id":"student_1","role":"student"},"scope":{"course_id":course['course_id']},
+        "input":{"questions":questions.data,"responses":["different"]}})
+    assert repeated.status == 'error'
+    questions.data = agent.memory.generate_questions(course['course_id'],'student_1',3)
     wrong_grade = agent.invoke({"request_id":"m5b","agent":"student_assistant","action":"memory_questions_submit",
                                  "actor":{"user_id":"student_1","role":"student"},"scope":{"course_id":course["course_id"]},
                                  "input":{"questions":questions.data,"responses":["错误答案"]}})
@@ -258,6 +304,201 @@ def test_student_memory_minimum_loop_and_teacher_disabled(campus):
     assert deleted.status == "success"
     with pytest.raises(NotFound):
         campus.get_course(course["course_id"])
+
+
+def test_knowledge_card_ai_split_and_cloze_only_call_provider_on_generation(tmp_path):
+    class KnowledgeCardProvider(LLMProvider):
+        calls = []
+
+        def generate(self, system_prompt: str, user_prompt: str) -> str:
+            self.calls.append((system_prompt, user_prompt))
+            if "语块拆分专家" in system_prompt:
+                return json.dumps([
+                    {"title": "监督学习定义", "keywords": ["监督学习"],
+                     "content": "监督学习是利用带标签样本训练模型的方法。"},
+                    {"title": "监督学习训练", "keywords": ["更新参数"],
+                     "content": "训练过程中根据误差更新参数。"},
+                ], ensure_ascii=False)
+            if "课程记忆重点分析助手" in system_prompt:
+                return json.dumps({
+                    "keywords": ["监督学习", "带标签样本"],
+                    "reason": "定义和训练样本是本知识点的核心概念",
+                }, ensure_ascii=False)
+            return "{}"
+
+    provider = KnowledgeCardProvider()
+    campus = CampusService(
+        LearningDatabase(tmp_path / "knowledge-card-ai.db"),
+        tmp_path / "uploads",
+        provider_factory=lambda: provider,
+    )
+    agent = CampusAgentService(campus)
+    course = campus.create_course("AI 知识卡片", "personal_course", "student_1", "student")
+    campus.db.execute(
+        """INSERT INTO knowledge_blocks(course_id,owner_id,block_order,title,keywords_json,content)
+           VALUES(?,?,?,?,?,?)""",
+        (course["course_id"], "student_1", 1, "监督学习基础", "[]",
+         "监督学习是利用带标签样本训练模型的方法。训练过程中根据误差更新参数。这类方法还需要根据训练目标评估模型效果。"),
+    )
+    block = campus.db.fetch_one(
+        "SELECT * FROM knowledge_blocks WHERE course_id=? AND owner_id=?",
+        (course["course_id"], "student_1"),
+    )
+    assert block
+
+    preview = agent.invoke({
+        "request_id": "ai-split-preview", "agent": "student_assistant",
+        "action": "knowledge_block_ai_split",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+        "input": {"block_id": block["block_id"]},
+    })
+    assert preview.status == "success" and len(preview.data["parts"]) == 2, preview.message
+    assert len(provider.calls) == 1
+
+    saved = agent.invoke({
+        "request_id": "ai-split-apply", "agent": "student_assistant",
+        "action": "knowledge_block_ai_split_apply",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+        "input": {"block_id": block["block_id"], "parts": preview.data["parts"]},
+    })
+    assert saved.status == "success" and len(saved.data) == 2
+    assert len(provider.calls) == 1, "确认保存语块不应再次调用模型"
+
+    cloze = agent.invoke({
+        "request_id": "ai-cloze-generate", "agent": "student_assistant",
+        "action": "cloze_generate",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+        "input": {"block_id": block["block_id"], "extra_keywords": []},
+    })
+    assert cloze.status == "success"
+    assert cloze.data["keyword_source"] == "AI 分析重点"
+    assert cloze.data["blank_count"] == 2
+    assert len(provider.calls) == 2
+
+    grade = agent.invoke({
+        "request_id": "ai-cloze-submit", "agent": "student_assistant",
+        "action": "cloze_submit",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+        "input": {"block_id": block["block_id"], "extra_keywords": cloze.data["keywords"],
+                  "responses": ["监督学习", "带标签样本"]},
+    })
+    assert grade.status == "success" and grade.data["score"] == 100
+    assert len(provider.calls) == 2, "提交挖空应复用生成结果，不应重复发送知识点"
+
+    denied = agent.invoke({
+        "request_id": "ai-split-denied", "agent": "student_assistant",
+        "action": "knowledge_block_ai_split",
+        "actor": {"user_id": "student_2", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+        "input": {"block_id": block["block_id"]},
+    })
+    assert denied.status == "error"
+    assert len(provider.calls) == 2, "未通过权限校验时不应发送知识点内容"
+
+
+@pytest.mark.parametrize('long_content', [False, True])
+def test_student_can_import_published_shared_course_knowledge(campus, long_content):
+    agent = CampusAgentService(campus)
+    course = campus.create_course("教师共享知识", "shared_course", "teacher_1", "teacher")
+    campus.enroll_student(course["course_id"], "teacher_1", "student_1")
+    campus.enroll_student(course["course_id"], "teacher_1", "student_2")
+    node_id = "kn_published_1"
+    version_id = "kv_published_1"
+    content = ('# 监督学习\n\n' + '使用带标签样本训练模型。' * 80
+               + '\n\n## 损失函数\n\n$$\nL = (y - x)^2\n$$\n\n' + '根据误差更新参数。' * 80
+               if long_content else '监督学习使用带标签样本训练模型。')
+    campus.db.execute(
+        """INSERT INTO knowledge_nodes(
+               node_id,course_id,node_scope,node_type,title,summary,markdown,keywords_json,status,material_type
+           ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (node_id, course["course_id"], "course", "knowledge_point", "监督学习",
+         "监督学习使用带标签样本训练模型。", content,
+         json.dumps(["监督学习", "标签"], ensure_ascii=False), "approved", "textbook"),
+    )
+    campus.db.execute(
+        """INSERT INTO knowledge_versions(version_id,course_id,version_number,status,created_by)
+           VALUES(?,?,?,?,?)""",
+        (version_id, course["course_id"], 1, "published", "teacher_1"),
+    )
+    campus.db.execute(
+        "INSERT INTO knowledge_version_nodes(version_id,node_id) VALUES(?,?)",
+        (version_id, node_id),
+    )
+    from published_knowledge import capture_publication
+    with campus.db.connect() as conn:
+        capture_publication(conn,version_id)
+
+    available = agent.invoke({
+        "request_id": "published-list", "agent": "student_assistant",
+        "action": "published_knowledge_list",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+    })
+    assert available.status == "success"
+    assert available.data["items"][0]["title"] == "监督学习"
+
+    imported = agent.invoke({
+        "request_id": "published-import", "agent": "student_assistant",
+        "action": "published_knowledge_import",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+        "input": {"node_ids": [node_id]},
+    })
+    assert imported.status == "success"
+    assert imported.data["imported_count"] > 1 if long_content else imported.data["imported_count"] == 1
+    saved = campus.db.fetch_all('SELECT * FROM knowledge_blocks WHERE course_id=? ORDER BY block_order', (course['course_id'],))
+    assert ''.join(row['content'] for row in saved) == content
+    assert all(row['source_node_id'] == node_id and row['source_version_id'] == version_id for row in saved)
+    assert campus.db.fetch_one('SELECT markdown FROM knowledge_nodes WHERE node_id=?', (node_id,))['markdown'] == content
+    assert agent.invoke({
+        "request_id": "blocks-1", "agent": "student_assistant",
+        "action": "knowledge_blocks_list",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+    }).data[0]["title"].startswith("监督学习")
+
+    repeated = agent.invoke({
+        "request_id": "published-repeat", "agent": "student_assistant",
+        "action": "published_knowledge_import",
+        "actor": {"user_id": "student_1", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+        "input": {"node_ids": [node_id]},
+    })
+    assert repeated.data["imported_count"] == 0
+    assert repeated.data["skipped_count"] == 1
+    assert agent.invoke({
+        "request_id": "blocks-2", "agent": "student_assistant",
+        "action": "knowledge_blocks_list",
+        "actor": {"user_id": "student_2", "role": "student"},
+        "scope": {"course_id": course["course_id"]},
+    }).data == []
+
+
+def test_numbered_split_preview_and_save_preserve_all_points(campus):
+    from skills.memory.service import MemoryLearningSkill
+    course = campus.create_course('编号知识点', 'personal_course', 'student_1', 'student')
+    content = '\n\n'.join(f'{index}. 知识点{index}\n这是该知识点的完整解释。\n(1) 下级示例。\n(2) 适用条件。' for index in range(1, 15))
+    campus.db.execute(
+        'INSERT INTO knowledge_blocks(course_id,owner_id,block_order,title,keywords_json,content) VALUES(?,?,?,?,?,?)',
+        (course['course_id'], 'student_1', 1, '编号知识点', '[]', content),
+    )
+    block = campus.db.fetch_one('SELECT block_id FROM knowledge_blocks WHERE course_id=?', (course['course_id'],))
+    memory = MemoryLearningSkill(campus)
+    with patch.object(campus, 'provider_factory', side_effect=AssertionError('编号拆分不需要模型')):
+        preview = memory.ai_split_preview(block['block_id'], 'student_1')
+        with pytest.raises(PermissionDenied):
+            memory.ai_split_preview(block['block_id'], 'student_2')
+    assert len(preview['parts']) == 14
+    assert ''.join(part['content'] for part in preview['parts']) == content
+    assert len(memory.list_blocks(course['course_id'], 'student_1')) == 1
+    saved = memory.apply_ai_split(block['block_id'], 'student_1', preview['parts'])
+    assert len(saved) == 14
+    assert all('(1) 下级示例。' in item['content'] and '(2) 适用条件。' in item['content'] for item in saved)
+    assert saved[-1]['title'] == '14. 知识点14'
 
 
 def test_agent_returns_model_network_error_without_crashing(tmp_path):

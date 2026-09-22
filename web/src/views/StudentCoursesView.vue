@@ -1,11 +1,28 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, onUnmounted, ref, watch, nextTick } from "vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { useRoute, useRouter } from "vue-router";
 import { api } from "../api";
+import StudyArtwork from "../components/StudyArtwork.vue";
+import StudyCardDeck from "../components/StudyCardDeck.vue";
+import StudentLearningFocus from "../components/StudentLearningFocus.vue";
+import PaperWorkspace from "../components/PaperWorkspace.vue";
+import ExpandableList from "../components/ExpandableList.vue";
+import { vStudyMotion } from "../study-motion";
+import { Setting, Share, ArrowDown, Reading, Plus, Collection, Document, FullScreen, Close } from "@element-plus/icons-vue";
+import { saveStudentDraft, readStudentDraft, clearStudentDrafts } from "../student-navigation";
+import { createCardSpeech } from "../card-speech";
 import { useAuthStore } from "../stores/auth";
 import KnowledgeGraphCanvas from "../components/KnowledgeGraphCanvas.vue";
 import AiSettingsDialog from "../components/AiSettingsDialog.vue";
+import KnowledgeMarkdown from "../components/KnowledgeMarkdown.vue";
+import StudentMaterialPreview from "../components/StudentMaterialPreview.vue";
+import { readWorkspace, writeWorkspace } from "../workspace-storage";
+import {
+  learningModeLabel,
+  questionAnswerLabel,
+  questionTypeLabel,
+} from "../question-display";
 import {
   startAudioMonitor,
   stopAudioMonitor,
@@ -23,6 +40,15 @@ const router = useRouter();
 const courses = ref<any[]>([]);
 const courseId = ref("");
 const activeTab = ref("qa");
+const learningWorkspace = ref<HTMLElement | null>(null);
+function resumeLearning() {
+  const root = learningWorkspace.value;
+  if (!root) return;
+  root.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth', block: 'start' });
+  const pane = [...root.querySelectorAll<HTMLElement>('.el-tab-pane')].find(element => getComputedStyle(element).display !== 'none');
+  const target = pane?.querySelector<HTMLElement>('textarea:not(:disabled), input:not(:disabled), button:not(:disabled)');
+  (target || root).focus({ preventScroll: true });
+}
 const loading = ref(false);
 const aiSettingsOpen = ref(false);
 const aiStatus = ref<any>(null);
@@ -37,6 +63,47 @@ let monitorHandle: AudioMonitorHandle | null = null;
 const question = ref("");
 const studentReply = ref("");
 const session = ref<any>(null);
+const sourcePreview = ref<any>(null);
+const sourceExpanded = ref(false);
+const courseNavOpen = ref(false);
+const cardView = ref('deck');
+const courseGroups = computed(() => [
+  { type: 'personal_course', title: '个人课程', detail: '个人课程，仅自己可见' },
+  { type: 'shared_course', title: '教师共享课程', detail: '已授权的课程资料' },
+].map(group => ({ ...group, items: courses.value.filter(course => course.course_type === group.type) })));
+const recentSources = computed(() => {
+  const latest = [...messages.value].reverse().find(message => message.role === 'assistant' && message.sources?.length);
+  return sourceLocations(latest?.sources || session.value?.sources || []);
+});
+function chooseSidebarCourse(id: string) {
+  courseId.value = id;
+  courseNavOpen.value = false;
+  navigateCourse();
+}
+async function showCourseCreation() {
+  activeTab.value = 'materials';
+  courseNavOpen.value = false;
+  await nextTick();
+  {
+    const input = document.querySelector<HTMLInputElement>('#personal-newCourseName-1, #personal-newCourseName-3');
+    input?.scrollIntoView({ block: 'center', behavior: 'instant' });
+    input?.focus();
+  }
+}
+watch(() => sourcePreview.value?.document_id, () => { sourceExpanded.value = false });
+function sourceLocations(sources:any[] = []) {
+  const result:any[] = [];
+  for (const source of sources) {
+    const locations = source.locations?.length ? source.locations : [source];
+    for (const location of locations) {
+      if (!location.document_id) continue;
+      const item = {...location, section: location.section || source.section};
+      if (!result.some(x => x.document_id === item.document_id && x.page_number === item.page_number)) result.push(item);
+    }
+  }
+  return result;
+}
+
 const messages = ref<any[]>([]);
 const quiz = ref<any>(null);
 const responses = ref<any[]>([]);
@@ -44,6 +111,11 @@ const grade = ref<any>(null);
 const profile = ref<any>(null);
 const retrievalMaterial = ref("all");
 const documents = ref<any[]>([]);
+const previewDocumentId = ref("");
+watch(documents, (items) => {
+  if (!items.some(item => item.document_id === previewDocumentId.value))
+    previewDocumentId.value = items[0]?.document_id || "";
+});
 const blocks = ref<any[]>([]);
 const dashboard = ref<any>(null);
 const newCourseName = ref("");
@@ -58,14 +130,24 @@ const editTitle = ref("");
 const editKeywords = ref("");
 const editContent = ref("");
 const splitPosition = ref<number | undefined>(undefined);
+const aiSplitDialog = ref(false);
+const aiSplitLoading = ref(false);
+const aiSplitApplying = ref(false);
+const aiSplitTargetId = ref<number | undefined>(undefined);
+const aiSplitPreview = ref<any>(null);
 const trainingBlockId = ref<number | undefined>(undefined);
 const extraKeywords = ref("");
 const cloze = ref<any>(null);
 const clozeResponses = ref<string[]>([]);
 const clozeResult = ref<any>(null);
 const recitedText = ref("");
+const recitationSubmission = ref({key:'',id:''});
 const recitationResult = ref<any>(null);
 const speechRate = ref(1);
+const speech = "speechSynthesis" in window
+  ? createCardSpeech(window.speechSynthesis, undefined, () => ElMessage.warning("朗读中断，请重试或检查浏览器语音设置"))
+  : null;
+const speechState = speech?.state ?? ref("idle");
 const recording = ref(false);
 const audioUrl = ref("");
 let recorder: MediaRecorder | null = null;
@@ -78,12 +160,73 @@ const questionCount = ref(6);
 const publishedFolders = ref<any[]>([]);
 const publishedFolderId = ref("");
 const publishedBank = ref<any>(null);
+const publishedPaperTitle = ref("课程试卷");
 const publishedResponses = ref<any[]>([]);
 const publishedGrade = ref<any>(null);
 const publishedGraph = ref<any>(null);
 const graphSelectedNode = ref<any>(null);
 const graphSearch = ref("");
 const graphLayout = ref<"force" | "circular">("force");
+const publishedKnowledge = ref<any>(null);
+const publishedKnowledgeDialog = ref(false);
+const selectedPublishedNodeIds = ref<string[]>([]);
+const importingPublished = ref(false);
+const startingReview = ref(false);
+let preferencesReady = false;
+
+function restoreStudyPreferences() {
+  const value = readWorkspace<any>(auth.user?.user_id || "", `student:${courseId.value}`, {});
+  activeTab.value = normalizeStudentView(
+    route.query.view || value?.view || activeTab.value,
+    selectedCourse.value?.course_type === "shared_course",
+  );
+  questionCount.value = Math.max(3, Math.min(12, Math.round(Number(value?.questionCount) || 6)));
+  speechRate.value = Math.max(0.75, Math.min(2, Number(value?.speechRate) || 1));
+  preferencesReady = true;
+}
+
+async function startReview() {
+  if (startingReview.value || !courseId.value) return;
+  startingReview.value = true;
+  const id = courseId.value;
+  try {
+    await invoke("knowledge_blocks_build", {}, id);
+    if (courseId.value !== id) return;
+    await loadCourseData();
+    if (courseId.value !== id) return;
+    if (!blocks.value.length) return ElMessage.info("当前没有可复习知识点");
+    activeTab.value = "training";
+    await generateCloze();
+  } catch (error) { showError(error, "复习准备失败，已完成的卡片会保留，可再次继续"); }
+  finally { startingReview.value = false; }
+}
+
+function rememberedCourseKey() {
+  return auth.user?.user_id
+    ? `zhijiao:student-course:${auth.user.user_id}`
+    : "";
+}
+
+function readRememberedCourse() {
+  const key = rememberedCourseKey();
+  if (!key) return "";
+  try {
+    return localStorage.getItem(key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberCourse(id = courseId.value) {
+  const key = rememberedCourseKey();
+  if (!key) return;
+  try {
+    if (id) localStorage.setItem(key, id);
+    else localStorage.removeItem(key);
+  } catch {
+    // 浏览器禁用本地存储时不影响课程使用。
+  }
+}
 
 const selectedCourse = computed(() =>
   courses.value.find((item) => item.course_id === courseId.value),
@@ -94,6 +237,78 @@ const materialPartitions = computed(
 const trainingBlock = computed(() =>
   blocks.value.find((item) => item.block_id === trainingBlockId.value),
 );
+const trainingIndex = computed(() =>
+  trainingBlock.value ? blocks.value.findIndex((item) => item.block_id === trainingBlock.value.block_id) : -1,
+);
+const splitAt = computed(() =>
+  Math.max(0, Math.min(editContent.value.length, Number(splitPosition.value || 0))),
+);
+const splitBefore = computed(() => editContent.value.slice(0, splitAt.value));
+const splitAfter = computed(() => editContent.value.slice(splitAt.value));
+
+const recentLearningAttempts = computed(() => {
+  const memory = (dashboard.value?.memory_attempts || []).map((attempt: any) => ({
+    ...attempt,
+    source: "memory",
+  }));
+  const practice = (dashboard.value?.practice_attempts || []).map(
+    (attempt: any) => ({
+      ...attempt,
+      source: "practice",
+    }),
+  );
+  const published = (dashboard.value?.published_attempts || []).map(
+    (attempt: any) => ({
+      ...attempt,
+      source: "published",
+    }),
+  );
+  return [...memory, ...practice, ...published]
+    .sort((left, right) => {
+      const leftTime = Date.parse(
+        String(left.created_at || "").replace(" ", "T"),
+      );
+      const rightTime = Date.parse(
+        String(right.created_at || "").replace(" ", "T"),
+      );
+      if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
+        return rightTime - leftTime;
+      }
+      return Number(right.attempt_id || 0) - Number(left.attempt_id || 0);
+    })
+    .slice(0, 10);
+});
+
+function learningAttemptLabel(attempt: any) {
+  if (attempt.source === "published") return "教师发布试卷";
+  if (attempt.source === "practice") return "专项练习";
+  if (attempt.mode === "cloze") return "挖空练习";
+  if (attempt.mode === "recitation") return "背诵检测";
+  return "记忆训练";
+}
+
+function learningAttemptTitle(attempt: any) {
+  return (
+    attempt.title ||
+    (attempt.source === "published"
+      ? "教师发布试卷"
+      : attempt.source === "practice"
+        ? "综合练习"
+        : "知识记忆训练")
+  );
+}
+
+function learningScoreTone(score: any) {
+  const value = Number(score);
+  return value >= 80 ? "good" : value >= 60 ? "normal" : "low";
+}
+
+function formatLearningDate(value: any) {
+  const raw = String(value || "");
+  if (!raw) return "时间未知";
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/);
+  return match ? `${match[1]} ${match[2]}` : raw;
+}
 
 function actionScope(id = courseId.value) {
   return id ? { course_id: id } : {};
@@ -105,6 +320,7 @@ async function invoke(
   id = courseId.value,
 ) {
   if (!auth.user) throw new Error("登录状态已失效，请重新登录");
+  const actorId = auth.user.user_id;
   const requiresCourse = ![
     "personal_course_create",
     "available_courses_list",
@@ -118,7 +334,9 @@ async function invoke(
     scope: actionScope(id),
     input,
     context: { source: "vue-student", language: "zh-CN" },
-  });
+  }, { timeout: 130000 });
+  if (auth.user?.user_id !== actorId || (requiresCourse && courseId.value !== id))
+    throw new Error('课程或账号已切换，已忽略上一页面的响应');
   if (data.status !== "success") throw new Error(data.message || "操作失败");
   return data.data;
 }
@@ -132,14 +350,21 @@ async function loadCourses() {
   try {
     courses.value = (await api.get("/student/courses")).data;
     const requestedCourse = String(route.query.course || "");
+    const rememberedCourse = readRememberedCourse();
     if (!courseId.value && courses.value.length) {
-      courseId.value = courses.value.some(
-        (item) => item.course_id === requestedCourse,
-      )
-        ? requestedCourse
-        : courses.value[0].course_id;
+      const preferredCourse = [requestedCourse, rememberedCourse].find((id) =>
+        courses.value.some((item) => item.course_id === id),
+      );
+      courseId.value = preferredCourse || courses.value[0].course_id;
     }
+    if (!courses.value.some((item) => item.course_id === courseId.value))
+      courseId.value = courses.value[0]?.course_id || "";
+    rememberCourse();
     await courseChanged();
+    if (navigationReady && String(route.query.course || '') !== courseId.value) {
+      await router.replace({ query: learningQuery() });
+      syncSourcePreview();
+    }
   } catch (error) {
     showError(error, "课程加载失败");
   } finally {
@@ -147,7 +372,39 @@ async function loadCourses() {
   }
 }
 
+let loadedCourseId = "";
+let navigationReady = false;
+const draftOwner = auth.user?.user_id || "";
+function saveCurrentDraft() {
+  if (auth.user?.user_id !== draftOwner) return;
+  saveStudentDraft(draftOwner, loadedCourseId, {
+    question: question.value, studentReply: studentReply.value, session: session.value,
+    messages: messages.value, quiz: quiz.value, responses: responses.value, grade: grade.value,
+    retrievalMaterial: retrievalMaterial.value,
+  });
+}
+function restoreCurrentDraft() {
+  const draft = readStudentDraft(draftOwner, courseId.value);
+  question.value = draft?.question || "";
+  studentReply.value = draft?.studentReply || "";
+  session.value = draft?.session || null;
+  messages.value = draft?.messages || [];
+  quiz.value = draft?.quiz || null;
+  responses.value = draft?.responses || [];
+  grade.value = draft?.grade || null;
+  retrievalMaterial.value = draft?.retrievalMaterial || "all";
+}
+onBeforeUnmount(saveCurrentDraft);
 async function courseChanged() {
+  if (loadedCourseId === courseId.value) {
+    await loadCourseData();
+    await loadPublishedGraph();
+    return;
+  }
+  saveCurrentDraft();
+  loadedCourseId = courseId.value;
+  rememberCourse();
+  restoreStudyPreferences();
   retrievalMaterial.value = "all";
   session.value = null;
   messages.value = [];
@@ -156,10 +413,14 @@ async function courseChanged() {
   publishedBank.value = null;
   publishedGrade.value = null;
   trainingBlockId.value = undefined;
+  documents.value = []; blocks.value = []; profile.value = null; dashboard.value = null;
+  cloze.value = null; clozeResult.value = null; recitationResult.value = null;
+  memoryQuestions.value = []; memoryGrade.value = null;
   activeTab.value = normalizeStudentView(
     activeTab.value,
     selectedCourse.value?.course_type === "shared_course",
   );
+  restoreCurrentDraft();
   await loadCourseData();
   await loadPublishedGraph();
 }
@@ -169,10 +430,10 @@ async function loadPublishedGraph() {
   graphSelectedNode.value = null;
   if (!courseId.value || selectedCourse.value?.course_type !== "shared_course")
     return;
+  const id = courseId.value;
   try {
-    publishedGraph.value = (
-      await api.get(`/student/courses/${courseId.value}/knowledge-graph`)
-    ).data;
+    const result = await api.get(`/student/courses/${id}/knowledge-graph`);
+    if (courseId.value === id) publishedGraph.value = result.data;
   } catch (error: any) {
     if (error?.response?.status !== 404)
       showError(error, "课程知识图谱加载失败");
@@ -181,13 +442,15 @@ async function loadPublishedGraph() {
 
 async function loadCourseData() {
   if (!courseId.value) return;
+  const id = courseId.value;
   try {
     const [docs, nextBlocks, nextProfile, nextDashboard] = await Promise.all([
-      invoke("document_status"),
-      invoke("knowledge_blocks_list"),
-      invoke("learning_profile"),
-      invoke("student_dashboard"),
+      invoke("document_status", {}, id),
+      invoke("knowledge_blocks_list", {}, id),
+      invoke("learning_profile", {}, id),
+      invoke("student_dashboard", {}, id),
     ]);
+    if (courseId.value !== id) return;
     documents.value = docs || [];
     blocks.value = nextBlocks || [];
     profile.value = nextProfile || null;
@@ -196,6 +459,40 @@ async function loadCourseData() {
       trainingBlockId.value = blocks.value[0].block_id;
   } catch (error) {
     showError(error, "学习数据加载失败");
+  }
+}
+
+async function openPublishedKnowledgeDialog() {
+  if (selectedCourse.value?.course_type !== "shared_course") return;
+  try {
+    publishedKnowledge.value = await invoke("published_knowledge_list");
+    const items = publishedKnowledge.value?.items || [];
+    selectedPublishedNodeIds.value = items
+      .filter((item: any) => !item.imported)
+      .map((item: any) => String(item.node_id));
+    publishedKnowledgeDialog.value = true;
+  } catch (error) {
+    showError(error, "已发布知识点加载失败");
+  }
+}
+
+async function importPublishedKnowledge() {
+  if (!selectedPublishedNodeIds.value.length)
+    return ElMessage.warning("请至少选择一个未导入的知识点");
+  importingPublished.value = true;
+  try {
+    const result = await invoke("published_knowledge_import", {
+      node_ids: selectedPublishedNodeIds.value,
+    });
+    await loadCourseData();
+    publishedKnowledgeDialog.value = false;
+    ElMessage.success(
+      `已导入 ${result.imported_count} 张知识卡片${result.skipped_count ? `，跳过重复卡片 ${result.skipped_count} 张` : ""}`,
+    );
+  } catch (error) {
+    showError(error, "教师知识点导入失败");
+  } finally {
+    importingPublished.value = false;
   }
 }
 
@@ -222,7 +519,7 @@ async function startGuidance() {
     session.value = result;
     messages.value = [
       { role: "student", content: question.value.trim() },
-      { role: "assistant", content: result.reply },
+      { role: "assistant", content: result.reply, sources: result.sources || [] },
     ];
     quiz.value = null;
     grade.value = null;
@@ -255,7 +552,7 @@ async function guidedTurn(intent: "respond" | "hint" | "reveal" | "end") {
     });
     messages.value.push(
       { role: "student", content },
-      { role: "assistant", content: result.reply },
+      { role: "assistant", content: result.reply, sources: result.sources || [] },
     );
     session.value = result;
     studentReply.value = "";
@@ -286,6 +583,7 @@ async function submitQuiz() {
   loading.value = true;
   try {
     grade.value = await invoke("quiz_submit", {
+      paper_id: quiz.value.paper_id,
       question_id: quiz.value.question_id,
       items: quiz.value.items,
       responses: responses.value,
@@ -333,8 +631,7 @@ async function createPersonalCourse() {
     newCourseDescription.value = "";
     await loadCourses();
     if (created?.course_id) {
-      courseId.value = created.course_id;
-      await courseChanged();
+      await router.push({ query: learningQuery(created.course_id, "materials") });
     }
     ElMessage.success("个人课程已创建，可以开始整理材料了");
   } catch (error) {
@@ -488,8 +785,8 @@ async function buildBlocks() {
     const result = await invoke("knowledge_blocks_build", {
       document_id: documents.value[0].document_id,
     });
-    blocks.value = [...blocks.value, ...(result || [])];
-    ElMessage.success(`已生成 ${(result || []).length} 个知识卡片`);
+    await loadCourseData();
+    ElMessage.success(`已准备 ${(result || []).length} 张知识卡片，已有卡片会自动复用`);
   } catch (error) {
     showError(error, "知识卡片生成失败");
   } finally {
@@ -509,6 +806,40 @@ function closeBlock() {
 }
 function onBlockDialogChange(value: boolean) {
   if (!value) closeBlock();
+}
+
+async function openAiSplit(block: any) {
+  aiSplitTargetId.value = block.block_id;
+  aiSplitLoading.value = true;
+  try {
+    aiSplitPreview.value = await invoke("knowledge_block_ai_split", {
+      block_id: block.block_id,
+    });
+    aiSplitDialog.value = true;
+  } catch (error) {
+    showError(error, "按知识点拆分失败");
+  } finally {
+    aiSplitLoading.value = false;
+  }
+}
+
+async function applyAiSplit() {
+  if (!aiSplitPreview.value?.parts?.length || !aiSplitTargetId.value)
+    return ElMessage.warning("暂无可保存的语块");
+  aiSplitApplying.value = true;
+  try {
+    blocks.value = await invoke("knowledge_block_ai_split_apply", {
+      block_id: aiSplitTargetId.value,
+      parts: aiSplitPreview.value.parts,
+    });
+    aiSplitDialog.value = false;
+    aiSplitPreview.value = null;
+    ElMessage.success("拆分内容已保存为独立知识卡片");
+  } catch (error) {
+    showError(error, "拆分内容保存失败");
+  } finally {
+    aiSplitApplying.value = false;
+  }
 }
 
 async function saveBlock() {
@@ -611,8 +942,9 @@ async function submitCloze() {
   loading.value = true;
   try {
     clozeResult.value = await invoke("cloze_submit", {
+      paper_id: cloze.value.paper_id,
       block_id: trainingBlockId.value,
-      extra_keywords: cloze.value.extra_keywords || [],
+      extra_keywords: cloze.value.keywords || cloze.value.extra_keywords || [],
       responses: clozeResponses.value,
     });
     await loadCourseData();
@@ -624,21 +956,22 @@ async function submitCloze() {
 }
 
 function speakBlock() {
-  if (!trainingBlock.value || !("speechSynthesis" in window))
-    return ElMessage.warning("当前浏览器不支持朗读");
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(trainingBlock.value.content);
-  utterance.lang = "zh-CN";
-  utterance.rate = speechRate.value;
-  window.speechSynthesis.speak(utterance);
+  if (!speech) return ElMessage.warning("当前浏览器不支持朗读");
+  if (!trainingBlock.value) return ElMessage.warning("请先选择一张卡片");
+  if (!speech.start(trainingBlock.value.content || "", speechRate.value))
+    ElMessage.warning("当前卡片没有可朗读的文字");
 }
+watch([courseId, trainingBlockId, activeTab], () => speech?.stop());
 
 async function evaluateRecitation() {
   if (!trainingBlockId.value || !recitedText.value.trim())
     return ElMessage.warning("请先输入或粘贴你的背诵内容");
   loading.value = true;
   try {
+    const key = `${courseId.value}:${trainingBlockId.value}:${recitedText.value.trim()}`;
+    if (recitationSubmission.value.key !== key) recitationSubmission.value = {key,id:crypto.randomUUID()};
     recitationResult.value = await invoke("recitation_evaluate", {
+      submission_id: recitationSubmission.value.id,
       block_id: trainingBlockId.value,
       recited_text: recitedText.value.trim(),
     });
@@ -741,7 +1074,7 @@ async function generateMemoryQuestions() {
     memoryResponses.value = initQuestionResponses(memoryQuestions.value);
     memoryGrade.value = null;
   } catch (error) {
-    showError(error, "AI 练习生成失败");
+    showError(error, "练习生成失败");
   } finally {
     loading.value = false;
   }
@@ -809,6 +1142,7 @@ async function loadPublishedBank() {
       count: 100,
       folder_id: publishedFolderId.value,
     });
+    publishedPaperTitle.value = publishedFolders.value.find((folder:any)=>folder.folder_id===publishedFolderId.value)?.folder_name || "课程试卷";
     publishedResponses.value = initQuestionResponses(
       publishedBank.value?.items || [],
     );
@@ -822,9 +1156,11 @@ async function loadPublishedBank() {
 
 async function submitPublishedBank() {
   if (!publishedBank.value) return;
+  publishedBank.value.submission_id ||= crypto.randomUUID();
   loading.value = true;
   try {
     publishedGrade.value = await invoke("quiz_submit", {
+      submission_id: publishedBank.value.submission_id,
       version_id: publishedBank.value.version_id,
       items: publishedBank.value.items,
       responses: publishedResponses.value,
@@ -890,27 +1226,81 @@ async function exportWorkbook() {
 }
 
 async function logout() {
+  clearStudentDrafts(draftOwner);
   await auth.logout();
   location.href = "/login";
+}
+function openSharingSettings() {
+  void router.push({ path: "/student/study-room", query: { sharing: "settings" } });
 }
 function updateAiStatus(settings: any) {
   aiStatus.value = settings;
 }
-watch([courseId, activeTab], ([course, tab]) => {
-  const query = {
-    ...route.query,
-    course: course || undefined,
-    view: tab || undefined,
-  };
-  if (
-    String(route.query.course || "") !== course ||
-    String(route.query.view || "") !== tab
-  )
-    router.replace({ query });
+function learningQuery(course = courseId.value, view = activeTab.value) {
+  const { preview, page, source, section, ...query } = route.query;
+  return { ...query, course: course || undefined, view };
+}
+function navigateCourse() {
+  if (!navigationReady) return;
+  const shared = courses.value.find(item => item.course_id === courseId.value)?.course_type === "shared_course";
+  void router.push({ query: learningQuery(courseId.value, normalizeStudentView(activeTab.value, shared)) });
+}
+watch(activeTab, tab => {
+  if (!navigationReady || route.path !== '/student/courses' || loadedCourseId !== courseId.value) return;
+  if (String(route.query.view || '') !== tab)
+    void router.push({ query: learningQuery(courseId.value, tab) });
+});
+function syncSourcePreview() {
+  if (!courseId.value) { sourcePreview.value = null; return; }
+  const id = typeof route.query.preview === 'string' ? route.query.preview : '';
+  const pageNumber = Number(route.query.page);
+  sourcePreview.value = id ? {
+    document_id: id,
+    page_number: Number.isInteger(pageNumber) && pageNumber > 0 ? pageNumber : null,
+    source_file: typeof route.query.source === 'string' ? route.query.source : '来源资料',
+    section: typeof route.query.section === 'string' ? route.query.section : '',
+  } : null;
+}
+async function openSourcePreview(source: any) {
+  await router.push({ query: { ...learningQuery(), preview: source.document_id,
+    page: source.page_number || undefined, source: source.source_file || undefined,
+    section: source.section || undefined }, state: { studentPreviewEntry: true } });
+  await nextTick();
+  if (activeTab.value === 'qa' && window.matchMedia('(max-width: 1000px)').matches) {
+    document.querySelector('.source-inspector')?.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' });
+  }
+}
+function closeSourcePreview() {
+  if (window.history.state?.studentPreviewEntry) router.back();
+  else void router.replace({ query: learningQuery() });
+}
+watch(() => route.fullPath, async () => {
+  if (!navigationReady || route.path !== '/student/courses') return;
+  const requested = String(route.query.course || '');
+  const available = courses.value.find(item => item.course_id === requested);
+  if (!available) {
+    if (courses.value.length) await router.replace({ query: learningQuery(courses.value[0].course_id, 'qa') });
+    return;
+  }
+  courseId.value = available.course_id;
+  activeTab.value = normalizeStudentView(route.query.view, available.course_type === 'shared_course');
+  syncSourcePreview();
+  if (loadedCourseId !== available.course_id) await courseChanged();
+});
+watch([activeTab, questionCount, speechRate], () => {
+  if (preferencesReady && courseId.value) writeWorkspace(auth.user?.user_id || "", `student:${courseId.value}`, {
+    view: activeTab.value, questionCount: questionCount.value, speechRate: speechRate.value,
+  });
 });
 onMounted(async () => {
   activeTab.value = normalizeStudentView(route.query.view, true);
   await loadCourses();
+  const initialQuery = String(route.query.course || '') === courseId.value
+    ? { ...route.query, course: courseId.value || undefined, view: activeTab.value }
+    : learningQuery();
+  await router.replace({ query: initialQuery });
+  syncSourcePreview();
+  navigationReady = true;
   try {
     aiStatus.value = (await api.get("/runtime/ai-settings")).data;
   } catch {
@@ -918,6 +1308,7 @@ onMounted(async () => {
   }
 });
 onUnmounted(async () => {
+  speech?.stop();
   if (recorder?.state === "recording") recorder.stop();
   recorderStream?.getTracks().forEach((track) => track.stop());
   if (audioUrl.value) URL.revokeObjectURL(audioUrl.value);
@@ -928,26 +1319,29 @@ onUnmounted(async () => {
 
 <template>
   <main class="content student-workspace" :aria-busy="loading">
-    <header class="student-header">
-      <div class="page-title">
-        <span class="eyebrow">课程学习</span>
-        <h1>今天从哪一个问题开始？</h1>
-        <p class="muted">
-          课程资料、答疑、知识卡片和练习都在同一个学习空间里，按自己的节奏继续。
-        </p>
-      </div>
-      <div class="student-account">
-        <el-tag
-          v-if="aiStatus"
-          :type="aiStatus.configured ? 'success' : 'warning'"
-          >{{ aiStatus.provider }} · {{ aiStatus.model }}</el-tag
-        ><el-button plain @click="aiSettingsOpen = true">AI 服务设置</el-button
-        ><el-button plain @click="$router.push('/student/study-room')"
-          >AI 自习室</el-button
-        ><span>{{ auth.user?.display_name || auth.user?.username }}</span
-        ><el-button @click="logout">退出</el-button>
-      </div>
+    <el-dialog :model-value="Boolean(sourcePreview) && (activeTab !== 'qa' || sourceExpanded)" title="来源资料预览" width="min(1200px, 96vw)" destroy-on-close @update:model-value="!$event && (activeTab === 'qa' ? sourceExpanded = false : closeSourcePreview())">
+      <StudentMaterialPreview v-if="sourcePreview" :key="sourcePreview.document_id + ':' + sourcePreview.page_number" :course-id="courseId" :document-id="sourcePreview.document_id" :page-number="sourcePreview.page_number" :source-name="sourcePreview.source_file" :section="sourcePreview.section" />
+    </el-dialog>
+    <header class="student-topbar">
+      <RouterLink to="/student/courses" class="student-brand"><el-icon><Reading/></el-icon><span>智教伴学<small>以知识陪伴成长</small></span></RouterLink>
+      <nav aria-label="学生端导航"><RouterLink to="/student/courses">学习空间</RouterLink><RouterLink to="/student/study-room">自习室</RouterLink><RouterLink to="/student/tasks">班级作业 / 考试</RouterLink></nav>
+      <el-dropdown trigger="click" placement="bottom-end"><el-button class="account-menu">{{ auth.user?.display_name || auth.user?.username }}<el-icon><ArrowDown/></el-icon></el-button>
+        <template #dropdown><el-dropdown-menu><el-dropdown-item :icon="Share" @click="openSharingSettings">自习数据共享</el-dropdown-item><el-dropdown-item :icon="Setting" @click="aiSettingsOpen = true">学习服务设置</el-dropdown-item><el-dropdown-item divided @click="logout">退出</el-dropdown-item></el-dropdown-menu></template>
+      </el-dropdown>
     </header>
+    <div class="student-app-grid">
+      <aside class="student-course-nav" aria-label="课程导航">
+        <div class="course-nav-heading"><button class="course-nav-toggle" :aria-expanded="courseNavOpen" @click="courseNavOpen = !courseNavOpen">我的课程<el-icon><ArrowDown/></el-icon></button><el-button :icon="Plus" circle aria-label="创建个人课程" @click="showCourseCreation"/></div>
+        <div class="course-nav-groups" :class="{ 'is-open': courseNavOpen }">
+          <section v-for="group in courseGroups" :key="group.type" class="course-nav-group"><h2>{{ group.title }}</h2><p>{{ group.detail }}</p>
+            <button v-for="course in group.items" :key="course.course_id" class="course-nav-item" :class="{ selected: courseId === course.course_id }" :aria-current="courseId === course.course_id ? 'true' : undefined" @click="chooseSidebarCourse(course.course_id)"><el-icon><Collection/></el-icon><span>{{ course.course_name }}</span></button>
+            <p v-if="!group.items.length" class="course-nav-empty">{{ group.type === 'personal_course' ? '创建课程，开始整理资料' : '加入课程后在这里显示' }}</p>
+          </section>
+        </div>
+        <div class="course-nav-art"><StudyArtwork/><span>理解，让知识彼此相连。</span></div>
+      </aside>
+      <div class="student-main">
+        <header class="student-header"><div class="page-title"><h1>学习空间</h1><p class="muted">围绕一门课程，理解、练习，再巩固。</p></div><StudyArtwork/></header>
     <el-progress
       v-if="loading"
       :percentage="100"
@@ -968,7 +1362,7 @@ onUnmounted(async () => {
             : 'info'
       "
       :closable="false"
-      class="upload-status"
+      :class="['upload-status', { 'is-processing': ['uploading', 'processing'].includes(uploadState.stage) }]"
     />
     <el-progress
       v-if="uploadState.stage === 'uploading'"
@@ -986,11 +1380,11 @@ onUnmounted(async () => {
     <el-card shadow="never" class="course-strip">
       <div class="course-strip-main">
         <div class="course-selector">
-          <label>当前课程</label
-          ><el-select
+          <label for="student-course-select">当前课程</label
+          ><el-select id="student-course-select"
             v-if="courses.length"
             v-model="courseId"
-            @change="courseChanged"
+            @change="navigateCourse"
             ><el-option
               v-for="course in courses"
               :key="course.course_id"
@@ -1006,39 +1400,13 @@ onUnmounted(async () => {
             >还没有课程，可以在下方创建个人课程。</span
           >
         </div>
+        <el-tag v-if="aiStatus" :type="aiStatus.configured ? 'success' : 'warning'" effect="plain">
+          {{ aiStatus.mode === 'mock' || aiStatus.provider === 'mock' ? '离线演示模式' : aiStatus.configured ? '学习服务已就绪' : '学习服务待配置' }}
+        </el-tag>
         <el-button text @click="loadCourses">刷新</el-button>
       </div>
-      <div v-if="selectedCourse" class="course-summary-cards">
-        <div class="course-summary-card">
-          <div class="course-summary-title">
-            <span>课程资料</span><em>学习空间</em>
-          </div>
-          <strong>{{ documents.length }}</strong
-          ><small>已解析材料</small>
-        </div>
-        <div class="course-summary-card">
-          <div class="course-summary-title">
-            <span>知识卡片</span><em>复习内容</em>
-          </div>
-          <strong>{{ blocks.length }}</strong
-          ><small>可复习内容</small>
-        </div>
-        <div class="course-summary-card">
-          <div class="course-summary-title">
-            <span>背诵平均</span><em>记忆训练</em>
-          </div>
-          <strong>{{ dashboard?.memory_average || 0 }}%</strong
-          ><small>挖空与背诵</small>
-        </div>
-        <div class="course-summary-card">
-          <div class="course-summary-title">
-            <span>练习平均</span><em>作答表现</em>
-          </div>
-          <strong>{{ dashboard?.practice_average || 0 }}%</strong
-          ><small>AI 练习成绩</small>
-        </div>
-      </div>
     </el-card>
+
     <el-empty
       v-if="!courses.length"
       description="暂无已授权课程，请联系任课教师或创建个人课程"
@@ -1049,13 +1417,13 @@ onUnmounted(async () => {
         个人课程适合整理教材、讲义或自己的复习材料；内容只对你可见。
       </p>
       <div class="student-two-column">
-        <el-input
+        <div class="form-field"><label for="personal-newCourseName-1">课程名称</label><el-input id="personal-newCourseName-1"
           v-model="newCourseName"
           placeholder="课程名称，例如：细胞生物学背诵"
-        /><el-input
+        /></div><div class="form-field"><label for="personal-newCourseDescription-2">课程说明（可选）</label><el-input id="personal-newCourseDescription-2"
           v-model="newCourseDescription"
           placeholder="课程说明（可选）"
-        />
+        /></div>
       </div>
       <el-button
         type="primary"
@@ -1064,8 +1432,9 @@ onUnmounted(async () => {
         >创建个人课程</el-button
       ></el-card
     >
+    <div v-if="courseId" ref="learningWorkspace" class="learning-workspace" tabindex="-1" aria-label="课程学习工作区">
     <el-tabs
-      v-if="courseId"
+      v-study-motion="`${courseId}:${activeTab}`"
       v-model="activeTab"
       class="student-workspace-tabs"
       stretch
@@ -1073,12 +1442,12 @@ onUnmounted(async () => {
       <el-tab-pane name="qa" label="学习问答">
         <div class="student-grid">
           <div class="learning-column">
-            <el-card shadow="never"
+            <el-card shadow="never" class="qa-panel"
               ><template #header
                 ><div class="card-header">
                   <b>引导式答疑</b><span class="muted">只引用当前课程资料</span>
                 </div></template
-              ><el-select
+              ><div v-show="!session || session.completed" class="qa-composer"><label for="student-question">输入问题</label><el-select
                 v-if="materialPartitions.length"
                 v-model="retrievalMaterial"
                 :disabled="!!session && !session.completed"
@@ -1088,7 +1457,7 @@ onUnmounted(async () => {
                   :key="item.material_type"
                   :label="item.label || item.material_type"
                   :value="item.material_type" /></el-select
-              ><el-input
+              ><el-input id="student-question"
                 v-model="question"
                 type="textarea"
                 :rows="3"
@@ -1103,6 +1472,8 @@ onUnmounted(async () => {
                 @click="startGuidance"
                 >开始思考</el-button
               >
+              </div>
+              <div v-if="!messages.length" class="qa-welcome"><el-icon><Reading/></el-icon><h2>从一个问题开始</h2><p>围绕当前课程提问，跟随资料线索形成自己的答案。</p><span>回答依据会出现在右侧，方便随时核对原文。</span></div>
               <div v-if="messages.length" class="dialogue">
                 <article
                   v-for="(message, index) in messages"
@@ -1113,6 +1484,12 @@ onUnmounted(async () => {
                     message.role === "student" ? "我" : "课程助教"
                   }}</strong>
                   <p>{{ message.content }}</p>
+                  <div v-if="message.role === 'assistant' && sourceLocations(message.sources).length" class="source-jumps">
+                    <div v-for="(source, sourceIndex) in sourceLocations(message.sources)" :key="sourceIndex" class="source-jump">
+                      <span>{{ source.source_file }} · {{ source.section }}<template v-if="source.page_number"> · 第 {{ source.page_number }} 页</template></span>
+                      <el-button size="small" type="primary" plain @click="openSourcePreview(source)">{{ source.page_number ? '查看第 ' + source.page_number + ' 页' : '查看原文' }}</el-button>
+                    </div>
+                  </div>
                 </article>
               </div>
               <template v-if="session && !session.completed"
@@ -1196,55 +1573,110 @@ onUnmounted(async () => {
             /></el-card>
           </div>
           <aside class="profile-column">
+            <section class="source-inspector" aria-label="来源内容预览">
+              <div class="source-inspector-heading"><h2>来源内容预览</h2><div v-if="sourcePreview"><el-button :icon="FullScreen" text aria-label="放大来源预览" @click="sourceExpanded = true"/><el-button :icon="Close" text aria-label="关闭来源预览" @click="closeSourcePreview"/></div></div>
+              <Transition name="source-slide" mode="out-in">
+                <StudentMaterialPreview compact v-if="sourcePreview && !sourceExpanded" :key="courseId + ':' + sourcePreview.document_id + ':' + sourcePreview.page_number" :course-id="courseId" :document-id="sourcePreview.document_id" :page-number="sourcePreview.page_number" :source-name="sourcePreview.source_file" :section="sourcePreview.section"/>
+                <div v-else-if="sourcePreview" class="source-placeholder"><p>正在放大查看来源</p></div>
+                <div v-else-if="recentSources.length" key="references" class="source-reference-list"><button v-for="(source, i) in recentSources" :key="i" class="source-reference" @click="openSourcePreview(source)"><el-icon><Document/></el-icon><span><strong>{{ source.source_file }}</strong><small>{{ source.section }}<template v-if="source.page_number"> · 第 {{ source.page_number }} 页</template></small></span><span>查看</span></button></div>
+                <div v-else key="empty" class="source-placeholder"><el-icon><Document/></el-icon><h3>让每个回答有据可查</h3><p>提问后，点击回答中的来源，即可在这里核对课程原文。</p><span>仅检索当前课程的可用资料</span></div>
+              </Transition>
+            </section>
             <el-card shadow="never"
               ><template #header
                 ><div class="card-header">
-                  <b>我的学习情况</b
+                  <b>接下来复习什么</b
                   ><el-button text @click="activeTab = 'profile'"
                     >查看全部</el-button
                   >
                 </div></template
               >
               <p class="muted">数据仅来自你在当前课程的问答和练习。</p>
-              <div class="profile-metrics">
-                <span
-                  >问答 <b>{{ profile?.questions?.length || 0 }}</b></span
-                ><span
-                  >练习 <b>{{ profile?.attempts?.length || 0 }}</b></span
-                >
-              </div>
-              <h3>需要复习</h3>
               <el-empty
                 v-if="!profile?.weak_points?.length"
                 description="完成练习后生成"
                 :image-size="72"
               />
-              <div
-                v-for="point in profile?.weak_points || []"
+              <ExpandableList :items="profile?.weak_points || []" label="复习知识点" :limit="5" :reset-key="courseId"><template #default="{items:visibleItems}"><div
+                v-for="point in visibleItems"
                 :key="point.knowledge_point"
                 class="weak-point"
               >
                 <span>{{ point.knowledge_point }}</span
                 ><el-tag type="warning">{{ point.level }}</el-tag>
-              </div></el-card
+              </div></template></ExpandableList></el-card
             >
           </aside>
         </div>
       </el-tab-pane>
-      <el-tab-pane name="materials" label="课程与材料"
-        ><div class="student-two-column">
+      <el-tab-pane name="materials" label="课程与材料">
+        <div class="materials-workspace" :class="{ 'has-preview': selectedCourse?.course_type === 'shared_course' }">
+        <el-card v-if="selectedCourse" shadow="never" class="visible-materials"
+          ><template #header
+            ><div class="card-header">
+              <b>当前可见材料</b
+              ><el-button text @click="loadCourseData">刷新</el-button>
+            </div></template
+          ><el-empty
+            v-if="!documents.length"
+            description="还没有课程材料"
+            :image-size="72"
+          />
+          <div
+            v-for="document in documents"
+            :key="document.document_id"
+            class="document-row"
+          >
+            <button
+              v-if="selectedCourse.course_type === 'shared_course'"
+              type="button"
+              class="material-select"
+              :class="{ 'is-selected': previewDocumentId === document.document_id }"
+              :aria-pressed="previewDocumentId === document.document_id"
+              @click="previewDocumentId = document.document_id"
+            >
+              <strong>{{ document.original_name }}</strong>
+              <span class="muted">{{ document.chunk_count }} 个文字片段 · {{ document.status }}</span>
+              <span class="document-preview">{{ document.text_preview || "点击查看材料" }}</span>
+            </button>
+            <div v-else>
+              <strong>{{ document.original_name }}</strong>
+              <p class="muted">
+                {{ document.chunk_count }} 个文字片段 · {{ document.status }}
+              </p>
+              <p class="document-preview">
+                {{ document.text_preview || "暂无文字预览" }}
+              </p>
+            </div>
+            <el-button
+              v-if="selectedCourse.course_type === 'personal_course'"
+              type="danger"
+              text
+              @click="deleteDocument(document.document_id)"
+              >删除</el-button
+            >
+          </div></el-card
+        >
+          <StudentMaterialPreview
+            v-if="selectedCourse?.course_type === 'shared_course' && activeTab === 'materials'"
+            :key="courseId"
+            v-model:selected-document-id="previewDocumentId"
+            :course-id="courseId"
+          />
+        </div>
+        <div class="student-two-column">
           <el-card shadow="never"
             ><template #header><b>创建个人课程</b></template
-            ><el-input
+            ><div class="form-field"><label for="personal-newCourseName-3">课程名称</label><el-input id="personal-newCourseName-3"
               v-model="newCourseName"
               placeholder="例如：细胞生物学背诵"
-            /><el-input
+            /></div><div class="form-field"><label for="personal-newCourseDescription-4">课程说明（可选）</label><el-input id="personal-newCourseDescription-4"
               v-model="newCourseDescription"
               type="textarea"
               :rows="3"
               class="stack-input"
               placeholder="课程说明（可选）"
-            /><el-button type="primary" @click="createPersonalCourse"
+            /></div><el-button type="primary" @click="createPersonalCourse"
               >创建并开始整理</el-button
             ><el-divider
               v-if="selectedCourse?.course_type === 'personal_course'"
@@ -1308,45 +1740,12 @@ onUnmounted(async () => {
                 class="file-action"
                 :disabled="!imageFile"
                 @click="extractImage"
-                >调用视觉模型并保存文字</el-button
+                >识别并保存文字</el-button
               ></template
             ></el-card
           >
         </div>
-        <el-card v-if="selectedCourse" shadow="never" class="nested-card"
-          ><template #header
-            ><div class="card-header">
-              <b>已解析材料</b
-              ><el-button text @click="loadCourseData">刷新</el-button>
-            </div></template
-          ><el-empty
-            v-if="!documents.length"
-            description="还没有课程材料"
-            :image-size="72"
-          />
-          <div
-            v-for="document in documents"
-            :key="document.document_id"
-            class="document-row"
-          >
-            <div>
-              <strong>{{ document.original_name }}</strong>
-              <p class="muted">
-                {{ document.chunk_count }} 个文字片段 · {{ document.status }}
-              </p>
-              <p class="document-preview">
-                {{ document.text_preview || "暂无文字预览" }}
-              </p>
-            </div>
-            <el-button
-              v-if="selectedCourse.course_type === 'personal_course'"
-              type="danger"
-              text
-              @click="deleteDocument(document.document_id)"
-              >删除</el-button
-            >
-          </div></el-card
-        ></el-tab-pane
+</el-tab-pane
       >
       <el-tab-pane name="blocks" label="知识卡片"
         ><el-card shadow="never"
@@ -1355,31 +1754,59 @@ onUnmounted(async () => {
               <div>
                 <b>把材料整理成可复习的卡片</b>
                 <p class="muted small">
-                  AI 只根据当前课程文字分块，你可以继续手动调整。
+                  根据当前课程资料整理知识卡片，生成后可手动调整。
                 </p>
               </div>
-              <el-button
-                type="primary"
-                :disabled="!documents.length"
-                @click="buildBlocks"
-                >AI 语义分块</el-button
-              >
+              <div class="block-header-actions">
+                <el-button
+                  v-if="selectedCourse.course_type === 'shared_course'"
+                  plain
+                  @click="openPublishedKnowledgeDialog"
+                  >导入教师已发布知识</el-button
+                ><el-button
+                  v-if="selectedCourse.course_type === 'personal_course'"
+                  type="primary"
+                  :disabled="!documents.length"
+                  @click="buildBlocks"
+                  >整理知识卡片</el-button
+                >
+              </div>
             </div></template
           ><el-empty
             v-if="!blocks.length"
             description="请先导入材料并生成知识卡片"
           />
-          <div v-else class="knowledge-card-grid">
+          <div v-else>
+            <div class="card-view-switch"><span>复习与整理</span><el-radio-group v-model="cardView" aria-label="知识卡片显示方式"><el-radio-button value="deck">逐张复习</el-radio-button><el-radio-button value="list">列表编辑</el-radio-button></el-radio-group></div>
+            <StudyCardDeck v-if="cardView === 'deck'" :cards="blocks" :course-id="courseId"/>
+            <div v-else class="knowledge-card-grid">
             <el-card
-              v-for="block in blocks"
+              v-for="(block, index) in blocks"
               :key="block.block_id"
               shadow="never"
               class="knowledge-card"
-              ><div class="card-header">
-                <b>{{ block.title }}</b
-                ><el-tag v-if="block.is_favorite" type="warning">重点</el-tag>
+              :style="{ '--motion-index': index }"
+              ><div class="knowledge-card-heading">
+                <div class="knowledge-card-title">
+                  <b>{{ block.title }}</b>
+                  <el-tag v-if="block.is_favorite" type="warning">重点</el-tag>
+                </div>
+              <div class="knowledge-card-tools">
+                <el-button size="small" @click="openBlock(block)"
+                  >编辑</el-button
+                ><el-button
+                  size="small"
+                  type="primary"
+                  plain
+                  :loading="aiSplitLoading && aiSplitTargetId === block.block_id"
+                  @click="openAiSplit(block)"
+                  >按知识点拆分</el-button
+                ><el-button size="small" @click="mergeBlock(block)"
+                  >合并下一张</el-button
+                >
               </div>
-              <p class="card-content">{{ block.content }}</p>
+              </div>
+              <KnowledgeMarkdown :content="block.content" />
               <div class="keyword-list">
                 <el-tag
                   v-for="keyword in block.keywords || []"
@@ -1387,16 +1814,123 @@ onUnmounted(async () => {
                   effect="plain"
                   >{{ keyword }}</el-tag
                 >
-              </div>
-              <div class="block-actions">
-                <el-button size="small" @click="openBlock(block)"
-                  >编辑</el-button
-                ><el-button size="small" @click="mergeBlock(block)"
-                  >合并下一张</el-button
-                >
               </div></el-card
             >
-          </div></el-card
+          </div></div></el-card
+        ><el-dialog
+          v-model="publishedKnowledgeDialog"
+          title="导入教师已发布知识点"
+          width="min(860px, 94vw)"
+          ><p class="muted small">
+            这里只显示当前共享课程最新发布版本中的知识点。导入时优先按章节号和知识点编号拆分，每个知识点保留对应解释、下级条目和公式。
+          </p>
+          <el-alert
+            v-if="publishedKnowledge?.version"
+            type="info"
+            :closable="false"
+            :title="`教师发布版本 v${publishedKnowledge.version.version_number} · 可选 ${publishedKnowledge.items?.length || 0} 个知识点`"
+          />
+          <el-empty
+            v-if="!publishedKnowledge?.items?.length"
+            description="教师暂未发布可导入的知识点"
+          />
+          <el-checkbox-group
+            v-else
+            v-model="selectedPublishedNodeIds"
+            class="published-knowledge-list"
+          >
+            <article
+              v-for="item in publishedKnowledge.items"
+              :key="item.node_id"
+              class="published-knowledge-item"
+            >
+              <div class="published-knowledge-heading">
+                <el-checkbox
+                  :label="String(item.node_id)"
+                  :disabled="item.imported"
+                  >{{ item.title }}</el-checkbox
+                >
+                <el-tag v-if="item.imported" type="success" size="small"
+                  >已导入</el-tag
+                >
+                <el-tag v-if="item.update_available" type="warning" size="small"
+                  >教师已更新，个人卡片保留原修改</el-tag
+                >
+              </div>
+              <KnowledgeMarkdown :content="item.content" />
+              <small class="muted"
+                >{{ item.original_name || "教师课程资料" }} ·
+                {{ item.material_type || "课程知识" }}</small
+              >
+            </article>
+          </el-checkbox-group>
+          <template #footer
+            ><el-button @click="publishedKnowledgeDialog = false"
+              >取消</el-button
+            ><el-button
+              type="primary"
+              :loading="importingPublished"
+              :disabled="!selectedPublishedNodeIds.length"
+              @click="importPublishedKnowledge"
+              >导入选中知识点</el-button
+            ></template
+        ></el-dialog
+        ><el-dialog
+          v-model="aiSplitDialog"
+          title="预览拆分结果"
+          width="min(820px, 94vw)"
+        >
+          <el-alert
+            type="info"
+            :closable="false"
+            title="只处理你自己的知识卡片"
+            description="优先按章节号和知识点编号拆分，保留对应解释与下级条目；无清晰编号时按内容含义拆分。确认保存后生成新卡片。"
+          />
+          <div v-if="aiSplitPreview" class="ai-split-preview">
+            <div class="ai-split-source">
+              <span class="muted small">原知识点</span>
+              <b>{{ aiSplitPreview.source_title }}</b>
+              <KnowledgeMarkdown :content="aiSplitPreview.source_content" />
+            </div>
+            <div class="ai-split-parts">
+              <div class="ai-split-heading">
+                <b>分析结果（{{ aiSplitPreview.parts.length }} 个语块）</b>
+                <span class="muted small">可在保存前调整标题和内容</span>
+              </div>
+              <article
+                v-for="(part, index) in aiSplitPreview.parts"
+                :key="index"
+                class="ai-split-part"
+              >
+                <div class="ai-split-part-title">
+                  <el-tag size="small">语块 {{ Number(index) + 1 }}</el-tag>
+                  <el-input v-model="part.title" placeholder="语块标题" />
+                </div>
+                <el-input
+                  v-model="part.content"
+                  type="textarea"
+                  :rows="4"
+                  placeholder="语块内容"
+                />
+                <div class="keyword-list">
+                  <el-tag
+                    v-for="keyword in part.keywords || []"
+                    :key="keyword"
+                    size="small"
+                    effect="plain"
+                    >{{ keyword }}</el-tag
+                  >
+                </div>
+              </article>
+            </div>
+          </div>
+          <template #footer>
+            <el-button @click="aiSplitDialog = false">取消</el-button>
+            <el-button type="primary" :loading="aiSplitApplying" @click="applyAiSplit"
+              >确认并生成知识卡片</el-button
+            >
+          </template>
+        </el-dialog
         ><el-dialog
           :model-value="!!editingBlock"
           title="调整知识卡片"
@@ -1413,13 +1947,35 @@ onUnmounted(async () => {
             :rows="8"
             placeholder="卡片内容"
           />
+          <div class="stack-input">
+            <b>内容预览</b>
+            <KnowledgeMarkdown :content="editContent" />
+          </div>
           <div class="split-row">
             <el-input-number
               v-model="splitPosition"
               :min="20"
               :max="Math.max(20, editContent.length - 20)"
               placeholder="拆分位置"
-            /><el-button @click="splitBlock">从此处拆分</el-button>
+            /><el-button @click="splitBlock">按预览位置拆分</el-button>
+          </div>
+          <div class="split-visual">
+            <div class="split-heading">
+              <b>拆分位置可视化</b>
+              <span>第 {{ splitAt }} / {{ editContent.length }} 个字符</span>
+            </div>
+            <el-slider
+              v-model="splitPosition"
+              :min="20"
+              :max="Math.max(20, editContent.length - 20)"
+              :disabled="editContent.length < 40"
+              show-input
+            />
+            <div class="split-preview">
+              <article><b>前一张卡片</b><pre>{{ splitBefore || "（暂无内容）" }}</pre></article>
+              <i>拆分线</i>
+              <article><b>后一张卡片</b><pre>{{ splitAfter || "（暂无内容）" }}</pre></article>
+            </div>
           </div>
           <template #footer
             ><el-button @click="closeBlock">取消</el-button
@@ -1429,94 +1985,103 @@ onUnmounted(async () => {
           ></el-dialog
         ></el-tab-pane
       >
-      <el-tab-pane name="training" label="训练巩固"
-        ><el-card shadow="never"
-          ><template #header><b>选择一张知识卡片</b></template
-          ><el-select v-model="trainingBlockId" placeholder="选择训练卡片"
-            ><el-option
-              v-for="block in blocks"
-              :key="block.block_id"
-              :label="block.title"
-              :value="block.block_id" /></el-select
-        ></el-card>
-        <div v-if="trainingBlock" class="student-two-column training-columns">
-          <el-card shadow="never"
-            ><template #header><b>关键词挖空</b></template
-            ><el-input
-              v-model="extraKeywords"
-              placeholder="手动追加重点词，逗号分隔" /><el-button
-              type="primary"
-              class="form-button"
-              @click="generateCloze"
-              >生成挖空</el-button
-            >
-            <div v-if="cloze" class="cloze-panel">
-              <h3>{{ cloze.title }}</h3>
-              <p class="cloze-text">
-                <template
-                  v-for="(segment, index) in cloze.segments"
-                  :key="index"
-                  ><span v-if="segment.type === 'text'">{{
-                    segment.value
-                  }}</span
-                  ><el-tag v-else type="warning"
-                    >第 {{ segment.index }} 空</el-tag
-                  ></template
-                >
-              </p>
-              <div class="cloze-inputs">
-                <el-input
-                  v-for="(_, index) in clozeResponses"
-                  :key="index"
-                  v-model="clozeResponses[Number(index)]"
-                  :placeholder="`第 ${Number(index) + 1} 空`"
-                />
-              </div>
-              <el-button type="primary" @click="submitCloze"
-                >提交并检测</el-button
-              >
+      <el-tab-pane name="training" label="训练巩固">
+        <section class="training-workspace" aria-label="训练巩固工作台">
+          <div class="training-context-card">
+            <div class="training-context-copy">
+              <div class="training-eyebrow"><span>学习训练台</span><span>ACTIVE SESSION</span></div>
+              <div class="training-context-title"><b>{{ trainingBlock?.title || "选择一张知识卡片" }}</b><el-tag v-if="trainingBlock" size="small" effect="plain">第 {{ trainingIndex + 1 }} / {{ blocks.length }} 张</el-tag></div>
+              <p>{{ trainingBlock ? "围绕当前知识点完成听读、复述和记忆提取。" : "先选择一张知识卡片，再开始训练。" }}</p>
             </div>
-            <el-result
-              v-if="clozeResult"
-              :icon="clozeResult.score >= 60 ? 'success' : 'warning'"
-              :title="`正确率 ${clozeResult.score}%`"
-              :sub-title="`答对 ${clozeResult.correct_count} / ${clozeResult.total} 空`" /></el-card
-          ><el-card shadow="never"
-            ><template #header><b>听觉强化与跟读</b></template>
-            <p class="muted">
-              先听一遍，再用自己的话复述；浏览器会在本地朗读，不上传录音。
-            </p>
-            <el-slider
-              v-model="speechRate"
-              :min="0.75"
-              :max="2"
-              :step="0.25"
-              show-stops /><el-button type="primary" @click="speakBlock"
-              >朗读当前卡片</el-button
-            ><el-divider /><el-input
-              v-model="recitedText"
-              type="textarea"
-              :rows="6"
-              placeholder="粘贴或输入你的复述内容，交给当前模型检测" /><el-button
-              class="form-button"
-              @click="evaluateRecitation"
-              >检测复述</el-button
-            ><el-result
-              v-if="recitationResult"
-              :title="`背诵评分 ${recitationResult.score}`"
-              :sub-title="recitationResult.feedback" /><el-divider /><el-button
-              plain
-              @click="toggleRecording"
-              >{{ recording ? "停止录音" : "录一段跟读" }}</el-button
-            ><audio
-              v-if="audioUrl"
-              :src="audioUrl"
-              controls
-              class="audio-player"
-          /></el-card>
-        </div>
-        <el-empty v-else description="请先在知识卡片中生成至少一张卡片"
-      /></el-tab-pane>
+            <div class="training-context-select">
+              <label for="training-card-picker">训练卡片</label>
+              <el-select id="training-card-picker" v-model="trainingBlockId" placeholder="选择训练卡片">
+                <el-option v-for="block in blocks" :key="block.block_id" :label="block.title" :value="block.block_id" />
+              </el-select>
+            </div>
+          </div>
+
+          <div v-if="trainingBlock" class="training-layout">
+            <section class="training-panel recall-panel">
+              <div class="training-panel-heading">
+                <span class="training-step-mark">01</span>
+                <div><span class="training-panel-kicker">RECALL</span><h2>记忆提取</h2><p>先从重点词回想完整知识，再核对答案。</p></div>
+                <el-tag v-if="clozeResult" size="small" :type="clozeResult.score >= 60 ? 'success' : 'warning'">{{ clozeResult.score }}%</el-tag>
+                <el-tag v-else size="small" type="info">待开始</el-tag>
+              </div>
+
+              <div class="training-card-context">
+                <span>当前卡片</span>
+                <strong>{{ trainingBlock.title }}</strong>
+                <div class="training-keywords">
+                  <el-tag v-for="keyword in trainingBlock.keywords || []" :key="keyword" size="small" effect="plain">{{ keyword }}</el-tag>
+                  <small v-if="!trainingBlock.keywords?.length">暂无提取重点，可手动追加。</small>
+                </div>
+              </div>
+
+              <div class="training-form-block">
+                <div class="training-label-row"><span>追加重点词</span><small>可选 · 用逗号分隔</small></div>
+                <el-input v-model="extraKeywords" placeholder="例如：索引、范式、事务" />
+                <el-button type="primary" class="training-primary-action" @click="generateCloze">生成挖空</el-button>
+              </div>
+
+              <div v-if="cloze" class="cloze-panel training-result-panel">
+                <div class="training-result-heading"><span>挖空练习</span><small>{{ cloze.segments?.length || 0 }} 个内容片段</small></div>
+                <h3>{{ cloze.title }}</h3>
+                <el-alert v-if="cloze.keyword_source === 'AI 分析重点'" type="success" :closable="false" :title="`已提取 ${cloze.keywords?.length || 0} 个重点用于挖空`" />
+                <p v-if="cloze.keywords?.length" class="muted small">本次重点：{{ cloze.keywords.join("、") }}</p>
+                <p class="cloze-text"><template v-for="(segment, index) in cloze.segments" :key="index"><span v-if="segment.type === 'text'">{{ segment.value }}</span><el-tag v-else type="warning">第 {{ segment.index }} 空</el-tag></template></p>
+                <div class="cloze-inputs"><el-input v-for="(_, index) in clozeResponses" :key="index" v-model="clozeResponses[Number(index)]" :placeholder="`第 ${Number(index) + 1} 空`" /></div>
+                <el-button type="primary" @click="submitCloze">提交并检测</el-button>
+              </div>
+              <div v-else class="training-empty-state"><span class="training-empty-mark">回想</span><strong>生成一组挖空，开始检验记忆</strong><p>系统会根据当前卡片的重点内容生成练习。</p></div>
+              <el-result v-if="clozeResult" :icon="clozeResult.score >= 60 ? 'success' : 'warning'" :title="`正确率 ${clozeResult.score}%`" :sub-title="`答对 ${clozeResult.correct_count} / ${clozeResult.total} 空`" />
+            </section>
+
+            <section class="training-panel audio-panel">
+              <div class="training-panel-heading">
+                <span class="training-step-mark">02</span>
+                <div><span class="training-panel-kicker">LISTEN & SPEAK</span><h2>听觉强化与跟读</h2><p>听一遍、说一遍、录一遍，把知识点变成自己的表达。</p></div>
+                <span class="training-live-dot" :class="{ active: speechState !== 'idle' || recording }">{{ speechState !== 'idle' || recording ? '进行中' : '未开始' }}</span>
+              </div>
+
+              <div class="training-stage-list">
+                <article class="training-stage-item">
+                  <span class="training-stage-index">A</span>
+                  <div class="training-stage-content">
+                    <div class="training-stage-title"><strong>先听一遍</strong><small>自动切换中英文发音</small></div>
+                    <el-slider v-model="speechRate" :min="0.75" :max="2" :step="0.25" :disabled="speechState !== 'idle'" aria-label="朗读速度" show-stops />
+                    <div class="speech-controls">
+                      <el-button type="primary" :disabled="!speech" @click="speakBlock">{{ speechState === 'idle' ? '朗读当前卡片' : '重新朗读' }}</el-button>
+                      <el-button :disabled="speechState === 'idle'" @click="speechState === 'paused' ? speech?.resume() : speech?.pause()">{{ speechState === 'paused' ? '继续朗读' : '暂停朗读' }}</el-button>
+                      <el-button :disabled="speechState === 'idle'" @click="speech?.stop()">停止朗读</el-button>
+                      <span class="muted" role="status">{{ speechState === 'paused' ? '已暂停' : speechState === 'speaking' ? '正在朗读' : '未朗读' }} · {{ speechRate }} 倍速</span>
+                    </div>
+                  </div>
+                </article>
+                <article class="training-stage-item">
+                  <span class="training-stage-index">B</span>
+                  <div class="training-stage-content">
+                    <div class="training-stage-title"><strong>复述检查</strong><small>用自己的话写下理解</small></div>
+                    <el-input v-model="recitedText" type="textarea" :rows="5" placeholder="输入你的复述内容，检查遗漏与理解偏差" />
+                    <el-button class="training-secondary-action" @click="evaluateRecitation">检测复述</el-button>
+                    <el-result v-if="recitationResult" :title="`背诵评分 ${recitationResult.score}`" :sub-title="recitationResult.feedback" />
+                  </div>
+                </article>
+                <article class="training-stage-item">
+                  <span class="training-stage-index">C</span>
+                  <div class="training-stage-content">
+                    <div class="training-stage-title"><strong>跟读记录</strong><small>录音仅保存在当前浏览器</small></div>
+                    <el-button plain @click="toggleRecording">{{ recording ? "停止录音" : "录一段跟读" }}</el-button>
+                    <audio v-if="audioUrl" :src="audioUrl" controls class="audio-player" />
+                  </div>
+                </article>
+              </div>
+            </section>
+          </div>
+          <el-empty v-else description="请先在知识卡片中生成至少一张卡片" />
+        </section>
+      </el-tab-pane>
       <el-tab-pane name="practice" label="作答与测验"
         ><el-card
           v-if="selectedCourse?.course_type === 'shared_course'"
@@ -1545,54 +2110,23 @@ onUnmounted(async () => {
             @click="loadPublishedBank"
             >载入整份任务</el-button
           >
-          <div v-if="publishedBank?.items?.length" class="question-list">
-            <p class="muted">
-              题库版本 v{{ publishedBank.version_number }} · 共
-              {{ publishedBank.total }} 题
-            </p>
-            <article
-              v-for="(item, index) in publishedBank.items"
-              :key="item.item_id"
-              class="question-item"
-            >
-              <b>{{ Number(index) + 1 }}. {{ item.question }}</b
-              ><el-checkbox-group
-                v-if="isMultiple(item)"
-                v-model="publishedResponses[Number(index)]"
-                ><el-checkbox
-                  v-for="option in item.options || []"
-                  :key="option.key || option"
-                  :label="option.key || option"
-                  >{{ option.text || option }}</el-checkbox
-                ></el-checkbox-group
-              ><el-radio-group
-                v-else-if="isChoice(item)"
-                v-model="publishedResponses[Number(index)]"
-                ><el-radio
-                  v-for="option in item.options || ['正确', '错误']"
-                  :key="option.key || option"
-                  :value="option.key || option"
-                  >{{ option.text || option }}</el-radio
-                ></el-radio-group
-              ><el-input
-                v-else
-                v-model="publishedResponses[Number(index)]"
-                type="textarea"
-                :rows="2"
-                placeholder="请输入答案"
-              />
-            </article>
-            <el-button type="primary" @click="submitPublishedBank"
-              >提交本次答案</el-button
-            ><el-result
-              v-if="publishedGrade"
-              :title="`本次正确率 ${publishedGrade.accuracy}%`"
-            /></div></el-card
+          <PaperWorkspace v-if="publishedBank?.items?.length" :key="publishedBank.version_id" :title="publishedPaperTitle"
+            :subtitle="`题库版本 ${publishedBank.version_number} · 共 ${publishedBank.items.length} 题`" :items="publishedBank.items"
+            :answered="publishedBank.items.map((_:any,index:number)=>Array.isArray(publishedResponses[index]) ? publishedResponses[index].length>0 : publishedResponses[index]!=null && String(publishedResponses[index]).trim()!=='')" :disabled="loading">
+            <template #answer="{item,index}">
+              <el-checkbox-group v-if="isMultiple(item)" v-model="publishedResponses[index]" :disabled="loading"><el-checkbox v-for="option in item.options || []" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-checkbox></el-checkbox-group>
+              <el-radio-group v-else-if="isChoice(item)" v-model="publishedResponses[index]" :disabled="loading"><el-radio v-for="option in item.options || ['正确', '错误']" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-radio></el-radio-group>
+              <el-input v-else v-model="publishedResponses[index]" type="textarea" :rows="4" placeholder="请输入答案" :aria-label="`第 ${index+1} 题答案`" :disabled="loading" />
+            </template>
+            <template #submit><el-button type="primary" :loading="loading" @click="submitPublishedBank">提交本次答案</el-button></template>
+            <template #result><el-result v-if="publishedGrade" icon="success" :title="`本次正确率 ${publishedGrade.accuracy}%`" /></template>
+          </PaperWorkspace>
+          </el-card
         ><el-card shadow="never" class="nested-card"
           ><template #header
             ><div class="card-header">
               <div>
-                <b>AI 智能出题与作答</b>
+                <b>专项练习</b>
                 <p class="muted small">
                   根据知识卡片生成，也可以导入 PDF、Word、TXT 或 XLSX 题库。
                 </p>
@@ -1606,11 +2140,14 @@ onUnmounted(async () => {
               :min="3"
               :max="12"
             /><el-button
+              class="practice-source-button"
               type="primary"
               :disabled="!blocks.length"
               @click="generateMemoryQuestions"
               >根据知识卡片生成</el-button
-            ><label class="file-picker"
+            ><label
+              class="file-picker practice-source-button"
+              :title="questionBankFile?.name || '选择题库文件'"
               ><input
                 type="file"
                 accept=".pdf,.docx,.txt,.xlsx,.xls"
@@ -1625,46 +2162,16 @@ onUnmounted(async () => {
           <el-empty
             v-if="!memoryQuestions.length"
             description="生成或导入一组练习后，在这里作答" />
-          <div v-else class="question-list">
-            <article
-              v-for="(item, index) in memoryQuestions"
-              :key="index"
-              class="question-item"
-            >
-              <b>{{ Number(index) + 1 }}. [{{ item.type }}] {{ item.question }}</b
-              ><el-checkbox-group
-                v-if="isMultiple(item)"
-                v-model="memoryResponses[Number(index)]"
-                ><el-checkbox
-                  v-for="option in item.options || []"
-                  :key="option"
-                  :label="option"
-                  >{{ option }}</el-checkbox
-                ></el-checkbox-group
-              ><el-radio-group
-                v-else-if="isChoice(item)"
-                v-model="memoryResponses[Number(index)]"
-                ><el-radio
-                  v-for="option in item.options || ['正确', '错误']"
-                  :key="option"
-                  :value="option"
-                  >{{ option }}</el-radio
-                ></el-radio-group
-              ><el-input
-                v-else
-                v-model="memoryResponses[Number(index)]"
-                type="textarea"
-                :rows="3"
-                placeholder="请输入简答内容"
-              />
-            </article>
-            <el-button type="primary" @click="submitMemoryQuestions"
-              >提交全部答案并由 AI 批改</el-button
-            ><el-result
-              v-if="memoryGrade"
-              :title="`本次正确率 ${memoryGrade.score}%`"
-              :sub-title="memoryGrade.summary"
-            /></div></el-card
+          <PaperWorkspace v-else title="专项练习" subtitle="完成后统一提交，查看本次练习反馈。" :items="memoryQuestions"
+            :answered="memoryQuestions.map((_:any,index:number)=>Array.isArray(memoryResponses[index]) ? memoryResponses[index].length>0 : memoryResponses[index]!=null && String(memoryResponses[index]).trim()!=='')" :disabled="loading">
+            <template #answer="{item,index}">
+              <el-checkbox-group v-if="isMultiple(item)" v-model="memoryResponses[index]" :disabled="loading"><el-checkbox v-for="option in item.options || []" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-checkbox></el-checkbox-group>
+              <el-radio-group v-else-if="isChoice(item)" v-model="memoryResponses[index]" :disabled="loading"><el-radio v-for="option in item.options || ['正确','错误']" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-radio></el-radio-group>
+              <el-input v-else v-model="memoryResponses[index]" type="textarea" :rows="4" placeholder="请输入简答内容" :aria-label="`第 ${index+1} 题答案`" :disabled="loading" />
+            </template>
+            <template #submit><el-button type="primary" :loading="loading" @click="submitMemoryQuestions">提交并查看批改</el-button></template>
+            <template #result><el-result v-if="memoryGrade" icon="success" :title="`本次正确率 ${memoryGrade.score}%`" :sub-title="memoryGrade.summary" /></template>
+          </PaperWorkspace></el-card
       ></el-tab-pane>
       <el-tab-pane name="profile" label="我的学习"
         ><el-card shadow="never"
@@ -1684,9 +2191,11 @@ onUnmounted(async () => {
             ><span
               >知识块 <b>{{ dashboard?.block_count || blocks.length }}</b></span
             ><span
-              >背诵平均 <b>{{ dashboard?.memory_average || 0 }}%</b></span
+              >背诵平均 <b>{{ dashboard?.memory_attempts?.length ? `${dashboard.memory_average}%` : '暂无作答' }}</b></span
             ><span
-              >练习平均 <b>{{ dashboard?.practice_average || 0 }}%</b></span
+              >练习平均 <b>{{ dashboard?.practice_attempts?.length ? `${dashboard.practice_average}%` : '暂无作答' }}</b></span
+            ><span
+              >试卷平均 <b>{{ dashboard?.published_attempts?.length ? `${dashboard.published_average}%` : '暂无作答' }}</b></span
             >
           </div>
           <div class="student-two-column">
@@ -1697,82 +2206,84 @@ onUnmounted(async () => {
                 description="完成一次挖空或练习后生成"
                 :image-size="72"
               />
-              <div
-                v-for="point in dashboard?.weak_points || []"
+              <ExpandableList :items="dashboard?.weak_points || []" label="薄弱知识点" :limit="5" :reset-key="courseId"><template #default="{items:visibleItems}"><div
+                v-for="point in visibleItems"
                 :key="point.point"
                 class="weak-point"
               >
                 <span>{{ point.point }}</span
                 ><el-tag type="warning">{{ point.count }} 次</el-tag>
-              </div>
+              </div></template></ExpandableList>
             </div>
-            <div>
-              <h3>最近学习成绩</h3>
+            <div class="learning-history">
+              <div class="history-heading">
+                <div>
+                  <h3>最近学习成绩</h3>
+                  <p>按完成时间显示最近 10 次学习表现</p>
+                </div>
+                <span v-if="recentLearningAttempts.length" class="history-count"
+                  >{{ recentLearningAttempts.length }} 条记录</span
+                >
+              </div>
               <el-empty
-                v-if="
-                  !dashboard?.memory_attempts?.length &&
-                  !dashboard?.practice_attempts?.length
-                "
+                v-if="!recentLearningAttempts.length"
                 description="暂无学习记录"
                 :image-size="72"
               />
-              <div
-                v-for="attempt in [
-                  ...(dashboard?.memory_attempts || []),
-                  ...(dashboard?.practice_attempts || []),
-                ].slice(0, 10)"
-                :key="attempt.attempt_id"
-                class="history-row"
-              >
-                <span>{{ attempt.mode || "AI练习" }}</span
-                ><strong>{{ attempt.score }}%</strong
-                ><small>{{ attempt.created_at }}</small>
+              <div v-else class="history-list">
+                <ExpandableList :items="recentLearningAttempts" label="学习成绩" :limit="5" :reset-key="courseId"><template #default="{items:visibleItems}"><article
+                  v-for="attempt in visibleItems"
+                  :key="attempt.source + '-' + attempt.attempt_id"
+                  class="history-row"
+                >
+                  <div class="history-row-info">
+                    <span class="history-kind" :class="attempt.source"
+                      >{{ learningAttemptLabel(attempt) }}</span
+                    >
+                    <strong>{{ learningAttemptTitle(attempt) }}</strong>
+                  </div>
+                  <div class="history-score" :class="learningScoreTone(attempt.score)">
+                    <strong>{{ attempt.score ?? 0 }}</strong>
+                    <small>得分</small>
+                  </div>
+                  <time>{{ formatLearningDate(attempt.created_at) }}</time>
+                </article></template></ExpandableList>
               </div>
             </div>
           </div></el-card
-        ><el-card shadow="never" class="nested-card"
-          ><template #header><b>我的背诵本与错题本</b></template>
-          <div class="export-actions">
-            <el-button @click="exportBook('recitation_book_export')"
-              >导出 Word 背诵本</el-button
-            ><el-button @click="exportBook('wrong_question_book_export')"
-              >导出 Word 错题本</el-button
-            >
-          </div>
-          <el-empty
-            v-if="
-              !dashboard?.recitation_book?.length &&
-              !dashboard?.wrong_question_book?.length
-            "
-            description="暂无错背或错题记录"
-            :image-size="80"
-          />
-          <div
-            v-for="item in dashboard?.recitation_book || []"
-            :key="`recite-${item.attempt_id}`"
-            class="record-card"
-          >
-            <b
-              >{{ item.title || "知识块" }} · {{ item.mode }} ·
-              {{ item.score }}%</b
-            >
-            <p>{{ item.feedback }}</p>
-          </div>
-          <div
-            v-for="item in dashboard?.wrong_question_book || []"
-            :key="`wrong-${item.created_at}-${item.question}`"
-            class="record-card"
-          >
-            <b>[{{ item.type }}] {{ item.question }}</b>
-            <p>
-              正确答案：{{
-                Array.isArray(item.correct_answer)
-                  ? item.correct_answer.join("、")
-                  : item.correct_answer
-              }}
-            </p>
-            <small>{{ item.feedback }}</small>
-          </div></el-card
+        ><el-card shadow="never" class="nested-card notebook-panel">
+          <template #header>
+            <div class="notebook-heading">
+              <h2>我的背诵本与错题本</h2>
+              <div class="export-actions">
+                <el-button @click="exportBook('recitation_book_export')">导出 Word 背诵本</el-button>
+                <el-button @click="exportBook('wrong_question_book_export')">导出 Word 错题本</el-button>
+              </div>
+            </div>
+          </template>
+          <el-empty v-if="!dashboard?.recitation_book?.length && !dashboard?.wrong_question_book?.length" description="暂无错背或错题记录" :image-size="80" />
+          <section v-if="dashboard?.recitation_book?.length" class="notebook-section" aria-label="背诵记录">
+            <h3 class="notebook-section-title">背诵记录 <span>{{ dashboard.recitation_book.length }} 条</span></h3>
+            <ExpandableList :items="dashboard.recitation_book" label="背诵记录" :limit="5" :reset-key="courseId"><template #default="{items:visibleItems}">
+              <article v-for="item in visibleItems" :key="`recite-${item.attempt_id}`" class="notebook-record">
+                <div class="notebook-meta"><span>{{ learningModeLabel(item.mode) }}</span><span>得分 <strong>{{ item.score }}%</strong></span></div>
+                <h4>{{ item.title || "知识块" }}</h4>
+                <p v-if="item.feedback" class="notebook-feedback">{{ item.feedback }}</p>
+              </article>
+            </template></ExpandableList>
+          </section>
+          <section v-if="dashboard?.wrong_question_book?.length" class="notebook-section" aria-label="错题记录">
+            <h3 class="notebook-section-title">错题记录 <span>{{ dashboard.wrong_question_book.length }} 条</span></h3>
+            <ExpandableList :items="dashboard.wrong_question_book" label="错题记录" :limit="5" :reset-key="courseId"><template #default="{items:visibleItems}">
+              <article v-for="item in visibleItems" :key="`wrong-${item.created_at}-${item.question}`" class="notebook-record">
+                <div class="notebook-meta"><span>{{ questionTypeLabel(item.type) }}</span></div>
+                <h4>{{ item.question }}</h4>
+                <p class="notebook-answer"><span>正确答案</span><strong>{{ questionAnswerLabel(item.correct_answer, item.type) }}</strong></p>
+                <p v-if="item.feedback" class="notebook-feedback">{{ item.feedback }}</p>
+              </article>
+            </template></ExpandableList>
+          </section>
+        </el-card
         ></el-tab-pane
       >
       <el-tab-pane
@@ -1808,7 +2319,7 @@ onUnmounted(async () => {
             description="教师尚未发布课程知识图谱"
           />
           <div v-else class="student-graph-layout">
-            <KnowledgeGraphCanvas
+            <KnowledgeGraphCanvas forest-palette
               :nodes="publishedGraph.nodes"
               :relations="publishedGraph.relations"
               :search="graphSearch"
@@ -1840,6 +2351,7 @@ onUnmounted(async () => {
         </el-card>
       </el-tab-pane>
     </el-tabs>
+    </div>
     <el-card
       v-if="courseId && activeTab === 'training'"
       shadow="never"
@@ -1864,6 +2376,67 @@ onUnmounted(async () => {
         >{{ monitorRunning ? "停止实时耳返" : "开启实时耳返" }}</el-button
       >
     </el-card>
+    <StudentLearningFocus v-if="selectedCourse" :mode="activeTab" :course-name="selectedCourse.course_name"
+      :documents="documents.length" :blocks="blocks.length" :preparing="startingReview" :loading="loading"
+      @resume="resumeLearning" @review="startReview" @profile="activeTab = 'profile'" />
+      </div>
+    </div>
     <AiSettingsDialog v-model="aiSettingsOpen" @changed="updateAiStatus" />
   </main>
 </template>
+
+<style scoped>
+.notebook-panel{margin-top:24px}.notebook-panel :deep(.el-card__header){padding:22px 26px}.notebook-panel :deep(.el-card__body){padding:26px}
+.notebook-heading{display:flex;align-items:center;justify-content:space-between;gap:24px;flex-wrap:wrap}.notebook-heading h2{margin:0;font-size:18px;line-height:1.5;font-weight:650;letter-spacing:0;color:#253b33}.notebook-heading .export-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:0}.notebook-heading .el-button{margin:0;min-height:36px;padding:9px 15px;border-radius:8px;font-size:13px;line-height:1.3;font-weight:500;color:#36594b;border-color:#d3e0d8;background:#fafcf9}
+.notebook-section + .notebook-section{margin-top:30px;padding-top:26px;border-top:1px solid #dce5df}.notebook-section-title{display:flex;align-items:baseline;gap:10px;margin:0 0 20px;font-size:15px;font-weight:600;line-height:1.5;color:#29473a}.notebook-section-title>span{font-size:12px;font-weight:400;color:#61736a;font-variant-numeric:tabular-nums}
+.notebook-record{padding:0 0 20px;max-width:100%;min-width:0}.notebook-record + .notebook-record{padding-top:20px;border-top:1px solid #edf1ed}.notebook-record:last-child{padding-bottom:0}.notebook-meta{display:flex;align-items:center;flex-wrap:wrap;gap:18px;margin-bottom:8px;font-size:12px;line-height:1.5;color:#61736a}.notebook-meta strong{margin-left:4px;font-weight:550;font-variant-numeric:tabular-nums;color:#385d4c}.notebook-record h4{max-width:90ch;margin:0;font-size:15px;line-height:1.85;font-weight:550;color:#253b33;overflow-wrap:anywhere;white-space:pre-wrap}.notebook-answer{display:flex;align-items:baseline;gap:14px;margin:12px 0 0;font-size:14px;line-height:1.75}.notebook-answer>span{flex-shrink:0;color:#61736a;font-size:13px}.notebook-answer>strong{color:#294b3c;font-weight:550;overflow-wrap:anywhere;white-space:pre-wrap}.notebook-feedback{max-width:90ch;margin:10px 0 0;font-size:14px;line-height:1.8;font-weight:400;color:#56634d;overflow-wrap:anywhere;white-space:pre-wrap}
+@media(prefers-reduced-motion:no-preference){.notebook-heading .el-button{transition:background-color .18s,border-color .18s,transform .18s}.notebook-heading .el-button:hover{background:#edf5f0;border-color:#94b9a8}.notebook-heading .el-button:active{transform:scale(.98)}}
+
+.history-row + .history-row{margin-top:8px}
+
+.materials-workspace{display:grid;gap:20px;align-items:start;margin-bottom:20px;min-width:0}
+.materials-workspace.has-preview{grid-template-columns:minmax(240px,1fr) minmax(0,2fr)}
+.visible-materials{min-width:0}
+.visible-materials :deep(.el-card__body){max-height:75vh;overflow:auto}
+.materials-workspace :deep(.student-material-preview){margin-bottom:0}
+.material-select{display:grid;gap:8px;width:100%;min-width:0;padding:12px;text-align:left;font:inherit;color:inherit;background:transparent;border:1px solid var(--el-border-color);border-radius:8px;cursor:pointer;overflow-wrap:anywhere}
+.material-select:hover{background:var(--el-fill-color-light)}
+.material-select.is-selected{border-color:var(--el-color-primary);background:var(--el-color-primary-light-9)}
+.material-select:focus-visible{outline:2px solid var(--el-color-primary);outline-offset:2px}
+.material-select .document-preview{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+@media(max-width:800px){.materials-workspace.has-preview{grid-template-columns:minmax(0,1fr)}.visible-materials :deep(.el-card__body){max-height:280px}}
+
+.student-workspace{--study-ease:cubic-bezier(.16,1,.3,1);padding-top:28px;max-width:1440px}
+.student-header{align-items:center;margin-bottom:22px;gap:20px}.student-header h1{font-size:28px;font-weight:650;margin:0 0 6px}.student-header p{font-size:13px;margin:0;color:#56634d}.student-account{gap:8px;flex-shrink:0}.account-menu :deep(span){gap:10px}.account-menu{background:transparent;border-color:#d4e1da}
+.course-strip{margin-bottom:18px;border-radius:12px;background:#fff}.course-strip :deep(.el-card__body){padding:16px 20px}.course-selector{grid-template-columns:70px minmax(200px,320px) minmax(0,1fr)}.course-selector>label{font-size:13px}.course-selector>.muted{font-size:12px;color:#56634d}.course-strip-main>.el-tag{flex-shrink:0}
+.learning-workspace{margin-top:26px;scroll-margin-top:24px}.learning-workspace:focus-visible{outline:2px solid #294b3c;outline-offset:6px}.student-workspace-tabs :deep(.el-tabs__header){margin-bottom:22px}.student-workspace-tabs :deep(.el-tabs__item){height:48px;font-size:14px}.student-workspace-tabs :deep(.el-tabs__active-bar){height:3px;border-radius:3px}.student-workspace-tabs :deep(.el-tabs__nav-wrap::after){height:1px;background:#dbe5de}.student-workspace-tabs :deep(.el-card__header){padding:18px 22px}.student-workspace-tabs :deep(.el-card__body){padding:22px}.student-grid{grid-template-columns:minmax(0,1fr) 280px;gap:24px}.profile-column :deep(.el-card){background:#f9fbf8}.profile-column .muted{font-size:13px;line-height:1.7;color:#56634d}
+@media(prefers-reduced-motion:no-preference){.student-header{animation:workspace-arrive .45s var(--study-ease) both}.course-strip{animation:workspace-arrive .55s .06s var(--study-ease) both}.student-workspace-tabs :deep(.el-tabs__active-bar){transition:transform .28s var(--study-ease)}.dialogue-row{animation:workspace-arrive .35s var(--study-ease) both}}
+@keyframes workspace-arrive{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@media(prefers-reduced-motion:reduce){.student-workspace :deep(*),.student-workspace :deep(*::before),.student-workspace :deep(*::after){animation:none!important;transition:none!important;scroll-behavior:auto!important}}
+@media(max-width:1100px){.student-header{align-items:flex-start}.student-grid{grid-template-columns:minmax(0,1fr) 240px}.course-selector{grid-template-columns:70px minmax(180px,1fr)}.course-selector>.muted{grid-column:2}.student-account{flex-wrap:wrap;justify-content:flex-end}}
+@media(max-width:760px){.student-grid{grid-template-columns:1fr}.student-header{display:block}.student-account{justify-content:flex-start}.course-strip-main{flex-wrap:wrap}}
+.source-jumps{display:grid;gap:8px;margin-top:10px}.source-jump{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px;border:1px solid #dce8e5;border-radius:8px;background:#f5faf8}.source-jump span{min-width:0;overflow-wrap:anywhere;font-size:13px;color:#47685f}.source-jump .el-button{flex-shrink:0}
+.training-workspace{display:grid;gap:16px}.training-context-card{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,360px);align-items:stretch;gap:20px;padding:22px 24px;border:1px solid #dce1d4;border-radius:14px;background:#fcfcf8;box-shadow:0 12px 28px rgba(41,75,60,.06)}.training-context-copy{display:grid;align-content:center;gap:8px;min-width:0}.training-eyebrow{display:flex;align-items:center;gap:10px;color:#72806e;font-size:10px;letter-spacing:.12em}.training-eyebrow span:last-child{color:#9ba494;font-size:9px}.training-context-title{display:flex;align-items:center;gap:10px;min-width:0}.training-context-title b{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#294b3c;font-size:22px;line-height:1.35}.training-context-title .el-tag{flex-shrink:0}.training-context-copy p{margin:0;color:#687563;font-size:12px;line-height:1.7}.training-context-select{display:grid;align-content:center;gap:7px;padding-left:20px;border-left:1px solid #dce1d4}.training-context-select label{color:#56634d;font-size:12px;font-weight:600}.training-context-select :deep(.el-select){width:100%}.training-layout{display:grid;grid-template-columns:minmax(320px,.86fr) minmax(0,1.14fr);gap:16px;align-items:start}.training-panel{min-width:0;border:1px solid #dce1d4;border-radius:14px;background:#fcfcf8;box-shadow:0 10px 24px rgba(41,75,60,.045);overflow:hidden}.training-panel-heading{display:grid;grid-template-columns:40px minmax(0,1fr) auto;align-items:start;gap:12px;padding:22px 24px 18px;border-bottom:1px solid #e3e8dd}.training-step-mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:#e4e9da;color:#294b3c;font-size:12px;font-weight:700;font-variant-numeric:tabular-nums}.training-panel-heading>div{display:grid;gap:3px;min-width:0}.training-panel-kicker{color:#81907d;font-size:9px;letter-spacing:.14em}.training-panel-heading h2{margin:0;color:#294b3c;font-size:18px;line-height:1.4}.training-panel-heading p{margin:1px 0 0;color:#687563;font-size:12px;line-height:1.65}.training-live-dot{align-self:center;white-space:nowrap;padding:5px 9px;border-radius:999px;background:#edf0e7;color:#74806e;font-size:11px}.training-live-dot.active{background:#e4e9da;color:#294b3c}.training-card-context{display:grid;gap:7px;margin:20px 24px 0;padding:15px 16px;border:1px solid #dce1d4;border-radius:10px;background:#f4f5ed}.training-card-context>span{color:#7b8776;font-size:11px}.training-card-context>strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#294b3c;font-size:15px}.training-keywords{display:flex;align-items:center;flex-wrap:wrap;gap:6px;min-height:22px}.training-keywords small{color:#7b8776;font-size:11px}.training-form-block{display:grid;gap:9px;margin:18px 24px 0}.training-label-row{display:flex;align-items:center;justify-content:space-between;gap:12px;color:#56634d;font-size:12px;font-weight:600}.training-label-row small{color:#8b9586;font-size:11px;font-weight:400}.training-primary-action{width:max-content;min-width:104px;margin:0}.training-empty-state{display:grid;justify-items:center;gap:7px;min-height:190px;margin:20px 24px 24px;padding:28px 20px;border:1px dashed #ccd7c6;border-radius:12px;background:#f7f8f2;text-align:center}.training-empty-mark{display:grid;place-items:center;width:46px;height:46px;border-radius:50%;background:#e4e9da;color:#5d7350;font-size:12px}.training-empty-state strong{color:#294b3c;font-size:14px}.training-empty-state p{margin:0;color:#7b8776;font-size:12px}.training-result-panel{margin:20px 24px 0;padding:16px;border:1px solid #dce1d4;border-radius:10px;background:#f7f8f2}.training-result-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;color:#294b3c;font-size:13px;font-weight:600}.training-result-heading small{color:#7b8776;font-size:11px;font-weight:400}.training-result-panel h3{margin:0 0 12px;color:#294b3c;font-size:16px;line-height:1.5}.training-result-panel .cloze-text{margin:14px 0;line-height:2}.training-result-panel .cloze-inputs{display:grid;gap:8px;margin:14px 0}.recall-panel>.el-result{padding:18px 24px 24px}.training-stage-list{padding:0 24px 8px}.training-stage-item{display:grid;grid-template-columns:30px minmax(0,1fr);gap:14px;padding:22px 0;border-top:1px solid #e3e8dd}.training-stage-item:first-child{border-top:0}.training-stage-index{display:grid;place-items:center;width:28px;height:28px;border:1px solid #cbd7c9;border-radius:9px;color:#5d7350;font-size:11px;font-weight:700}.training-stage-content{display:grid;gap:11px;min-width:0}.training-stage-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.training-stage-title strong{color:#294b3c;font-size:14px}.training-stage-title small{color:#7b8776;font-size:11px}.training-stage-content :deep(.el-slider){margin:2px 5px 0}.training-stage-content :deep(.el-textarea__inner){min-height:112px}.training-secondary-action{width:max-content;margin:0}.training-stage-content :deep(.el-result){padding:10px 0 0;text-align:left}.training-stage-content :deep(.el-result__icon){display:none}.training-stage-content :deep(.el-result__title),.training-stage-content :deep(.el-result__subtitle){text-align:left}.audio-player{width:100%;max-width:420px}.speech-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.speech-controls .el-button + .el-button { margin-left: 0; }
+.knowledge-card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}.knowledge-card-title{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 160px;overflow-wrap:anywhere}.knowledge-card-tools{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-left:auto}.knowledge-card-tools :deep(.el-button+.el-button){margin-left:0}
+.split-visual{display:grid;gap:10px;margin-top:14px;padding:14px;border:1px solid #dce8e5;border-radius:12px;background:#f7fbfa}.split-heading{display:flex;justify-content:space-between;gap:16px;color:#315b55}.split-heading span{font-size:12px;color:#718580}.split-preview{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);gap:12px;align-items:stretch}.split-preview article{min-width:0;padding:12px;border:1px solid #dfe9e6;border-radius:9px;background:#fff}.split-preview pre{max-height:180px;margin:9px 0 0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;font-size:13px;line-height:1.6;color:#45645f}.split-preview>i{display:grid;place-items:center;padding:0 4px;border-left:2px dashed #e69b48;color:#a75d16;font-size:12px;font-style:normal;writing-mode:vertical-rl}@media(max-width:700px){.split-preview{grid-template-columns:1fr}.split-preview>i{border-left:0;border-top:2px dashed #e69b48;writing-mode:horizontal-tb;padding:7px}}
+.student-two-column{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.learning-history{min-width:0}.history-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}.history-heading h3{margin:0}.history-heading p{margin:5px 0 0;color:#81918b;font-size:12px}.history-count{flex:0 0 auto;padding:4px 9px;border-radius:999px;background:#edf0e7;color:#294b3c;font-size:12px}.history-list{display:grid;gap:8px}.history-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:12px;padding:11px 12px;border:1px solid #e3ece8;border-radius:10px;background:linear-gradient(135deg,#fff,#f8fcfa);transition:border-color .15s,box-shadow .15s,transform .15s}.history-row:hover{border-color:#9bc5bb;box-shadow:0 5px 14px #31544812;transform:translateY(-1px)}.history-row-info{display:grid;min-width:0;gap:5px}.history-row-info>strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#294a42;font-size:13px}.history-kind{width:max-content;padding:3px 7px;border-radius:5px;font-size:11px;font-weight:700}.history-kind.memory{background:#edf0e7;color:#294b3c}.history-kind.practice{background:#edf0e7;color:#5d7350}.history-kind.published{background:#fff4e8;color:#a86b22}.history-score{display:grid;justify-items:end;min-width:60px}.history-score>strong{font-size:18px;line-height:1}.history-score>small{margin-top:3px;color:#8a9994;font-size:11px}.history-score.good>strong{color:#526747}.history-score.normal>strong{color:#8b5b28}.history-score.low>strong{color:#a34f28}.history-row>time{color:#899793;font-size:11px;white-space:nowrap}@media(max-width:700px){.student-two-column{grid-template-columns:1fr}}@media(max-width:600px){.history-row{grid-template-columns:minmax(0,1fr) auto;gap:8px}.history-row>time{grid-column:1/-1}.history-score{min-width:54px}}
+.block-header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.published-knowledge-list{display:grid;gap:10px;margin-top:14px;max-height:min(58vh,620px);overflow:auto;padding-right:4px}.published-knowledge-item{padding:13px 14px;border:1px solid #dfe9e6;border-radius:10px;background:#fcfcf8}.published-knowledge-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.published-knowledge-item p{margin:8px 0 6px;color:#526b64;line-height:1.65;white-space:pre-wrap}.published-knowledge-item small{display:block}
+
+/* A3: course navigation / learning canvas / evidence, with artwork outside reading areas. */
+.student-workspace{--study-ease:cubic-bezier(.16,1,.3,1);max-width:1920px!important;padding:0 22px 28px!important;margin:0 auto;background:#dfe3d5;min-height:100dvh;color:#293c30}
+.student-topbar{height:78px;display:flex;align-items:center;gap:36px;border-bottom:1px solid #e0e8e3;margin-bottom:18px}.student-brand{display:flex;align-items:center;gap:12px;min-width:208px;text-decoration:none;color:#193e38;font-size:22px;font-weight:650}.student-brand>.el-icon{font-size:32px;color:#294b3c}.student-brand small{display:block;font-size:10px;font-weight:400;letter-spacing:.15em;color:#56634d;margin-top:3px}.student-topbar nav{display:flex;gap:32px;align-self:stretch;align-items:center;flex:1}.student-topbar nav a{font-size:14px;text-decoration:none;color:#56634d;height:100%;display:flex;align-items:center;position:relative;white-space:nowrap}.student-topbar nav a.router-link-active{color:#294b3c;font-weight:600}.student-topbar nav a.router-link-active::after{content:'';position:absolute;bottom:12px;left:0;right:0;height:2px;background:#294b3c;border-radius:2px}.account-menu{gap:12px;max-width:230px}.account-menu :deep(span){overflow:hidden;text-overflow:ellipsis}
+.student-app-grid{display:grid;grid-template-columns:210px minmax(0,1fr);gap:18px;align-items:start}.student-main{min-width:0}.student-course-nav{position:sticky;top:18px;min-height:calc(100dvh - 120px);max-height:calc(100dvh - 36px);display:flex;flex-direction:column;background:#fcfcf8;border:1px solid #dce1d4;border-radius:12px;padding:18px 10px 0;overflow:auto}.course-nav-heading{display:flex;align-items:center;justify-content:space-between;padding:0 6px 8px;gap:10px}.course-nav-toggle{border:0;background:none;font:inherit;font-size:15px;font-weight:600;color:#293c30;padding:4px;cursor:pointer}.course-nav-toggle .el-icon{display:none}.course-nav-group{padding:16px 0}.course-nav-group+.course-nav-group{border-top:1px solid #dce1d4}.course-nav-group h2{font-size:13px;margin:0 10px 7px}.course-nav-group p{font-size:11px;line-height:1.7;color:#56634d;margin:0 10px 12px}.course-nav-item{display:flex;align-items:center;text-align:left;gap:10px;width:100%;padding:12px 11px;border:0;border-radius:7px;margin:3px 0;background:transparent;color:#495741;font:inherit;font-size:13px;cursor:pointer;min-width:0}.course-nav-item span{overflow-wrap:anywhere;line-height:1.5}.course-nav-item .el-icon{font-size:17px;flex-shrink:0}.course-nav-item.selected{background:#e4e9da;color:#294b3c;font-weight:600}.course-nav-item:hover{background:#edf0e7}.course-nav-art{margin-top:auto;padding-top:26px;overflow:hidden}.course-nav-art>span{display:block;font-size:11px;color:#56634d;margin:0 10px 22px}.student-header{position:relative;display:flex;align-items:center;min-height:76px;margin:0 0 14px;padding:6px 16px;overflow:hidden}.student-header .page-title{display:flex;gap:20px;align-items:baseline;position:relative;z-index:1}.student-header h1{font-size:28px;letter-spacing:-.025em;margin:0}.student-header .study-artwork{position:absolute;right:0;top:-8px;width:138px;height:96px;opacity:.5}.student-header p{font-size:13px;max-width:40ch}.course-strip{margin-bottom:14px;border-color:#dce1d4;border-radius:10px}.course-strip :deep(.el-card__body){padding:12px 16px}.course-strip-main{display:flex;align-items:center;gap:12px}.course-selector{display:grid;grid-template-columns:auto minmax(150px,240px);gap:10px;align-items:center;flex:1}.course-selector>.muted{grid-column:1/-1;font-size:12px}.course-selector label{font-size:12px;font-weight:600}.learning-workspace{margin-top:0}.student-workspace-tabs :deep(.el-tabs__header){margin:0 0 14px;background:#fcfcf8;border:1px solid #dce1d4;border-radius:9px;padding:0 12px}.student-workspace-tabs :deep(.el-tabs__item){height:49px;font-size:13px;padding:0 16px}.student-workspace-tabs :deep(.el-tabs__nav-wrap::after){display:none}.student-workspace-tabs :deep(.el-tabs__active-bar){height:3px;background:#294b3c}.student-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,32%);gap:16px}.student-grid>*{min-width:0}.student-workspace-tabs :deep(.el-card){border-color:#dce1d4;border-radius:10px}.student-workspace-tabs :deep(.el-card__header){padding:16px 18px}.student-workspace-tabs :deep(.el-card__body){padding:18px}.qa-panel :deep(>.el-card__body){display:flex;flex-direction:column;min-height:480px}.qa-composer{order:5;margin-top:20px;padding-top:18px;border-top:1px solid #e4ece7}.qa-composer>label{display:block;font-size:12px;color:#56634d;margin-bottom:8px}.qa-composer>.el-select{margin-bottom:10px}.qa-composer>.form-button{margin-top:10px}.qa-welcome{margin:auto 0;padding:40px 22px;max-width:55ch}.qa-welcome>.el-icon{font-size:30px;color:#294b3c;margin-bottom:14px}.qa-welcome h2{font-size:24px;font-weight:600;margin:0 0 12px}.qa-welcome p{font-size:14px;line-height:1.8;margin:0 0 8px;color:#56634d}.qa-welcome>span{font-size:12px;color:#56634d}.dialogue{margin:0}.dialogue-row{padding:18px 16px;border-radius:8px}.dialogue-row p{font-size:14px;line-height:1.9}.dialogue-row.student{background:#eef5f2}.dialogue-row.assistant{background:transparent}.source-jump{border:1px solid #dce1d4;border-radius:8px;padding:12px;gap:12px;background:#fcfcf8}.source-jump>span{overflow-wrap:anywhere}.profile-column{display:flex;flex-direction:column;gap:16px}.profile-column :deep(.el-card){background:#fcfcf8}.source-inspector{border:1px solid #dce1d4;border-radius:10px;background:#fcfcf8;overflow:hidden}.source-inspector-heading{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:53px;padding:12px 16px;border-bottom:1px solid #e4ece7}.source-inspector-heading h2{font-size:14px;margin:0;font-weight:600}.source-inspector-heading .el-button{margin:0;padding:4px}.source-placeholder{padding:34px 22px;min-height:245px}.source-placeholder>.el-icon{font-size:32px;color:#729889}.source-placeholder h3{font-size:15px;margin:20px 0 10px}.source-placeholder p{font-size:13px;line-height:1.8;color:#56634d}.source-placeholder>span{font-size:11px;color:#56634d}.source-reference-list{padding:12px}.source-reference{width:100%;display:flex;align-items:center;gap:10px;text-align:left;font:inherit;font-size:12px;padding:14px 8px;background:transparent;border:0;border-bottom:1px solid #e4ece7;color:#294b3c;cursor:pointer}.source-reference>span:nth-child(2){flex:1;min-width:0}.source-reference strong,.source-reference small{display:block;overflow-wrap:anywhere;line-height:1.7}.source-reference small{color:#56634d}.source-inspector :deep(.student-material-preview){border:0;margin:0}.source-inspector :deep(.preview-body iframe){height:410px;min-height:260px}.source-inspector :deep(.preview-header){flex-wrap:wrap}.source-inspector :deep(.preview-header b){font-size:12px}.source-inspector :deep(.preview-pagination){flex-wrap:wrap;font-size:12px}.source-inspector :deep(.preview-toolbar){flex-wrap:wrap}.source-inspector :deep(.preview-toolbar .el-select){flex-basis:100%}.source-inspector :deep(.el-card__body){padding:14px}.card-view-switch{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}.card-view-switch>span{font-size:13px;color:#56634d}.student-workspace :deep(.learning-focus){margin-top:18px}.student-workspace :deep(.el-input__inner),.student-workspace :deep(.el-textarea__inner){caret-color:#294b3c}.student-workspace :deep(.el-textarea__inner::placeholder){color:#68705e}.student-workspace :deep(.el-input__inner::placeholder){color:#68705e}.student-workspace :deep(:focus-visible){outline:2px solid #294b3c;outline-offset:3px}.student-workspace ::selection{background:#dce3d3;color:#294b3c}
+@media(prefers-reduced-motion:no-preference){.course-nav-item{transition:background .18s,transform .22s var(--study-ease)}.course-nav-item:hover{transform:translateX(3px)}.student-workspace :deep(.el-button){transition:transform .18s var(--study-ease),background-color .18s}.student-workspace :deep(.el-button:active:not(:disabled)){transform:scale(.97)}.source-slide-enter-active,.source-slide-leave-active{transition:transform .24s var(--study-ease),opacity .18s}.source-slide-enter-from{transform:translateX(20px);opacity:0}.source-slide-leave-to{transform:translateX(8px);opacity:0}.knowledge-card{transition:transform .22s var(--study-ease)}.knowledge-card:hover{transform:translateY(-3px)}}
+@media(prefers-reduced-motion:no-preference){.upload-status.is-processing{animation:upload-status-pulse 1.8s ease-in-out infinite}.upload-status.is-processing :deep(.el-alert__title)::after{content:'';display:inline-block;width:5px;height:5px;margin-left:8px;vertical-align:middle;border-radius:50%;background:#5d7350;box-shadow:0 0 0 0 #5d735066;animation:upload-status-dot 1.4s ease-out infinite}.source-jump{transition:transform .2s var(--study-ease),border-color .18s,background-color .18s}.source-jump:hover{transform:translateY(-2px);border-color:#9dbba8;background:#f2faf5}.knowledge-card{animation:knowledge-card-enter .38s var(--study-ease) both;animation-delay:calc(var(--motion-index, 0) * 35ms)}}
+@keyframes upload-status-pulse{0%,100%{box-shadow:0 0 0 0 rgba(93,115,80,0)}50%{box-shadow:0 6px 18px -14px rgba(41,75,60,.58)}}
+@keyframes upload-status-dot{70%,100%{box-shadow:0 0 0 7px transparent}}
+@keyframes knowledge-card-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@media(min-width:1500px){.course-selector{grid-template-columns:auto minmax(180px,260px) minmax(0,1fr)}.course-selector>.muted{grid-column:auto}}
+@media(max-width:1200px){.student-app-grid{grid-template-columns:180px minmax(0,1fr);gap:14px}.student-grid{grid-template-columns:minmax(0,1fr) 270px}.student-workspace{padding:0 16px 24px!important}.student-topbar{gap:20px}.student-brand{min-width:176px}.student-topbar nav{gap:20px}.student-header .page-title{display:block}.student-header p{margin-top:8px}.course-strip-main{flex-wrap:wrap}.course-selector{flex-basis:100%}.student-workspace-tabs :deep(.el-tabs__item){padding:0 12px}}
+@media(max-width:1000px){.student-grid{grid-template-columns:minmax(0,1fr)}.profile-column{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.student-topbar{flex-wrap:wrap;height:auto;min-height:76px;padding:12px 0;gap:14px}.student-topbar nav{order:3;flex-basis:100%;height:38px}.student-topbar nav a.router-link-active::after{bottom:0}.student-topbar .el-dropdown{margin-left:auto}.source-inspector :deep(.preview-body iframe){height:360px}}
+@media(max-width:760px){.student-workspace{padding:0 12px 20px!important}.student-app-grid{grid-template-columns:minmax(0,1fr);gap:12px}.student-course-nav{position:static;min-height:0;max-height:none;padding:10px 12px}.course-nav-heading{padding:0}.course-nav-toggle{display:flex;align-items:center;gap:10px}.course-nav-toggle .el-icon{display:inline-flex}.course-nav-groups{display:none}.course-nav-groups.is-open{display:block}.course-nav-art{display:none}.student-brand{font-size:19px;min-width:0}.student-brand>.el-icon{font-size:26px}.account-menu{max-width:160px}.student-topbar nav{gap:22px}.student-topbar nav a{font-size:13px}.student-header{padding:8px 2px;margin-bottom:10px;min-height:70px}.student-header h1{font-size:25px}.student-header p{font-size:12px}.student-header>.study-artwork{opacity:.3;right:-28px;width:112px;height:84px}.course-selector{grid-template-columns:auto minmax(0,1fr)}.course-strip-main>.el-tag{max-width:100%;white-space:normal;height:auto;min-height:24px}.profile-column{display:flex}.student-workspace-tabs :deep(.el-card__header),.student-workspace-tabs :deep(.el-card__body){padding:16px}.qa-panel :deep(>.el-card__body){min-height:420px}.qa-welcome{padding:26px 4px}.qa-welcome h2{font-size:22px}.source-jump{flex-wrap:wrap}.student-workspace-tabs :deep(.el-tabs__header){padding:0 8px}.card-view-switch{flex-wrap:wrap}.source-placeholder{min-height:0;padding:24px}.card-header{flex-wrap:wrap}}
+@media(max-width:980px){.training-context-card{grid-template-columns:1fr}.training-context-select{padding:16px 0 0;border-top:1px solid #dce1d4;border-left:0}.training-layout{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:760px){.training-context-card{padding:18px}.training-context-title{align-items:flex-start;flex-direction:column;gap:6px}.training-context-title b{white-space:normal;font-size:19px}.training-panel-heading{padding:18px 16px 16px;grid-template-columns:34px minmax(0,1fr)}.training-panel-heading>.el-tag,.training-live-dot{grid-column:2;justify-self:start}.training-card-context,.training-form-block,.training-empty-state,.training-result-panel{margin-left:16px;margin-right:16px}.training-stage-list{padding-inline:16px}.training-stage-title{align-items:flex-start;flex-direction:column;gap:4px}.training-panel-heading h2{font-size:17px}}
+
+</style>

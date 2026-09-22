@@ -3,9 +3,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import re
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from argon2 import PasswordHasher
@@ -13,7 +14,7 @@ from openpyxl import load_workbook
 
 from campus_service import CampusService, PermissionDenied, ValidationError
 from database import LearningDatabase
-from config import get_student_default_password
+from config import get_runtime_setting, get_student_default_password
 
 
 class TeacherService:
@@ -47,6 +48,32 @@ class TeacherService:
         teacher_id = self.require_teacher(actor)
         return self.db.fetch_all("SELECT * FROM terms WHERE owner_id=? ORDER BY created_at DESC", (teacher_id,))
 
+    def institution_profile(self, actor: dict[str, Any]) -> dict[str, Any]:
+        """Return deployment-level school choices plus this teacher's used values."""
+        teacher_id = self.require_teacher(actor)
+        rows = self.db.fetch_all(
+            "SELECT campus,major FROM classes WHERE teacher_id=?", (teacher_id,),
+        )
+
+        def choices(env_name: str, historical: list[str], fallback: str = "") -> list[str]:
+            configured = get_runtime_setting(env_name, fallback)
+            values = [part.strip() for part in configured.split(",") if part.strip()]
+            return list(dict.fromkeys([*values, *historical]))
+
+        return {
+            "school_name": get_runtime_setting("ZHIJIAO_SCHOOL_NAME", "温州医科大学"),
+            "campuses": choices(
+                "ZHIJIAO_SCHOOL_CAMPUSES",
+                [str(row.get("campus") or "").strip() for row in rows if row.get("campus")],
+                "本部,仁济",
+            ),
+            "majors": choices(
+                "ZHIJIAO_SCHOOL_MAJORS",
+                [str(row.get("major") or "").strip() for row in rows if row.get("major")],
+                "信息管理与信息系统",
+            ),
+        }
+
     def create_term(self, actor: dict[str, Any], name: str, starts_on: date | None = None,
                     ends_on: date | None = None, academic_year: str = "",
                     teaching_period: str = "") -> dict[str, Any]:
@@ -77,6 +104,32 @@ class TeacherService:
             if "UNIQUE" in str(exc).upper():
                 raise ValidationError("该学期名称已存在") from exc
             raise
+        return self.db.fetch_one("SELECT * FROM terms WHERE term_id=?", (term_id,)) or {}
+
+    def update_term(self, actor: dict[str, Any], term_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        teacher_id = self.require_teacher(actor)
+        term = self.db.fetch_one(
+            "SELECT * FROM terms WHERE term_id=? AND owner_id=?", (term_id, teacher_id)
+        )
+        if not term:
+            raise PermissionDenied("无权修改该学期")
+        starts_on = updates.get("starts_on", term.get("starts_on"))
+        ends_on = updates.get("ends_on", term.get("ends_on"))
+        starts_text = starts_on.isoformat() if isinstance(starts_on, date) else (str(starts_on) if starts_on else None)
+        ends_text = ends_on.isoformat() if isinstance(ends_on, date) else (str(ends_on) if ends_on else None)
+        if starts_text and ends_text and date.fromisoformat(starts_text) > date.fromisoformat(ends_text):
+            raise ValidationError("学期结束日期不能早于开学第一天")
+        name = str(updates.get("term_name", term["term_name"])).strip()
+        if not name:
+            raise ValidationError("学期名称不能为空")
+        self.db.execute(
+            """UPDATE terms SET term_name=?,starts_on=?,ends_on=?,academic_year=?,teaching_period=?
+               WHERE term_id=? AND owner_id=?""",
+            (name[:120], starts_text, ends_text,
+             str(updates.get("academic_year", term.get("academic_year") or "")).strip()[:32],
+             str(updates.get("teaching_period", term.get("teaching_period") or "")).strip()[:64],
+             term_id, teacher_id),
+        )
         return self.db.fetch_one("SELECT * FROM terms WHERE term_id=?", (term_id,)) or {}
 
     def list_classes(self, actor: dict[str, Any], course_id: str | None = None) -> list[dict[str, Any]]:
@@ -129,12 +182,269 @@ class TeacherService:
         rows = self.list_classes(actor, course_id)
         return next(row for row in rows if row["class_id"] == class_id)
 
+    def update_class(self, actor: dict[str, Any], class_id: str,
+                     updates: dict[str, Any]) -> dict[str, Any]:
+        teacher_id = self.require_teacher(actor)
+        current = self.require_class(actor, class_id)
+        course_id = str(updates.get("course_id") or current["course_id"]).strip()
+        term_id = str(updates.get("term_id") or current["term_id"]).strip()
+        course = self.campus.require_access(course_id, teacher_id, "teacher")
+        if course["course_type"] != "shared_course" or course["owner_id"] != teacher_id:
+            raise PermissionDenied("只能使用自己的共享课程")
+        term = self.db.fetch_one(
+            "SELECT * FROM terms WHERE term_id=? AND owner_id=?", (term_id, teacher_id)
+        )
+        if not term:
+            raise PermissionDenied("无权使用该学期")
+        class_name = str(updates.get("class_name", current["class_name"]) or "").strip()
+        if not class_name:
+            raise ValidationError("教学班名称不能为空")
+        class_variant = str(updates.get("class_variant", current.get("class_variant")) or "").strip()[:100]
+        teaching_time_slot = str(updates.get("teaching_time_slot", current.get("teaching_time_slot")) or "").strip()[:120]
+        campus = str(updates.get("campus", current.get("campus")) or "").strip()[:100]
+        cohort_year = str(updates.get("cohort_year", current.get("cohort_year")) or "").strip()[:32]
+        major = str(updates.get("major", current.get("major")) or "").strip()[:120]
+        teaching_level = str(updates.get("teaching_level", current.get("teaching_level")) or "").strip()[:100]
+        try:
+            with self.db.connect() as conn:
+                conn.execute(
+                    """UPDATE classes SET course_id=?,term_id=?,class_name=?,class_variant=?,
+                          teaching_time_slot=?,campus=?,cohort_year=?,major=?,teaching_level=?,
+                          updated_at=CURRENT_TIMESTAMP
+                   WHERE class_id=? AND teacher_id=?""",
+                    (course_id, term_id, class_name, class_variant, teaching_time_slot,
+                 campus, cohort_year, major, teaching_level, class_id, teacher_id),
+                )
+                if course_id != current["course_id"]:
+                    members = conn.execute(
+                        "SELECT student_id FROM class_memberships WHERE class_id=? AND status='active'", (class_id,),
+                    ).fetchall()
+                    for member in members:
+                        self._remove_unused_enrollment(conn, current["course_id"], member["student_id"])
+                        conn.execute(
+                            "INSERT OR IGNORE INTO course_enrollments(course_id,student_id,direct_grant) VALUES(?,?,0)",
+                            (course_id, member["student_id"]),
+                        )
+        except Exception as exc:
+            if "UNIQUE" in str(exc).upper():
+                raise ValidationError("该课程和学期下已存在同名教学班") from exc
+            raise
+        rows = self.list_classes(actor, course_id)
+        return next(row for row in rows if row["class_id"] == class_id)
+
+    def delete_class(self, actor: dict[str, Any], class_id: str) -> None:
+        teacher_id = self.require_teacher(actor)
+        current = self.require_class(actor, class_id)
+        with self.db.connect() as conn:
+            members = conn.execute("SELECT student_id FROM class_memberships WHERE class_id=?", (class_id,)).fetchall()
+            conn.execute("DELETE FROM classes WHERE class_id=? AND teacher_id=?", (class_id, teacher_id))
+            for member in members:
+                self._remove_unused_enrollment(conn, current["course_id"], member["student_id"])
+
+    @staticmethod
+    def _remove_unused_enrollment(conn, course_id: str, student_id: str) -> None:
+        conn.execute(
+            """DELETE FROM course_enrollments WHERE course_id=? AND student_id=? AND direct_grant=0
+               AND NOT EXISTS (
+                   SELECT 1 FROM class_memberships m JOIN classes c USING(class_id)
+                   WHERE c.course_id=? AND m.student_id=? AND m.status='active' AND c.status='active'
+               )""", (course_id, student_id, course_id, student_id),
+        )
+
     def require_class(self, actor: dict[str, Any], class_id: str) -> dict[str, Any]:
         teacher_id = self.require_teacher(actor)
         row = self.db.fetch_one("SELECT * FROM classes WHERE class_id=? AND teacher_id=?", (class_id, teacher_id))
         if not row:
             raise PermissionDenied("无权访问该教学班")
         return row
+
+    @staticmethod
+    def _validate_clock(value: str, label: str) -> str:
+        value = str(value or "").strip()
+        if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+            raise ValidationError(f"{label}必须使用 HH:MM 格式")
+        return value
+
+    def replace_weekly_schedules(self, actor: dict[str, Any], class_id: str,
+                                 schedules: list[dict[str, Any]],
+                                 adjustments: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        scope = self.require_class(actor, class_id)
+        changes = []
+        if adjustments is not None:
+            if len(adjustments) > 100:
+                raise ValidationError("单个教学班最多设置 100 条调课记录")
+            term = self.db.fetch_one("SELECT * FROM terms WHERE term_id=?", (scope["term_id"],))
+            seen = set()
+            for entry in adjustments:
+                try:
+                    original = date.fromisoformat(str(entry.get("original_date") or "")).isoformat()
+                    makeup = date.fromisoformat(str(entry["makeup_date"])).isoformat() if entry.get("makeup_date") else None
+                except ValueError as exc:
+                    raise ValidationError("调课日期格式无效") from exc
+                if original in seen or original == makeup:
+                    raise ValidationError("原上课日期不能重复，补课日期不能与原日期相同")
+                seen.add(original)
+                if any((term.get("starts_on") and day < term["starts_on"]) or
+                       (term.get("ends_on") and day > term["ends_on"])
+                       for day in (original, makeup) if day):
+                    raise ValidationError("调课日期必须在学期范围内")
+                reason = str(entry.get("reason") or "").strip()
+                if len(reason) > 120:
+                    raise ValidationError("调课说明不能超过 120 个字符")
+                changes.append((class_id, original, makeup, reason))
+        normalized: list[dict[str, Any]] = []
+        for entry in schedules:
+            weekday = int(entry.get("weekday") or 0)
+            starts_week = int(entry.get("starts_week") or 1)
+            ends_week = int(entry.get("ends_week") or 18)
+            if weekday not in range(1, 8):
+                raise ValidationError("上课星期必须在星期一到星期日之间")
+            if starts_week < 1 or ends_week < starts_week or ends_week > 30:
+                raise ValidationError("课程周次范围无效")
+            details = entry.get("details") or {}
+            raw_start_time = str(entry.get("start_time") or "").strip()
+            raw_end_time = str(entry.get("end_time") or "").strip()
+            if raw_start_time or raw_end_time:
+                start_time = self._validate_clock(raw_start_time, "开始时间")
+                end_time = self._validate_clock(raw_end_time, "结束时间")
+                if end_time <= start_time:
+                    raise ValidationError("下课时间必须晚于上课时间")
+            else:
+                # Imported rows may intentionally omit clock times; their period label
+                # remains visible in the calendar and is enough to identify the class.
+                start_time = end_time = ""
+            location = str(entry.get("location") or "").strip()
+            if not location:
+                raise ValidationError("请填写每条课程的上课地点或线上地址")
+            if len(location) > 120:
+                raise ValidationError("上课地点不能超过 120 个字符")
+            normalized.append({
+                "schedule_id": f"cws_{uuid.uuid4().hex[:16]}",
+                "weekday": weekday, "start_time": start_time, "end_time": end_time,
+                "location": location,
+                "starts_week": starts_week, "ends_week": ends_week,
+                "details_json": json.dumps(details, ensure_ascii=False),
+            })
+        with self.db.connect() as conn:
+            if adjustments is not None:
+                conn.execute("DELETE FROM class_calendar_adjustments WHERE class_id=?", (class_id,))
+                conn.executemany("INSERT INTO class_calendar_adjustments(class_id,original_date,makeup_date,reason) VALUES(?,?,?,?)", changes)
+            conn.execute("DELETE FROM class_weekly_schedules WHERE class_id=?", (class_id,))
+            conn.executemany(
+                """INSERT INTO class_weekly_schedules(
+                       schedule_id,class_id,weekday,start_time,end_time,location,starts_week,ends_week,details_json
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                [(row["schedule_id"], class_id, row["weekday"], row["start_time"],
+                  row["end_time"], row["location"], row["starts_week"], row["ends_week"],
+                  row["details_json"])
+                  for row in normalized],
+            )
+        return self.db.fetch_all(
+            "SELECT * FROM class_weekly_schedules WHERE class_id=? ORDER BY weekday,start_time",
+            (class_id,),
+        )
+
+    def course_calendar(self, actor: dict[str, Any], course_id: str,
+                        term_id: str | None = None) -> dict[str, Any]:
+        teacher_id = self.require_teacher(actor)
+        course = self.campus.require_access(course_id, teacher_id, "teacher")
+        if course["owner_id"] != teacher_id:
+            raise PermissionDenied("无权查看该课程日历")
+        condition = "cl.course_id=? AND cl.teacher_id=?"
+        params: list[Any] = [course_id, teacher_id]
+        if term_id:
+            condition += " AND cl.term_id=?"
+            params.append(term_id)
+        classes = self.db.fetch_all(
+            f"""SELECT cl.class_id,cl.class_name,cl.term_id,t.term_name,t.starts_on,t.ends_on
+                FROM classes cl JOIN terms t USING(term_id) WHERE {condition}
+                ORDER BY t.starts_on,cl.class_name""",
+            tuple(params),
+        )
+        events: list[dict[str, Any]] = []
+        schedules: list[dict[str, Any]] = []
+        for class_row in classes:
+            rows = self.db.fetch_all(
+                """SELECT * FROM class_weekly_schedules WHERE class_id=?
+                   ORDER BY weekday,start_time""", (class_row["class_id"],),
+            )
+            for row in rows:
+                try:
+                    details = json.loads(row.get("details_json") or "{}")
+                except json.JSONDecodeError:
+                    details = {}
+                schedule = {key: value for key, value in row.items() if key != "details_json"}
+                schedules.append({**schedule, "details": details,
+                                  "class_name": class_row["class_name"],
+                                  "term_id": class_row["term_id"]})
+                if details.get("date"):
+                    try:
+                        event_date = date.fromisoformat(str(details["date"]))
+                    except ValueError:
+                        event_date = None
+                    if event_date:
+                        events.append({
+                            "schedule_id": row["schedule_id"], "class_id": class_row["class_id"],
+                            "class_name": class_row["class_name"], "term_id": class_row["term_id"],
+                            "term_name": class_row["term_name"],
+                            "week": int(details.get("week") or row["starts_week"]),
+                            "date": event_date.isoformat(), "weekday": row["weekday"],
+                            "start_time": row["start_time"], "end_time": row["end_time"],
+                            "location": details.get("location") or row["location"],
+                            "period_label": details.get("period_label") or "",
+                            "course_name": details.get("course_name") or course.get("course_name", ""),
+                            "teaching_content": details.get("teaching_content") or "",
+                            "teacher": details.get("teacher") or "",
+                            "teaching_nature": details.get("teaching_nature") or "",
+                            "credits": details.get("credits") or "",
+                            "total_hours": details.get("total_hours") or "",
+                            "lesson_hours": details.get("lesson_hours") or "",
+                        })
+                    continue
+                if not class_row.get("starts_on"):
+                    continue
+                first_day = date.fromisoformat(class_row["starts_on"])
+                term_end = date.fromisoformat(class_row["ends_on"]) if class_row.get("ends_on") else first_day + timedelta(weeks=30)
+                first_occurrence = first_day + timedelta(days=(int(row["weekday"]) - first_day.isoweekday()) % 7)
+                for week in range(int(row["starts_week"]), int(row["ends_week"]) + 1):
+                    event_date = first_occurrence + timedelta(weeks=week - 1)
+                    if event_date > term_end:
+                        break
+                    events.append({
+                        "schedule_id": row["schedule_id"], "class_id": class_row["class_id"],
+                        "class_name": class_row["class_name"], "term_id": class_row["term_id"],
+                        "term_name": class_row["term_name"], "week": week,
+                        "date": event_date.isoformat(), "weekday": row["weekday"],
+                        "start_time": row["start_time"], "end_time": row["end_time"],
+                        "location": row["location"], "period_label": details.get("period_label") or "",
+                        "course_name": details.get("course_name") or course.get("course_name", ""),
+                        "teaching_content": details.get("teaching_content") or "",
+                        "teacher": details.get("teacher") or "",
+                        "teaching_nature": details.get("teaching_nature") or "",
+                        "credits": details.get("credits") or "",
+                        "total_hours": details.get("total_hours") or "",
+                        "lesson_hours": details.get("lesson_hours") or "",
+                    })
+        adjustments = []
+        for class_row in classes:
+            adjustments.extend(self.db.fetch_all(
+                "SELECT * FROM class_calendar_adjustments WHERE class_id=? ORDER BY original_date",
+                (class_row["class_id"],)))
+        mapping = {(row["class_id"], row["original_date"]): row for row in adjustments}
+        adjusted, cancelled = [], []
+        for event in events:
+            change = mapping.get((event["class_id"], event["date"]))
+            if change:
+                event = {**event, "original_date": event["date"], "adjustment_reason": change["reason"]}
+                if not change["makeup_date"]:
+                    cancelled.append(event)
+                    continue
+                event["date"] = change["makeup_date"]
+                event["weekday"] = date.fromisoformat(event["date"]).isoweekday()
+            adjusted.append(event)
+        events = adjusted
+        events.sort(key=lambda row: (row["date"], row["start_time"], row["class_name"]))
+        return {"course_id": course_id, "schedules": schedules, "events": events, "adjustments": adjustments, "cancelled_events": cancelled}
 
     def list_members(self, actor: dict[str, Any], class_id: str) -> list[dict[str, Any]]:
         self.require_class(actor, class_id)
@@ -162,7 +472,7 @@ class TeacherService:
             raise PermissionDenied("只能重置当前教学班在册学生的密码")
         with self.db.connect() as conn:
             conn.execute(
-                """UPDATE users SET password_hash=?,must_change_password=1,
+                """UPDATE users SET password_hash=?,must_change_password=1,session_version=session_version+1,
                        password_changed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE user_id=?""",
                 (self.passwords.hash(new_password), student_id),
             )
@@ -181,7 +491,7 @@ class TeacherService:
 
     @staticmethod
     def _valid_student_number(value: str) -> bool:
-        return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,63}", value))
+        return bool(re.fullmatch(r"[0-9]{6,20}", value))
 
     def import_members(self, actor: dict[str, Any], class_id: str,
                        rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -200,10 +510,11 @@ class TeacherService:
             name = str(raw.get("display_name") or "").strip()[:100]
             base = {"row": index, "student_number": number, "display_name": name}
             if not self._valid_student_number(number):
-                results.append({**base, "status": "invalid", "message": "学号格式无效"})
+                results.append({**base, "status": "invalid", "message": "学号必须为 6–20 位数字，请将名单学号列设为文本以保留前导零"})
                 continue
             try:
                 with self.db.connect() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
                     found = conn.execute(
                         "SELECT * FROM users WHERE student_number=? OR username=? ORDER BY student_number IS NOT NULL DESC LIMIT 1",
                         (number, number),
@@ -213,6 +524,12 @@ class TeacherService:
                         user = dict(found)
                         if user["role"] != "student":
                             results.append({**base, "status": "conflict", "message": "该学号已被非学生账号占用"})
+                            continue
+                        if user.get("student_number") and user["student_number"] != number:
+                            results.append({**base, "status": "conflict", "message": "该登录名已绑定其他学号，请核对学生账号"})
+                            continue
+                        if name and user.get("display_name") and name != user["display_name"]:
+                            results.append({**base, "status": "conflict", "message": "该学号已绑定其他姓名，请核对名单，未创建重复账号"})
                             continue
                         user_id = user["user_id"]
                         if not user.get("student_number"):
@@ -254,11 +571,11 @@ class TeacherService:
                             (class_id, user_id, anon),
                         )
                         conn.execute(
-                            "INSERT OR IGNORE INTO course_enrollments(course_id,student_id) VALUES(?,?)",
+                            "INSERT OR IGNORE INTO course_enrollments(course_id,student_id,direct_grant) VALUES(?,?,0)",
                             (scope["course_id"], user_id),
                         )
                         status = "created" if created else "reused"
-                results.append({**base, "user_id": user_id, "status": status, "message": ""})
+                results.append({**base, "user_id": user_id, "status": status, "message": "该学生已在本班，未重复添加" if status == "already_member" else "复用已有学生账号" if status == "reused" else "已创建学生账号"})
             except Exception as exc:
                 results.append({**base, "status": "conflict", "message": str(exc)[:160]})
         summary = {key: sum(1 for item in results if item["status"] == key)

@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.pytest-basetemp*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -25,6 +26,7 @@ relay-deploy-linux-x64.zip
 *.egg-info/
 web/node_modules/
 web/dist/
+web/dist-card-preview/
 web/.npm-cache/
 *.tsbuildinfo
 vendor/

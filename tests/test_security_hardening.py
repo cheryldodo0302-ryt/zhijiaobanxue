@@ -1,7 +1,9 @@
 import io
 import zipfile
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
+import jwt
 import pytest
 
 import config
@@ -57,6 +59,35 @@ def test_disabled_user_cannot_reuse_existing_access_token(tmp_path):
     db.execute("UPDATE users SET status='disabled' WHERE user_id=?", (user["user_id"],))
     with pytest.raises(PermissionDenied, match="停用"):
         auth.authenticate(access)
+
+
+def test_login_session_has_fixed_one_month_expiry(tmp_path):
+    db = LearningDatabase(tmp_path / "auth.db")
+    auth = AuthService(db, tmp_path / "secret")
+    user = auth.create_user("student", "safe-password-123", "student")
+    _, access, refresh = auth.login("student", "safe-password-123")
+
+    access_payload = auth.decode(access)
+    refresh_payload = auth.decode(refresh, "refresh")
+    assert access_payload["session_exp"] == refresh_payload["session_exp"]
+
+    _, next_access, next_refresh = auth.refresh(refresh)
+    assert auth.decode(next_access)["session_exp"] == refresh_payload["session_exp"]
+    assert auth.decode(next_refresh, "refresh")["session_exp"] == refresh_payload["session_exp"]
+
+    now = datetime.now(timezone.utc)
+    expired_access = jwt.encode(
+        {
+            "sub": user["user_id"], "role": user["role"], "type": "access",
+            "jti": "expired-session", "iss": auth.issuer, "iat": now,
+            "exp": now + timedelta(minutes=15),
+            "session_exp": int((now - timedelta(seconds=1)).timestamp()),
+        },
+        auth.secret,
+        algorithm="HS256",
+    )
+    with pytest.raises(PermissionDenied, match="一个月"):
+        auth.authenticate(expired_access)
 
 
 def test_login_rate_limit_blocks_brute_force(tmp_path):

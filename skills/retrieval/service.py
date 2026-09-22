@@ -1,5 +1,5 @@
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -14,6 +14,9 @@ class Evidence:
     score: float
     material_type: str = ""
     material_label: str = ""
+    document_id: str | None = None
+    page_number: int | None = None
+    locations: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return asdict(self)

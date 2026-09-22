@@ -11,6 +11,8 @@ const router = createRouter({ history:createWebHistory(), routes:[
   { path:'/knowledge-graph', component:() => import('./views/KnowledgeGraphView.vue'), meta:{ role:'teacher' } },
   { path:'/questions', component:() => import('./views/QuestionCenterView.vue'), meta:{ role:'teacher' } },
   { path:'/analytics', component:() => import('./views/TeachingOverviewView.vue'), meta:{ role:'teacher' } },
+  { path:'/student-portraits', component:() => import('./views/StudentPortraitView.vue'), meta:{ role:'teacher' } },
+  { path:'/student/tasks', component:() => import('./views/StudentTasksView.vue'), meta:{ role:'student' } },
   { path:'/student/courses', component:() => import('./views/StudentCoursesView.vue'), meta:{ role:'student' } },
   { path:'/student/study-room', component:() => import('./views/StudentStudyRoomView.vue'), meta:{ role:'student' } },
 ] })
@@ -23,6 +25,16 @@ router.beforeEach(async to => {
   if (auth.user && !auth.user.must_change_password && to.path === '/change-password') return auth.user.role === 'teacher' ? '/' : '/student/courses'
   if (to.meta.role && auth.user?.role !== to.meta.role) return auth.user?.role === 'teacher' ? '/' : '/student/courses'
   if (to.path === '/login' && auth.user) return auth.user.must_change_password ? '/change-password' : auth.user.role === 'teacher' ? '/' : '/student/courses'
+})
+
+// Use the destination after auth redirects, so a rejected navigation cannot
+// leave the browser tab showing the wrong portal.
+router.afterEach((to, _from, failure) => {
+  if (failure) return
+  const role = to.meta.public ? undefined : to.meta.role || useAuthStore().user?.role
+  document.documentElement.dataset.portal = typeof role === 'string' ? role : ''
+  document.title = role === 'student' ? '智教伴学 · 学生端'
+    : role === 'teacher' ? '智教伴学 · 教师端' : '智教伴学'
 })
 
 export default router

@@ -1,0 +1,95 @@
+/* Shared forest palette. Loaded after portal styles; overlays inherit from html. */
+html:is([data-portal="teacher"], [data-portal="student"]),
+:is(.teacher-surface, .student-surface) {
+  color-scheme: light;
+  --primary: #294b3c;
+  --el-color-primary: #294b3c;
+  --el-color-primary-dark-2: #203c30;
+  --el-color-primary-light-3: #50694b;
+  --el-color-primary-light-5: #8d9c80;
+  --el-color-primary-light-7: #c3cdb7;
+  --el-color-primary-light-8: #dce3d3;
+  --el-color-primary-light-9: #edf0e7;
+  --el-color-success: #526747;
+  --el-color-success-dark-2: #405337;
+  --el-color-warning: #8b5b28;
+  --el-color-warning-dark-2: #734a20;
+  --el-color-danger: #a34f28;
+  --el-color-danger-dark-2: #853d1c;
+  --el-color-info: #665d4d;
+  --el-text-color-primary: #293c30;
+  --el-text-color-regular: #495741;
+  --el-text-color-secondary: #56634d;
+  --el-text-color-placeholder: #68705e;
+  --el-border-color: #cbd2c2;
+  --el-border-color-light: #dce1d4;
+  --el-border-color-lighter: #e7eadd;
+  --el-fill-color-light: #edf0e7;
+  --el-fill-color-lighter: #f4f5ed;
+  --el-fill-color-blank: #fcfcf8;
+  --el-bg-color: #fcfcf8;
+  --el-bg-color-overlay: #fcfcf8;
+  --el-color-white: #fcfcf8;
+  background: #f4f5ed;
+}
+
+/* Semantic ramps follow the same reference hues, including hover/disabled states. */
+html:is([data-portal="teacher"], [data-portal="student"]),
+:is(.teacher-surface, .student-surface) {
+  --el-color-success-light-3: #657a59;
+  --el-color-success-light-5: #9ba98e;
+  --el-color-success-light-7: #c7d0bd;
+  --el-color-success-light-8: #dce3d3;
+  --el-color-success-light-9: #edf0e7;
+  --el-color-warning-light-3: #9a6936;
+  --el-color-warning-light-5: #bd9766;
+  --el-color-warning-light-7: #dfc8a7;
+  --el-color-warning-light-8: #ecdbc1;
+  --el-color-warning-light-9: #faf1e4;
+  --el-color-danger-light-3: #ad5933;
+  --el-color-danger-light-5: #c68c6e;
+  --el-color-danger-light-7: #e1bfaa;
+  --el-color-danger-light-8: #ecd3c3;
+  --el-color-danger-light-9: #f8eee6;
+  --el-color-info-light-3: #786e5d;
+  --el-color-info-light-5: #a69c8b;
+  --el-color-info-light-7: #d2cbbd;
+  --el-color-info-light-8: #e3ded2;
+  --el-color-info-light-9: #f2efe7;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) ::selection { background: #dce3d3; color: #294b3c; }
+html:is([data-portal="teacher"], [data-portal="student"]) :focus-visible { outline: 2px solid #5d7350; outline-offset: 3px; }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(input, textarea) { caret-color: #294b3c; }
+
+/* Override legacy component-level teal rules, including their selected states. */
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button--primary {
+  --el-button-bg-color: var(--el-color-primary);
+  --el-button-border-color: var(--el-color-primary);
+  --el-button-hover-bg-color: var(--el-color-primary-light-3);
+  --el-button-hover-border-color: var(--el-color-primary-light-3);
+  --el-button-active-bg-color: var(--el-color-primary-dark-2);
+  --el-button-active-border-color: var(--el-color-primary-dark-2);
+}
+html:is([data-portal="teacher"], [data-portal="student"]) .el-button--primary.is-plain {
+  --el-button-bg-color: #edf0e7;
+  --el-button-text-color: #294b3c;
+  --el-button-border-color: #8d9c80;
+}
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-link, .el-button.is-link, .el-button--text) { --el-button-text-color: var(--el-color-primary); --el-button-hover-text-color: var(--el-color-primary-dark-2); }
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-tabs__item.is-active, .el-tabs__item:hover, .el-segmented__item-selected) { color: #294b3c !important; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-tabs__active-bar { background-color: #5d7350 !important; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-radio-button__original-radio:checked + .el-radio-button__inner { background: #294b3c !important; border-color: #294b3c !important; box-shadow: -1px 0 0 0 #294b3c !important; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-checkbox__input.is-checked .el-checkbox__inner { background: #294b3c !important; border-color: #294b3c !important; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-tree-node.is-current > .el-tree-node__content { background: #e4e9da !important; color: #294b3c; }
+.teacher-surface .teacher-route a:not(.el-button) { color: #294b3c; }
+:is(.teacher-surface, .student-surface) :focus-visible { outline-color: #5d7350; }
+:is(.teacher-surface, .student-surface) ::selection { background: #dce3d3; color: #294b3c; }
+:is(.teacher-surface, .student-surface) :is(.el-textarea__inner, .el-input__inner) { caret-color: #294b3c; }
+
+/* Native controls must inherit the same Chinese sans face as the surrounding UI. */
+html:is([data-portal="teacher"], [data-portal="student"]),
+:is(.teacher-surface, .student-surface) {
+  --campus-font: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  font-family: var(--campus-font);
+}
+html:is([data-portal="teacher"], [data-portal="student"]) :is(button, input, select, textarea) { font-family: var(--campus-font); }

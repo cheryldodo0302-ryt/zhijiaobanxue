@@ -1,9 +1,17 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import ElementPlus from 'element-plus'
+import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import 'element-plus/dist/index.css'
 import App from './App.vue'
 import router from './router'
 import './styles.css'
 import './preview.css'
-createApp(App).use(createPinia()).use(router).use(ElementPlus).mount('#app')
+import './button-styles.css'
+import './student-ui.css'
+import './teacher-ui.css'
+import './campus-theme.css'
+import './campus-depth.css'
+import './campus-controls.css'
+import './login-scene.css'
+createApp(App).use(createPinia()).use(router).use(ElementPlus, { locale: zhCn }).mount('#app')

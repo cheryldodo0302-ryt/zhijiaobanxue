@@ -331,6 +331,195 @@ def test_publish_readiness_blocks_fallback_for_syllabus_only(governance):
     assert "syllabus_safe_fallback" not in {item["code"] for item in readiness["blockers"]}
 
 
+def test_finished_document_review_syncs_course_tree_and_job_status(governance):
+    db, _, service, teacher, _, course = governance
+    job = service.queue_document(
+        teacher, course["course_id"], "review.txt", "text/plain", "关系模型是二维表结构".encode()
+    )
+    service.process_job(job["job_id"])
+    block = db.fetch_one(
+        "SELECT block_id FROM document_blocks WHERE document_id=? LIMIT 1", (job["document_id"],)
+    )
+    analysis = db.fetch_one(
+        "SELECT analysis_job_id FROM semantic_analysis_jobs WHERE document_id=?", (job["document_id"],)
+    )
+    with db.connect() as conn:
+        conn.execute(
+            """INSERT INTO course_outline_generations(
+                   generation_id,course_id,material_type,analysis_job_id,status
+               ) VALUES('gen_review',?,'other',?,'current')""",
+            (course["course_id"], analysis["analysis_job_id"]),
+        )
+        conn.execute(
+            """INSERT INTO knowledge_nodes(
+                   node_id,course_id,document_id,node_scope,node_type,title,markdown,status,
+                   analysis_job_id,material_type
+               ) VALUES('doc_point',?,?,'document','knowledge_point','关系模型',
+                        '关系模型是二维表结构','approved',?,'other')""",
+            (course["course_id"], job["document_id"], analysis["analysis_job_id"]),
+        )
+        conn.execute(
+            """INSERT INTO knowledge_nodes(
+                   node_id,course_id,node_scope,node_type,title,markdown,status,
+                   analysis_job_id,material_type,generation_id
+               ) VALUES('course_point',?,'course','knowledge_point','关系模型',
+                        '关系模型是二维表结构','draft',?,'other','gen_review')""",
+            (course["course_id"], analysis["analysis_job_id"]),
+        )
+        conn.executemany(
+            """INSERT INTO knowledge_node_sources(node_id,block_id,document_id,page_number)
+               VALUES(?,?,?,1)""",
+            [("doc_point", block["block_id"], job["document_id"]),
+             ("course_point", block["block_id"], job["document_id"])],
+        )
+        conn.execute(
+            """UPDATE document_blocks SET content_destination='knowledge',
+               verification_status='teacher_verified' WHERE block_id=?""", (block["block_id"],)
+        )
+        conn.execute(
+            """UPDATE semantic_analysis_jobs SET status='review_required',current_stage='teacher_review'
+               WHERE analysis_job_id=?""", (analysis["analysis_job_id"],)
+        )
+
+    service._refresh_document_review_state(job["document_id"], teacher["user_id"])
+
+    assert db.fetch_one("SELECT status FROM knowledge_nodes WHERE node_id='course_point'")["status"] == "approved"
+    assert db.fetch_one(
+        "SELECT status FROM semantic_analysis_jobs WHERE analysis_job_id=?", (analysis["analysis_job_id"],)
+    )["status"] == "completed"
+    assert db.fetch_one(
+        "SELECT status FROM ingestion_jobs WHERE document_id=?", (job["document_id"],)
+    )["status"] == "ready"
+
+
+def test_whole_document_review_allows_publish_without_point_approval(governance):
+    db, _, service, teacher, _, course = governance
+    job = service.queue_document(
+        teacher, course["course_id"], "whole-review.txt", "text/plain",
+        "关系模型是二维表结构".encode(), analysis_mode="local",
+    )
+    service.process_job(job["job_id"])
+    analysis = db.fetch_one(
+        "SELECT analysis_job_id FROM semantic_analysis_jobs WHERE document_id=? ORDER BY created_at DESC LIMIT 1",
+        (job["document_id"],),
+    )
+    if analysis:
+        service.process_semantic_analysis(analysis["analysis_job_id"])
+
+    result = service.approve_document_knowledge(teacher, job["document_id"])
+
+    assert result["knowledge_review_mode"] == "whole_document"
+    assert result["knowledge_review_status"] == "approved"
+    readiness = service.publish_readiness(teacher, course["course_id"])
+    assert readiness["can_publish"] is True
+    assert readiness["whole_reviewed_documents"] == 1
+    version = service.publish(teacher, course["course_id"])
+    assert version["status"] == "published"
+
+
+def _workflow_document(service, db, teacher, course, name="workflow.md"):
+    job = service.queue_document(
+        teacher, course["course_id"], name, "text/markdown",
+        f"# 关系模型\n\n## 数据结构\n\n关系模型使用二维表组织数据，元组对应一行记录。{name}".encode(),
+        analysis_mode="local",
+    )
+    service.process_job(job["job_id"])
+    analysis = db.fetch_one("SELECT analysis_job_id FROM semantic_analysis_jobs WHERE document_id=?", (job["document_id"],))
+    if analysis:
+        service.process_semantic_analysis(analysis["analysis_job_id"])
+    return job
+
+
+def test_review_library_approval_and_student_release_are_separate(governance):
+    from published_knowledge import publication, withdraw_version
+    from knowledge_graph_service import KnowledgeGraphService
+
+    db, campus, service, teacher, _, course = governance
+    job = _workflow_document(service, db, teacher, course)
+    workflow = service.knowledge_workflow(teacher, course["course_id"])
+    assert workflow["student_publication"] is None
+    assert workflow["documents"][0]["library_status"] == "pending"
+    result = service.approve_documents_to_library(teacher, course["course_id"], [job["document_id"]])
+    assert result == {"approved": [job["document_id"]], "failed": []}
+    assert publication(db, course["course_id"]) == (None, [], [])
+    workflow = service.knowledge_workflow(teacher, course["course_id"])
+    assert workflow["documents"][0]["library_status"] == "approved"
+    assert workflow["documents"][0]["student_version"] is None
+    graph = KnowledgeGraphService(db, campus)
+    assert graph.workbench(teacher, course["course_id"])["library_knowledge"]
+    assert graph.import_approved_nodes(teacher, course["course_id"])["imported"] > 0
+    assert graph.workbench(teacher, course["course_id"])["versions"] == []
+    version = service.publish(teacher, course["course_id"], "workflow-release")
+    assert service.publish(teacher, course["course_id"], "workflow-release")["version_id"] == version["version_id"]
+    workflow = service.knowledge_workflow(teacher, course["course_id"])
+    assert workflow["documents"][0]["student_version"] == version["version_number"]
+    frozen = publication(db, course["course_id"])
+    candidates = service.list_knowledge_candidates(teacher, job["document_id"])
+    assert candidates
+    candidate = service.approve_knowledge_candidate(teacher, candidates[0]["candidate_id"])
+    edited = service.update_knowledge_candidate(teacher, candidate["candidate_id"], {"title": "修订后的关系模型"})
+    assert edited["review_status"] == "MODIFIED"
+    assert publication(db, course["course_id"]) == frozen
+    assert service.knowledge_workflow(teacher, course["course_id"])["documents"][0]["library_status"] == "pending"
+    withdraw_version(campus, teacher, course["course_id"], version["version_id"])
+    assert service.knowledge_workflow(teacher, course["course_id"])["student_publication"] is None
+
+
+def test_library_batch_checks_all_courses_before_writing(governance):
+    db, campus, service, teacher, other, course = governance
+    job = _workflow_document(service, db, teacher, course)
+    second = TeacherService(db, campus).create_course(teacher, "其他课程")
+    second_job = _workflow_document(service, db, teacher, second, "other.md")
+    with pytest.raises(PermissionDenied):
+        service.approve_documents_to_library(teacher, course["course_id"], [job["document_id"], second_job["document_id"]])
+    assert service.knowledge_workflow(teacher, course["course_id"])["documents"][0]["library_status"] == "pending"
+    with pytest.raises(PermissionDenied):
+        service.approve_documents_to_library(other, course["course_id"], [job["document_id"]])
+    student_actor = {"user_id": teacher["user_id"], "role": "student"}
+    with pytest.raises(PermissionDenied):
+        service.knowledge_workflow(student_actor, course["course_id"])
+    with pytest.raises(PermissionDenied):
+        service.publish(student_actor, course["course_id"])
+
+
+def test_outline_revision_needs_reapproval_without_changing_student_snapshot(governance):
+    from published_knowledge import publication
+
+    db, _, service, teacher, _, course = governance
+    job = _workflow_document(service, db, teacher, course)
+    service.approve_documents_to_library(teacher, course["course_id"], [job["document_id"]])
+    service.publish(teacher, course["course_id"])
+    frozen = publication(db, course["course_id"])
+    node = next(row for row in service.course_outline(teacher, course["course_id"])["nodes"]
+                if row["node_type"] == "knowledge_point")
+    saved = service.update_node(teacher, node["node_id"], {"markdown": "修改后的关系模型知识正文"})
+    assert saved["status"] == "draft"
+    assert publication(db, course["course_id"]) == frozen
+    readiness = service.publish_readiness(teacher, course["course_id"])
+    assert db.fetch_one("SELECT status FROM knowledge_nodes WHERE node_id=?", (node["node_id"],))["status"] == "draft"
+    # Other approved points can still be released; this revision must be excluded.
+    if readiness["can_publish"]:
+        service.publish(teacher, course["course_id"])
+        assert all(row["node_id"] != node["node_id"] for row in publication(db, course["course_id"])[1])
+    approved = service.update_node(teacher, node["node_id"], {"status": "approved"})
+    assert approved["status"] == "approved"
+    service.publish(teacher, course["course_id"])
+    assert any(row["markdown"] == "修改后的关系模型知识正文" for row in publication(db, course["course_id"])[1])
+
+
+def test_library_batch_reports_failed_analysis_without_publishing(governance):
+    db, _, service, teacher, _, course = governance
+    ready = _workflow_document(service, db, teacher, course)
+    failed = _workflow_document(service, db, teacher, course, "failed.md")
+    db.execute("UPDATE semantic_analysis_jobs SET status='failed' WHERE document_id=?", (failed["document_id"],))
+    result = service.approve_documents_to_library(teacher, course["course_id"], [ready["document_id"], failed["document_id"]])
+    assert result["approved"] == [ready["document_id"]]
+    assert result["failed"][0]["document_id"] == failed["document_id"]
+    workflow = service.knowledge_workflow(teacher, course["course_id"])
+    assert workflow["student_publication"] is None
+    assert not next(row for row in workflow["documents"] if row["document_id"] == failed["document_id"])["can_approve"]
+
+
 def test_safe_fallback_groups_outline_fields_under_their_experiment(governance):
     _, _, service, _, _, _ = governance
     blocks = [

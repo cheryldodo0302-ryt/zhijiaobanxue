@@ -66,11 +66,11 @@ def main() -> int:
     os.environ["NO_PROXY"] = env["NO_PROXY"]
     os.environ["no_proxy"] = env["no_proxy"]
     env["PYTHONPATH"] = os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")])
-    subprocess.run([sys.executable, str(ROOT / "scripts" / "bootstrap_demo.py"), "--if-empty"], env=env, check=True)
+    subprocess.run([sys.executable, str(ROOT / "scripts" / "bootstrap_demo.py"), "--if-empty", "--with-demo-course"], env=env, check=True)
     teacher_password, student_password = credentials(data_dir / "demo_credentials.txt")
     npm = "npm.cmd" if os.name == "nt" else "npm"
-    api_log = (ROOT / ".e2e-api.log").open("w", encoding="utf-8")
-    web_log = (ROOT / ".e2e-web.log").open("w", encoding="utf-8")
+    api_log = (data_dir / ".e2e-api.log").open("w", encoding="utf-8")
+    web_log = (data_dir / ".e2e-web.log").open("w", encoding="utf-8")
     api = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "api:app", "--host", "127.0.0.1", "--port", str(API_PORT)],
         cwd=ROOT, env=env, stdout=api_log, stderr=subprocess.STDOUT,
@@ -152,6 +152,13 @@ def main() -> int:
         })["data"]
         assert refused["refused"] and not refused["sources"]
         checks.append("无检索结果拒答")
+        for question in ("监督学习的发明者早餐吃什么？", "数据库能治疗感冒吗？", "asdfghjkl123456"):
+            result = invoke(student_http, student, "student_assistant", "course_qa", "virtual_ai_101", {
+                "question": question, "intent": "start",
+            })["data"]
+            assert result["refused"] and not result["sources"], question
+        checks.append("边界问题、无关问题和随机输入均拒答")
+
 
         private_course = invoke(student_http, student, "student_assistant", "personal_course_create", "", {"course_name": "临时测试课"})["data"]
         bad = invoke(student_http, student, "student_assistant", "student_document_upload", private_course["course_id"], {

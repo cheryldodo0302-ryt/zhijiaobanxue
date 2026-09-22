@@ -12,11 +12,13 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from agent_service import CampusAgentService
+import config
+from account_ai_service import AccountAiService
 from auth_service import AuthService
 from campus_service import CampusError, CampusService, NotFound
 from config import (
-    DB_PATH, MATERIALS_DIR, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB,
-    get_ai_settings, get_public_ai_settings, save_user_ai_settings, student_import_config_status,
+    DB_PATH, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB,
+    student_import_config_status,
 )
 from database import LearningDatabase
 from llm_provider import backend_provider_status
@@ -30,7 +32,6 @@ from knowledge_graph_service import KnowledgeGraphService
 
 db = LearningDatabase(DB_PATH)
 campus = CampusService(db)
-campus.seed_demo(MATERIALS_DIR)
 agents = CampusAgentService(campus)
 auth = AuthService(db)
 teachers = TeacherService(db, campus)
@@ -38,7 +39,7 @@ ingestion = IngestionService(db, campus)
 teaching_archives = TeachingArchiveService(db, campus, ingestion)
 knowledge_graphs = KnowledgeGraphService(db, campus)
 question_banks = QuestionBankService(db, campus)
-study_room = BrowserStudyRoomService()
+study_room = BrowserStudyRoomService(campus=campus)
 app = FastAPI(title="智教伴学 API", version="1.0.0")
 allowed_origins = [value.strip() for value in os.environ.get(
     "ZHIJIAO_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
@@ -81,6 +82,26 @@ class LoginPayload(BaseModel):
     password: str
 
 
+class StudyTelemetryPayload(BaseModel):
+    """浏览器端 AI 识别后的脱敏信号；禁止上传图片或视频。"""
+
+    face_ok: bool = False
+    head_ok: bool = False
+    eye_closed: bool = False
+    person_ok: bool = False
+    hand_near_face: bool = False
+    hand_count: int = Field(default=0, ge=0, le=2)
+    hand_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    head_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    calibrating: bool = False
+    camera_available: bool = True
+
+
+class StudyStartPayload(BaseModel):
+    course_id: str | None = None
+    class_id: str | None = None
+
+
 class RuntimeAiSettingsPayload(BaseModel):
     mode: str
     provider: str = "auto"
@@ -102,6 +123,14 @@ class TermCreatePayload(BaseModel):
     teaching_period: str = ""
 
 
+class TermUpdatePayload(BaseModel):
+    term_name: str | None = None
+    starts_on: date | None = None
+    ends_on: date | None = None
+    academic_year: str | None = None
+    teaching_period: str | None = None
+
+
 class ClassCreatePayload(BaseModel):
     course_id: str
     term_id: str
@@ -112,6 +141,39 @@ class ClassCreatePayload(BaseModel):
     cohort_year: str = ""
     major: str = ""
     teaching_level: str = ""
+
+
+class ClassUpdatePayload(BaseModel):
+    course_id: str | None = None
+    term_id: str | None = None
+    class_name: str | None = None
+    class_variant: str | None = None
+    teaching_time_slot: str | None = None
+    campus: str | None = None
+    cohort_year: str | None = None
+    major: str | None = None
+    teaching_level: str | None = None
+
+
+class WeeklyScheduleEntry(BaseModel):
+    weekday: int = Field(ge=1, le=7)
+    start_time: str
+    end_time: str
+    location: str = ""
+    starts_week: int = Field(default=1, ge=1, le=30)
+    ends_week: int = Field(default=18, ge=1, le=30)
+    details: dict = Field(default_factory=dict)
+
+
+class CalendarAdjustmentEntry(BaseModel):
+    original_date: str
+    makeup_date: str | None = None
+    reason: str = Field(default="", max_length=120)
+
+
+class WeeklySchedulesPayload(BaseModel):
+    adjustments: list[CalendarAdjustmentEntry] | None = Field(default=None, max_length=100)
+    schedules: list[WeeklyScheduleEntry] = Field(default_factory=list, max_length=20)
 
 
 class TeachingArchiveBatchPayload(BaseModel):
@@ -150,6 +212,7 @@ class KnowledgeGraphNodeImportPayload(BaseModel):
 
 class KnowledgeGraphSyncPayload(BaseModel):
     graph_node_ids: list[str] = Field(default_factory=list, max_length=1000)
+    source_knowledge_node_ids: list[str] = Field(default_factory=list, max_length=1000)
 
 
 class KnowledgeGraphNodePayload(BaseModel):
@@ -218,7 +281,12 @@ class QuestionReviewPayload(BaseModel):
 
 class QuestionBankSubmitPayload(BaseModel):
     version_id: str
+    submission_id: str | None = Field(default=None, min_length=1, max_length=100)
     responses: list[dict] = Field(min_length=1, max_length=100)
+
+
+class KnowledgePublishPayload(BaseModel):
+    request_id: str = Field(min_length=1,max_length=100)
 
 
 class QuestionFolderPayload(BaseModel):
@@ -324,6 +392,8 @@ def current_teacher(user: dict = Depends(current_user)) -> dict:
         raise HTTPException(status_code=403, detail="仅教师可以访问该接口")
     if user.get("must_change_password"):
         raise HTTPException(status_code=403, detail="请先修改初始密码")
+    if not config.TEACHER_PORTAL_ENABLED:
+        raise HTTPException(status_code=403, detail={'status':'disabled','message':'教师能力暂未开放'})
     return user
 
 
@@ -336,6 +406,8 @@ def current_student(user: dict = Depends(current_user)) -> dict:
 
 
 def current_ready_user(user: dict = Depends(current_user)) -> dict:
+    if user.get('role') == 'teacher':
+        return current_teacher(user)
     if user.get("must_change_password"):
         raise HTTPException(status_code=403, detail="请先修改初始密码")
     return user
@@ -344,7 +416,7 @@ def current_ready_user(user: dict = Depends(current_user)) -> dict:
 def _set_refresh_cookie(response: Response, token: str) -> None:
     response.set_cookie(
         "zhijiao_refresh", token, httponly=True, secure=os.environ.get("ZHIJIAO_COOKIE_SECURE") == "1",
-        samesite="lax", max_age=7 * 24 * 3600, path="/api/v1/auth",
+        samesite="lax", max_age=auth.login_session_days * 24 * 3600, path="/api/v1/auth",
     )
 
 
@@ -364,8 +436,7 @@ def capabilities() -> dict:
 
 @app.get("/api/v1/runtime/ai-settings")
 def runtime_ai_settings(user: dict = Depends(current_ready_user)) -> dict:
-    del user
-    return get_public_ai_settings()
+    return AccountAiService(db).public(user)
 
 
 @app.put("/api/v1/runtime/ai-settings")
@@ -373,21 +444,9 @@ def update_runtime_ai_settings(
     payload: RuntimeAiSettingsPayload,
     user: dict = Depends(current_ready_user),
 ) -> dict:
-    del user
     try:
-        current = get_ai_settings()
-        api_key = payload.api_key
-        if payload.mode == "custom" and not api_key and current.get("mode") == "custom":
-            api_key = str(current.get("api_key") or "")
-        save_user_ai_settings(
-            payload.mode,
-            provider=payload.provider,
-            base_url=payload.base_url,
-            model=payload.model,
-            api_key=api_key,
-        )
-        return get_public_ai_settings()
-    except ValueError as exc:
+        return AccountAiService(db).save(user, **payload.model_dump())
+    except (ValueError, CampusError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -468,6 +527,11 @@ def teacher_terms(user: dict = Depends(current_teacher)) -> list[dict]:
     return teachers.list_terms(user)
 
 
+@app.get("/api/v1/teacher/institution-profile")
+def teacher_institution_profile(user: dict = Depends(current_teacher)) -> dict:
+    return teachers.institution_profile(user)
+
+
 @app.post("/api/v1/teacher/terms", status_code=201)
 def teacher_term_create(payload: TermCreatePayload, user: dict = Depends(current_teacher)) -> dict:
     try:
@@ -475,6 +539,15 @@ def teacher_term_create(payload: TermCreatePayload, user: dict = Depends(current
             user, payload.term_name, payload.starts_on, payload.ends_on,
             payload.academic_year, payload.teaching_period,
         )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/terms/{term_id}")
+def teacher_term_update(term_id: str, payload: TermUpdatePayload,
+                        user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return teachers.update_term(user, term_id, payload.model_dump(exclude_unset=True))
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -494,6 +567,45 @@ def teacher_class_create(payload: ClassCreatePayload, user: dict = Depends(curre
         )
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/v1/teacher/classes/{class_id}")
+def teacher_class_update(class_id: str, payload: ClassUpdatePayload,
+                         user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return teachers.update_class(user, class_id, payload.model_dump(exclude_unset=True))
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/v1/teacher/classes/{class_id}")
+def teacher_class_delete(class_id: str, user: dict = Depends(current_teacher)) -> dict:
+    try:
+        teachers.delete_class(user, class_id)
+        return {"ok": True, "class_id": class_id}
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/v1/teacher/classes/{class_id}/weekly-schedules")
+def teacher_class_weekly_schedules(class_id: str, payload: WeeklySchedulesPayload,
+                                   user: dict = Depends(current_teacher)) -> list[dict]:
+    try:
+        return teachers.replace_weekly_schedules(
+            user, class_id, [row.model_dump() for row in payload.schedules],
+            adjustments=[row.model_dump() for row in payload.adjustments] if payload.adjustments is not None else None
+        )
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/courses/{course_id}/calendar")
+def teacher_course_calendar(course_id: str, term_id: str | None = None,
+                            user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return teachers.course_calendar(user, course_id, term_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/teacher/courses/{course_id}/teaching-archive")
@@ -785,7 +897,10 @@ def teacher_knowledge_graph_sync(
     user: dict = Depends(current_teacher),
 ) -> dict:
     try:
-        return knowledge_graphs.sync_sources(user, course_id, payload.graph_node_ids or None)
+        return knowledge_graphs.sync_sources(
+            user, course_id, payload.graph_node_ids or None,
+            payload.source_knowledge_node_ids or None,
+        )
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -883,8 +998,18 @@ def student_study_room_status(user: dict = Depends(current_student)) -> dict:
 
 
 @app.post("/api/v1/student/study-room/start")
-def student_study_room_start(user: dict = Depends(current_student)) -> dict:
-    return study_room.start(str(user["user_id"]))
+def student_study_room_start(payload: StudyStartPayload | None = None, user: dict = Depends(current_student)) -> dict:
+    from portrait_api import checked
+    return checked(study_room.start, str(user["user_id"]), **(payload.model_dump() if payload else {}))
+
+
+@app.post("/api/v1/student/study-room/telemetry")
+def student_study_room_telemetry(payload: StudyTelemetryPayload,
+                                 user: dict = Depends(current_student)) -> dict:
+    try:
+        return study_room.telemetry(str(user["user_id"]), payload.model_dump())
+    except StudyRoomUnavailable as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/student/study-room/finish")
@@ -1131,6 +1256,15 @@ def teacher_knowledge_candidate_approve(candidate_id: str, user: dict = Depends(
 def teacher_knowledge_candidate_reject(candidate_id: str, user: dict = Depends(current_teacher)) -> dict:
     try:
         return ingestion.reject_knowledge_candidate(user, candidate_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/documents/{document_id}/approve-to-library")
+@app.post("/api/v1/teacher/documents/{document_id}/knowledge-review", deprecated=True)
+def teacher_document_knowledge_review(document_id: str, user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return ingestion.approve_document_knowledge(user, document_id)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1392,6 +1526,8 @@ def document_preview_token(document_id: str, user: dict = Depends(current_ready_
 def document_source(document_id: str, token: str = Query(...)) -> FileResponse:
     try:
         user = auth.authenticate_document_token(token, document_id)
+        if user.get('role') == 'teacher':
+            current_teacher(user)
         document, source = ingestion.source_file(user, document_id)
         return FileResponse(
             source, media_type=document["mime_type"], filename=document["original_name"],
@@ -1406,6 +1542,8 @@ def document_source(document_id: str, token: str = Query(...)) -> FileResponse:
 def document_preview(document_id: str, token: str = Query(...)) -> Response:
     try:
         user = auth.authenticate_document_token(token, document_id)
+        if user.get('role') == 'teacher':
+            current_teacher(user)
         media_type, value = ingestion.preview_file(user, document_id)
         if isinstance(value, str):
             return Response(
@@ -1595,17 +1733,52 @@ def student_question_folders(course_id: str,
 def student_question_submit(course_id: str, payload: QuestionBankSubmitPayload,
                             user: dict = Depends(current_student)) -> dict:
     try:
-        return question_banks.submit(user, course_id, payload.version_id, payload.responses)
+        return question_banks.submit(user, course_id, payload.version_id, payload.responses, payload.submission_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/teacher/courses/{course_id}/knowledge-workflow")
+def teacher_knowledge_workflow(course_id: str, user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return ingestion.knowledge_workflow(user, course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/teacher/courses/{course_id}/knowledge-library/approve")
+def teacher_knowledge_library_approve(course_id: str, payload: BatchDeletePayload,
+                                      user: dict = Depends(current_teacher)) -> dict:
+    try:
+        return ingestion.approve_documents_to_library(user, course_id, payload.ids)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/teacher/courses/{course_id}/knowledge-versions/publish")
-def teacher_knowledge_publish(course_id: str, user: dict = Depends(current_teacher)) -> dict:
+def teacher_knowledge_publish(course_id: str, payload: KnowledgePublishPayload | None = None, user: dict = Depends(current_teacher)) -> dict:
     try:
-        return ingestion.publish(user, course_id)
+        return ingestion.publish(user, course_id, payload.request_id if payload else None)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get('/api/v1/teacher/courses/{course_id}/knowledge-versions')
+def teacher_knowledge_versions(course_id: str, user: dict = Depends(current_teacher)) -> list[dict]:
+    from published_knowledge import version_history
+    try:
+        return version_history(campus,user,course_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403,detail=str(exc)) from exc
+
+
+@app.post('/api/v1/teacher/courses/{course_id}/knowledge-versions/{version_id}/withdraw')
+def teacher_knowledge_version_withdraw(course_id: str, version_id: str, user: dict = Depends(current_teacher)) -> dict:
+    from published_knowledge import withdraw_version
+    try:
+        return withdraw_version(campus,user,course_id,version_id)
+    except CampusError as exc:
+        raise HTTPException(status_code=403,detail=str(exc)) from exc
 
 
 @app.post("/api/v1/agent/invoke")
@@ -1638,3 +1811,7 @@ def list_courses(user_id: str, role: str, user: dict = Depends(current_ready_use
         return campus.list_courses(user_id, role)
     except CampusError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+from portrait_api import portrait_router
+app.include_router(portrait_router(campus, study_room, current_teacher, current_student))

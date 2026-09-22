@@ -1,4 +1,5 @@
 import io
+import json
 
 import pytest
 from openpyxl import Workbook
@@ -8,10 +9,134 @@ from campus_service import CampusService, PermissionDenied
 from database import LearningDatabase
 from ingestion_service import IngestionService
 from question_bank_service import QuestionBankService
+from skills.memory.service import MemoryLearningSkill
 from teacher_service import TeacherService
 
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def test_snapshot_grading_history_and_submission_id_are_stable(question_bank):
+    db,campus,ingestion,service,teacher,_,student,_,course = question_bank
+    service.import_template(teacher,course['course_id'],'题库.xlsx',XLSX_MIME,question_workbook(),ai_mode='local')
+    for item in ingestion.list_question_bank(teacher,course['course_id']):
+        if item['answer_markdown']:
+            ingestion.review_question(teacher,item['item_id'],{'status':'approved'})
+    version = ingestion.publish_question_bank(teacher,course['course_id'])
+    paper = service.student_questions(student,course['course_id'])
+    item = next(q for q in paper['items'] if q['type']=='single_choice')
+    db.execute("UPDATE question_bank_items SET stem_markdown='尚未发布的新题干',correct_answer_json='\"B\"',answer_markdown='B' WHERE item_id=?", (item['item_id'],))
+    assert next(q for q in service.student_questions(student,course['course_id'])['items'] if q['item_id']==item['item_id'])['question']==item['question']
+    responses = [{'item_id':item['item_id'],'response':'B'}]
+    result = service.submit(student,course['course_id'],version['version_id'],responses,'repeat-safe')
+    assert result['accuracy']==0 and result['results'][0]['correct_answer']=='A'
+    assert service.submit(student,course['course_id'],version['version_id'],responses,'repeat-safe')==result
+    assert db.fetch_one('SELECT COUNT(*) n FROM question_bank_attempts')['n']==1
+    assert campus.class_analysis(course['course_id'],teacher['user_id'])['quiz_count']==1
+    assert campus.profile(course['course_id'],student['user_id'],'student')['attempts']
+    history = MemoryLearningSkill(campus).student_dashboard(student['user_id'],course['course_id'])
+    assert history['wrong_question_book'][0]['correct_answer']=='A'
+    assert history['wrong_question_book'][0]['question']==item['question']
+
+
+def publish_statistics_paper(question_bank):
+    _, _, ingestion, service, teacher, _, student, _, course = question_bank
+    service.import_template(teacher, course['course_id'], '统计测试.xlsx', XLSX_MIME,
+                            question_workbook(), ai_mode='local')
+    for item in ingestion.list_question_bank(teacher, course['course_id']):
+        if item['answer_markdown']:
+            ingestion.review_question(teacher, item['item_id'], {'status': 'approved'})
+    version = ingestion.publish_question_bank(teacher, course['course_id'])
+    paper = service.student_questions(student, course['course_id'])
+    item = next(q for q in paper['items'] if q['type'] == 'single_choice')
+    return version, item
+
+
+@pytest.mark.parametrize('class_scope', [False, True])
+def test_statistics_keep_published_labels_and_stems_after_draft_changes(question_bank, class_scope):
+    db, campus, _, service, teacher, _, student, _, course = question_bank
+    version, item = publish_statistics_paper(question_bank)
+    class_id = None
+    if class_scope:
+        class_id = 'snapshot-class'
+        db.execute("INSERT INTO terms(term_id,term_name,owner_id) VALUES('snapshot-term','学期',?)", (teacher['user_id'],))
+        db.execute("INSERT INTO classes(class_id,course_id,term_id,class_name,teacher_id) VALUES(?,?,'snapshot-term','班级',?)",
+                   (class_id, course['course_id'], teacher['user_id']))
+        db.execute("INSERT INTO class_memberships(class_id,student_id,anonymous_id) VALUES(?,?,'snapshot-student')",
+                   (class_id, student['user_id']))
+    responses = [{'item_id': item['item_id'], 'response': 'B'}]
+    service.submit(student, course['course_id'], version['version_id'], responses, 'snapshot-submit')
+    before = service.statistics(teacher, course['course_id'], class_id)
+    dashboard = MemoryLearningSkill(campus).student_dashboard(student['user_id'], course['course_id'])
+    db.execute("UPDATE question_bank_items SET knowledge_points_json=?,stem_markdown='尚未发布的新题干' WHERE item_id=?",
+               (json.dumps(['新稿标签']), item['item_id']))
+    assert service.statistics(teacher, course['course_id'], class_id) == before
+    assert {point['point'] for point in before['weak_points']} == set(item['knowledge_points'])
+    assert all(point['attempts'] == 1 and point['wrong_count'] == 1 for point in before['weak_points'])
+    assert before['ranking'][0]['stem_markdown'] == item['question']
+    assert MemoryLearningSkill(campus).student_dashboard(student['user_id'], course['course_id']) == dashboard
+    assert service.submit(student, course['course_id'], version['version_id'], responses, 'snapshot-submit')['accuracy'] == 0
+    # A later correct answer replaces this student's previous answer in the same version.
+    db.execute("UPDATE question_bank_attempts SET submitted_at='2000-01-01' WHERE student_id=?", (student['user_id'],))
+    service.submit(student, course['course_id'], version['version_id'],
+                   [{'item_id': item['item_id'], 'response': 'A'}], 'snapshot-corrected')
+    after = service.statistics(teacher, course['course_id'], class_id)
+    assert after['summary']['attempts'] == 1 and after['summary']['accuracy'] == 100
+    assert all(point['attempts'] == 1 and point['wrong_count'] == 0 for point in after['weak_points'])
+
+
+def test_legacy_learning_events_use_each_answered_publication_snapshot(question_bank):
+    from learning_events import history
+
+    db, campus, ingestion, service, teacher, _, student, _, course = question_bank
+    old_version, item = publish_statistics_paper(question_bank)
+    responses = [{'item_id': item['item_id'], 'response': 'B'}]
+    service.submit(student, course['course_id'], old_version['version_id'], responses)
+    db.execute("UPDATE question_bank_items SET knowledge_points_json=? WHERE item_id=?",
+               (json.dumps(['第二版标签']), item['item_id']))
+    new_version = ingestion.publish_question_bank(teacher, course['course_id'])
+    service.submit(student, course['course_id'], new_version['version_id'], responses)
+    db.execute("UPDATE question_bank_items SET knowledge_points_json=? WHERE item_id=?",
+               (json.dumps(['尚未发布的第三版']), item['item_id']))
+    current = service.statistics(teacher, course['course_id'])
+    assert current['version']['version_id'] == new_version['version_id']
+    assert [point['point'] for point in current['weak_points']] == ['第二版标签']
+    before = campus.class_analysis(course['course_id'], teacher['user_id'])
+    # Simulate pre-ledger history without changing the saved attempts or publications.
+    db.execute('DELETE FROM learning_events WHERE course_id=?', (course['course_id'],))
+    legacy = history(db, course['course_id'], student['user_id'])
+    assert len(legacy) == 2
+    points = [json.loads(row['records_json'])[0]['knowledge_points'] for row in legacy]
+    assert item['knowledge_points'] in points and ['第二版标签'] in points
+    after = campus.class_analysis(course['course_id'], teacher['user_id'])
+    assert before['weak_points'] == after['weak_points']
+    assert after['quiz_count'] == 2
+
+
+def test_missing_historical_snapshot_does_not_borrow_current_draft_labels(question_bank):
+    from learning_events import history
+
+    db, campus, _, service, teacher, _, student, _, course = question_bank
+    version, item = publish_statistics_paper(question_bank)
+    service.submit(student, course['course_id'], version['version_id'],
+                   [{'item_id': item['item_id'], 'response': 'B'}])
+    db.execute('UPDATE question_bank_version_items SET snapshot_json=NULL WHERE version_id=?', (version['version_id'],))
+    db.execute('UPDATE question_bank_items SET knowledge_points_json=?,stem_markdown=? WHERE item_id=?',
+               (json.dumps(['当前草稿标签']), '当前草稿题目', item['item_id']))
+    stats = service.statistics(teacher, course['course_id'])
+    assert stats['summary']['attempts'] == 1 and stats['weak_points'] == []
+    assert stats['ranking'][0]['knowledge_points'] == []
+    assert '缺少发布快照' in stats['ranking'][0]['stem_markdown']
+    # Existing submission snapshots still contribute to the unified course analysis.
+    assert campus.class_analysis(course['course_id'], teacher['user_id'])['weak_points']
+    db.execute('DELETE FROM learning_events WHERE course_id=?', (course['course_id'],))
+    legacy = history(db, course['course_id'], student['user_id'])
+    assert json.loads(legacy[0]['records_json'])[0]['knowledge_points'] == []
+    assert campus.class_analysis(course['course_id'], teacher['user_id'])['weak_points'] == []
+    dashboard = MemoryLearningSkill(campus).student_dashboard(student['user_id'], course['course_id'])
+    assert len(dashboard['published_attempts']) == 1
+    assert dashboard['weak_points'] == []
+    assert '当前草稿' not in json.dumps(dashboard, ensure_ascii=False)
 
 
 def question_workbook() -> bytes:
@@ -106,7 +231,10 @@ def test_template_import_review_publish_answer_and_statistics(question_bank):
     assert statistics["summary"]["students"] == 2
     assert statistics["summary"]["attempts"] == 4
     assert statistics["ranking"][0]["error_rate"] == 100.0
-    assert all(student["wrong_questions"] for student in statistics["students"])
+    assert statistics["students"] == []
+    assert statistics["data_scope"] == "course_aggregate"
+    assert student_one["user_id"] not in str(statistics)
+    assert student_two["user_id"] not in str(statistics)
     assert db.fetch_one("SELECT COUNT(*) count FROM question_bank_attempts")["count"] == 4
 
 
@@ -145,6 +273,48 @@ def test_folder_import_move_publish_and_student_listing(question_bank):
     )
     assert published["version_id"] == version["version_id"]
     assert published["folder_id"] == folder["folder_id"]
+
+
+def test_published_submission_is_visible_in_student_history_and_teacher_analysis(question_bank):
+    _, campus, ingestion, service, teacher, _, student_one, _, course = question_bank
+    folder = service.create_folder(teacher, course["course_id"], "阶段测验", "exam")
+    service.import_template(
+        teacher, course["course_id"], "阶段测验.xlsx", XLSX_MIME, question_workbook(),
+        ai_mode="local", folder_id=folder["folder_id"],
+    )
+    for item in ingestion.list_question_bank(teacher, course["course_id"]):
+        if item["answer_markdown"]:
+            ingestion.review_question(teacher, item["item_id"], {"status": "approved"})
+    version = ingestion.publish_question_bank(
+        teacher, course["course_id"], folder_id=folder["folder_id"]
+    )
+    student = {"user_id": student_one["user_id"], "role": "student"}
+    paper = service.student_questions(
+        student, course["course_id"], folder_id=folder["folder_id"]
+    )
+    grade = service.submit(student, course["course_id"], version["version_id"], [
+        {"item_id": paper["items"][0]["item_id"], "response": "对"},
+        {"item_id": paper["items"][1]["item_id"], "response": "A"},
+    ])
+
+    dashboard = MemoryLearningSkill(campus).student_dashboard(
+        student_one["user_id"], course["course_id"]
+    )
+    assert grade["accuracy"] == 50.0
+    assert len(dashboard["published_attempts"]) == 1
+    assert dashboard["published_attempts"][0]["score"] == 50.0
+    assert dashboard["published_attempts"][0]["title"] == "阶段测验"
+    assert dashboard["wrong_question_book"][0]["source"] == "published"
+    assert any(point["point"] == "关系模型" for point in dashboard["weak_points"])
+
+    statistics = service.statistics(teacher, course["course_id"])
+    assert statistics["version"]["version_id"] == version["version_id"]
+    assert statistics["summary"]["answered"] == 1
+    assert statistics["students"] == []
+    assert statistics["summary"]["accuracy"] == 50.0
+    assert student_one["user_id"] not in str(statistics)
+    assert any(point["point"] == "关系模型" and point["wrong_count"] == 1
+               for point in statistics["weak_points"])
 
 
 def test_judgment_keeps_excel_yn_options(question_bank):

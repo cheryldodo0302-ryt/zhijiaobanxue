@@ -824,8 +824,8 @@ class QuestionBankService:
             )
         return self.db.fetch_one(
             """SELECT * FROM question_bank_versions
-               WHERE course_id=? AND folder_id IS NULL AND status='published'
-               ORDER BY version_number DESC LIMIT 1""",
+               WHERE course_id=? AND status='published'
+               ORDER BY published_at DESC,version_number DESC LIMIT 1""",
             (course_id,),
         )
 
@@ -858,19 +858,10 @@ class QuestionBankService:
             return {"version_id": None, "version_number": None, "total": 0, "items": []}
         limit = max(1, min(int(limit), 100))
         offset = max(0, int(offset))
-        total = self.db.fetch_one(
-            "SELECT COUNT(*) count FROM question_bank_version_items WHERE version_id=?",
-            (version["version_id"],),
-        )
-        rows = self.db.fetch_all(
-            """SELECT q.item_id,q.question_type,q.stem_markdown,q.options_json,
-                      q.knowledge_points_json,q.difficulty,q.duration_seconds
-               FROM question_bank_version_items vi
-               JOIN question_bank_items q USING(item_id)
-               WHERE vi.version_id=?
-               ORDER BY q.import_row_number,q.created_at LIMIT ? OFFSET ?""",
-            (version["version_id"], limit, offset),
-        )
+        from published_knowledge import question_items
+        available = question_items(self.db,version['version_id'],course_id,actor['user_id'])
+        total = {'count':len(available)}
+        rows = available[offset:offset+limit]
         items = []
         for row in rows:
             items.append({
@@ -907,64 +898,51 @@ class QuestionBankService:
         return bool(normalize(response)) and normalize(response) == normalize(answer)
 
     def submit(self, actor: dict[str, Any], course_id: str, version_id: str,
-               responses: list[dict[str, Any]]) -> dict[str, Any]:
+               responses: list[dict[str, Any]], request_id: str | None = None) -> dict[str, Any]:
         if actor.get("role") != "student":
             raise PermissionDenied("仅学生可以提交题库答案")
-        self.campus.require_access(course_id, str(actor["user_id"]), "student")
-        current = self.db.fetch_one(
-            """SELECT * FROM question_bank_versions
-               WHERE version_id=? AND course_id=? AND status='published'""",
-            (version_id, course_id),
-        )
-        if not current:
-            raise ValidationError("题库已更新，请刷新后重新作答")
-        if not responses or len(responses) > 100:
+        user_id = str(actor['user_id'])
+        self.campus.require_access(course_id,user_id,"student")
+        if not responses or len(responses)>100:
             raise ValidationError("每次需提交 1 至 100 道题")
-        item_ids = list(dict.fromkeys(_text(item.get("item_id")) for item in responses))
-        if any(not value for value in item_ids) or len(item_ids) != len(responses):
-            raise ValidationError("提交中包含空题号或重复题目")
-        placeholders = ",".join("?" for _ in item_ids)
-        rows = self.db.fetch_all(
-            f"""SELECT q.* FROM question_bank_version_items vi
-                JOIN question_bank_items q USING(item_id)
-                WHERE vi.version_id=? AND q.item_id IN ({placeholders})""",
-            (version_id, *item_ids),
-        )
-        by_id = {row["item_id"]: row for row in rows}
-        if len(by_id) != len(item_ids):
-            raise ValidationError("提交中包含不属于当前发布版本的题目")
-
-        submission_id = f"qsub_{uuid.uuid4().hex}"
-        results = []
+        request_id = request_id or "qsub_" + uuid.uuid4().hex
+        if not isinstance(request_id,str) or not 1 <= len(request_id) <= 100:
+            raise ValidationError("提交标识无效")
+        supplied = {"version_id":version_id,"responses":responses}
+        from published_knowledge import question_items
         with self.db.connect() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            old = conn.execute("SELECT * FROM submission_receipts WHERE user_id=? AND kind='published' AND request_id=?", (user_id,request_id)).fetchone()
+            if old:
+                if old['course_id'] != course_id or _loads(old['input_json'],{}) != supplied:
+                    raise ValidationError("提交标识已使用，请开始新一轮练习")
+                return _loads(old['result_json'],{})
+            current = conn.execute("SELECT 1 FROM question_bank_versions WHERE version_id=? AND course_id=? AND status='published'", (version_id,course_id)).fetchone()
+            if not current:
+                raise ValidationError("题库已更新，请刷新后重新作答")
+            rows = question_items(self.db,version_id,course_id,user_id)
+            by_id = {r['item_id']:r for r in rows}
+            ids = [_text(r.get('item_id')) for r in responses]
+            if len(set(ids))!=len(ids) or any(i not in by_id for i in ids):
+                raise ValidationError("题目未发布或未授权给当前教学班")
+            submission_id = "qsub_" + uuid.uuid4().hex
+            results, records = [], []
             for submitted in responses:
-                item = by_id[_text(submitted["item_id"])]
-                response = submitted.get("response", "")
-                answer = _loads(item["correct_answer_json"], item["answer_markdown"])
-                correct = self._is_correct(item["question_type"], response, answer)
-                conn.execute(
-                    """INSERT INTO question_bank_attempts(
-                           attempt_id,submission_id,course_id,version_id,item_id,student_id,
-                           response_json,is_correct
-                       ) VALUES(?,?,?,?,?,?,?,?)""",
-                    (f"qat_{uuid.uuid4().hex}", submission_id, course_id, version_id,
-                     item["item_id"], actor["user_id"], _json(response), int(correct)),
-                )
-                results.append({
-                    "item_id": item["item_id"],
-                    "correct": correct,
-                    "response": response,
-                    "correct_answer": answer,
-                    "explanation": item["explanation_markdown"],
-                })
-        correct_count = sum(bool(item["correct"]) for item in results)
-        return {
-            "submission_id": submission_id,
-            "correct": correct_count,
-            "total": len(results),
-            "accuracy": round(correct_count * 100 / len(results), 1),
-            "results": results,
-        }
+                item = by_id[submitted['item_id']]
+                response = submitted.get('response','')
+                answer = _loads(item['correct_answer_json'],item['answer_markdown'])
+                correct = self._is_correct(item['question_type'],response,answer)
+                conn.execute("""INSERT INTO question_bank_attempts(attempt_id,submission_id,course_id,version_id,item_id,student_id,response_json,is_correct)
+                    VALUES(?,?,?,?,?,?,?,?)""", ("qat_"+uuid.uuid4().hex,submission_id,course_id,version_id,item['item_id'],user_id,_json(response),int(correct)))
+                results.append({'item_id':item['item_id'],'correct':correct,'response':response,'correct_answer':answer,'explanation':item['explanation_markdown']})
+                records.append({'knowledge_points':_loads(item['knowledge_points_json'],[]),'question':item['stem_markdown'],'correct':correct,'response':response})
+            correct_count = sum(r['correct'] for r in results)
+            score = round(100*correct_count/len(results),1)
+            result = {'submission_id':submission_id,'correct':correct_count,'total':len(results),'accuracy':score,'results':results}
+            from learning_events import record
+            record(conn,'published',submission_id,course_id,user_id,score,len(results),records)
+            conn.execute("INSERT INTO submission_receipts VALUES(?,?,?,?,?,?)", (user_id,'published',request_id,course_id,_json(supplied),_json(result)))
+            return result
 
     def statistics(self, actor: dict[str, Any], course_id: str,
                    class_id: str | None = None,
@@ -980,40 +958,49 @@ class QuestionBankService:
             )
             if not class_info:
                 raise PermissionDenied("无权查看该教学班题库统计")
-            member_condition = "AND a.student_id IN (SELECT student_id FROM class_memberships WHERE class_id=? AND status='active')"
+            member_condition = """AND EXISTS(SELECT 1 FROM learning_events e,json_each(e.class_ids_json) scope
+                WHERE e.event_id='published:'||a.submission_id AND e.legacy=0 AND scope.value=?)"""
             params.append(class_id)
 
         version = self.latest_published(course_id, folder_id)
         if not version:
             return {
-                "version": None, "summary": {"students": 0, "answered": 0, "accuracy": 0},
-                "ranking": [], "students": [],
+                "version": None, "summary": {"students": 0, "answered": 0, "attempts": 0, "accuracy": 0},
+                "ranking": [], "students": [], "weak_points": [],
             }
+        latest_params = [*params, version["version_id"], version["version_id"]]
         latest_cte = f"""
             WITH ranked AS (
                 SELECT a.*,ROW_NUMBER() OVER (
                     PARTITION BY a.student_id,a.item_id ORDER BY a.submitted_at DESC,a.attempt_id DESC
                 ) position
                 FROM question_bank_attempts a
-                WHERE a.course_id=? {member_condition}
-            ), latest AS (SELECT * FROM ranked WHERE position=1)
+                WHERE a.course_id=? {member_condition} AND a.version_id=?
+            ), latest AS (SELECT * FROM ranked WHERE position=1),
+            published_items AS (
+                SELECT item_id,
+                       COALESCE(json_extract(snapshot_json,'$.stem_markdown'),'历史题目（缺少发布快照）') stem_markdown,
+                       COALESCE(json_extract(snapshot_json,'$.question_type'),'other') question_type,
+                       COALESCE(json_extract(snapshot_json,'$.knowledge_points_json'),'[]') knowledge_points_json,
+                       COALESCE(json_extract(snapshot_json,'$.import_row_number'),0) import_row_number
+                FROM question_bank_version_items WHERE version_id=?
+            )
         """
         ranking_rows = self.db.fetch_all(
             latest_cte + """
             SELECT q.item_id,q.stem_markdown,q.question_type,
+                   q.knowledge_points_json,
                    COUNT(l.attempt_id) attempts,
                    COALESCE(SUM(l.is_correct),0) correct_count,
                    COALESCE(SUM(CASE WHEN l.is_correct=0 THEN 1 ELSE 0 END),0) wrong_count
-            FROM question_bank_version_items vi
-            JOIN question_bank_items q USING(item_id)
+            FROM published_items q
             LEFT JOIN latest l ON l.item_id=q.item_id
-            WHERE vi.version_id=?
             GROUP BY q.item_id,q.stem_markdown,q.question_type
             ORDER BY CASE WHEN COUNT(l.attempt_id)=0 THEN -1
                           ELSE 1.0*SUM(CASE WHEN l.is_correct=0 THEN 1 ELSE 0 END)/COUNT(l.attempt_id)
                      END DESC,COUNT(l.attempt_id) DESC,q.import_row_number
             """,
-            (*params, version["version_id"]),
+            tuple(latest_params),
         )
         ranking = []
         for index, row in enumerate(ranking_rows, 1):
@@ -1021,6 +1008,7 @@ class QuestionBankService:
             wrong = int(row["wrong_count"])
             ranking.append({
                 **row,
+                "knowledge_points": _loads(row["knowledge_points_json"], []),
                 "rank": index if attempts else None,
                 "error_rate": round(wrong * 100 / attempts, 1) if attempts else 0,
                 "accuracy": round(int(row["correct_count"]) * 100 / attempts, 1) if attempts else 0,
@@ -1035,55 +1023,68 @@ class QuestionBankService:
             )
         else:
             members = self.db.fetch_all(
-                """SELECT DISTINCT e.student_id,u.student_number,u.display_name,u.username
-                   FROM course_enrollments e LEFT JOIN users u ON u.user_id=e.student_id
-                   WHERE e.course_id=? ORDER BY u.student_number,u.display_name""",
-                (course_id,),
+                """SELECT DISTINCT enrolled.student_id,u.student_number,u.display_name,u.username
+                   FROM (
+                       SELECT e.student_id FROM course_enrollments e WHERE e.course_id=?
+                       UNION
+                       SELECT m.student_id
+                       FROM class_memberships m
+                       JOIN classes cl ON cl.class_id=m.class_id
+                       WHERE cl.course_id=? AND cl.teacher_id=? AND m.status='active'
+                   ) enrolled
+                   LEFT JOIN users u ON u.user_id=enrolled.student_id
+                   ORDER BY u.student_number,u.display_name""",
+                (course_id, course_id, actor["user_id"]),
             )
         latest_rows = self.db.fetch_all(
             latest_cte + """
-            SELECT l.student_id,l.item_id,l.is_correct,l.response_json,l.submitted_at,
-                   q.stem_markdown,q.answer_markdown
-            FROM latest l JOIN question_bank_items q USING(item_id)
-            JOIN question_bank_version_items vi ON vi.item_id=q.item_id
-            WHERE vi.version_id=?
+            SELECT l.student_id,l.item_id,l.is_correct,l.submitted_at,q.knowledge_points_json
+            FROM latest l JOIN published_items q USING(item_id)
             """,
-            (*params, version["version_id"]),
+            tuple(latest_params),
         )
         by_student: dict[str, list[dict[str, Any]]] = {}
+        weak_points: dict[str, dict[str, int]] = {}
         for row in latest_rows:
             by_student.setdefault(row["student_id"], []).append(row)
-        students = []
-        for member in members:
-            attempts = by_student.get(member["student_id"], [])
-            wrong = [{
-                "item_id": row["item_id"],
-                "question": row["stem_markdown"],
-                "response": _loads(row["response_json"], ""),
-                "correct_answer": row["answer_markdown"],
-                "submitted_at": row["submitted_at"],
-            } for row in attempts if not row["is_correct"]]
-            correct = sum(bool(row["is_correct"]) for row in attempts)
-            students.append({
-                **member,
-                "answered": len(attempts),
-                "correct": correct,
-                "wrong_count": len(wrong),
-                "accuracy": round(correct * 100 / len(attempts), 1) if attempts else 0,
-                "wrong_questions": wrong,
-            })
-        answered_students = sum(item["answered"] > 0 for item in students)
-        total_attempts = sum(item["answered"] for item in students)
-        total_correct = sum(item["correct"] for item in students)
+            points = _loads(row["knowledge_points_json"], [])
+            if isinstance(points, str):
+                points = [points]
+            for point in points if isinstance(points, list) else []:
+                point = _text(point)
+                if not point:
+                    continue
+                stats = weak_points.setdefault(point, {"attempts": 0, "wrong_count": 0})
+                stats["attempts"] += 1
+                stats["wrong_count"] += int(not row["is_correct"])
+        # Teacher learning analysis is aggregate-only. The roster belongs to
+        # membership management; identifiable answers belong to the student.
+        member_attempts = [by_student.get(member["student_id"], []) for member in members]
+        answered_students = sum(bool(attempts) for attempts in member_attempts)
+        total_attempts = sum(len(attempts) for attempts in member_attempts)
+        total_correct = sum(bool(row["is_correct"]) for attempts in member_attempts for row in attempts)
         return {
             "version": version,
             "class": class_info,
             "summary": {
-                "students": len(students),
+                "students": len(members),
                 "answered": answered_students,
                 "attempts": total_attempts,
                 "accuracy": round(total_correct * 100 / total_attempts, 1) if total_attempts else 0,
             },
             "ranking": ranking,
-            "students": students,
+            "students": [],
+            "data_scope": "class_aggregate" if class_id else "course_aggregate",
+            "weak_points": [
+                {
+                    "point": point,
+                    **stats,
+                    "error_rate": round(stats["wrong_count"] * 100 / stats["attempts"], 1)
+                    if stats["attempts"] else 0,
+                }
+                for point, stats in sorted(
+                    weak_points.items(),
+                    key=lambda entry: (-entry[1]["wrong_count"], -entry[1]["attempts"], entry[0]),
+                )
+            ],
         }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import sys
 import socket
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -56,18 +57,25 @@ def main() -> None:
     )
     print("Knowledge ingestion worker started. Press Ctrl+C to stop.")
     while True:
-        row = db.fetch_one("SELECT job_id FROM ingestion_jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
-        if row:
-            service.process_job(row["job_id"])
-            continue
-        semantic = db.fetch_one(
-            """SELECT analysis_job_id FROM semantic_analysis_jobs
-               WHERE status='queued'
-                  OR (status='retry_wait' AND COALESCE(next_retry_at,updated_at)<=CURRENT_TIMESTAMP)
-               ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,created_at LIMIT 1"""
-        )
-        if semantic:
-            service.process_semantic_analysis(semantic["analysis_job_id"])
+        try:
+            row = db.fetch_one("SELECT job_id FROM ingestion_jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
+            if row:
+                service.process_job(row["job_id"])
+                continue
+            semantic = db.fetch_one(
+                """SELECT analysis_job_id FROM semantic_analysis_jobs
+                   WHERE status='queued'
+                      OR (status='retry_wait' AND COALESCE(next_retry_at,updated_at)<=CURRENT_TIMESTAMP)
+                   ORDER BY CASE status WHEN 'queued' THEN 0 ELSE 1 END,created_at LIMIT 1"""
+            )
+            if semantic:
+                service.process_semantic_analysis(semantic["analysis_job_id"])
+                continue
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            print("Database is temporarily busy; worker will retry in 2 seconds.", flush=True)
+            time.sleep(2)
             continue
         time.sleep(2)
 

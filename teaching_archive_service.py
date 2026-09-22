@@ -4,6 +4,7 @@ import hashlib
 import html
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -184,6 +185,42 @@ class TeachingArchiveService:
             return "experiment_material", "attachment"
         return "other", "teaching_archive"
 
+    @classmethod
+    def _looks_like_teaching_schedule(cls, source: Path) -> bool:
+        """Recognize schedule spreadsheets from their headers, not only their filename."""
+        suffix = source.suffix.lower()
+        try:
+            if suffix == ".xlsx":
+                workbook = load_workbook(source, read_only=True, data_only=True)
+                try:
+                    for sheet in workbook.worksheets:
+                        for row_index, row in enumerate(sheet.iter_rows(values_only=True)):
+                            headers = {cls._schedule_header(value) for value in row}
+                            if {"周次", "课程名称"}.issubset(headers):
+                                return True
+                            if row_index >= 79:
+                                break
+                finally:
+                    workbook.close()
+            elif suffix == ".xls":
+                import xlrd
+
+                workbook = xlrd.open_workbook(str(source), on_demand=True)
+                try:
+                    for sheet in workbook.sheets():
+                        for row_index in range(min(sheet.nrows, 80)):
+                            headers = {cls._schedule_header(sheet.cell_value(row_index, column))
+                                       for column in range(sheet.ncols)}
+                            if {"周次", "课程名称"}.issubset(headers):
+                                return True
+                finally:
+                    workbook.release_resources()
+        except Exception:
+            # Classification must remain best-effort; the commit parser reports
+            # a precise spreadsheet error if the file cannot actually be read.
+            return False
+        return False
+
     @staticmethod
     def _infer_scope(relative_path: str, sample_text: str = "") -> dict[str, str]:
         text = f"{relative_path} {sample_text[:5000]}"
@@ -257,6 +294,8 @@ class TeachingArchiveService:
         if suffix == "" and not is_database_backup and status == "staged":
             status, risks, error = "blocked", ["unknown_binary_type"], "无扩展名文件无法确认安全类型"
         record_type, routing_target = self._infer_document_type(safe_relative, suffix)
+        if status == "staged" and suffix in {".xls", ".xlsx"} and self._looks_like_teaching_schedule(stored):
+            record_type, routing_target = "teaching_schedule", "teaching_archive"
         if is_database_backup:
             record_type, routing_target = "experiment_material", "attachment"
         if suffix in ARCHIVE_EXTENSIONS:
@@ -442,13 +481,69 @@ class TeachingArchiveService:
     def _legacy_target_extension(suffix: str) -> str:
         return {".doc": ".docx", ".xls": ".xlsx", ".ppt": ".pptx"}[suffix]
 
+    @staticmethod
+    def _convert_doc_with_word(source: Path, output: Path) -> tuple[Path | None, str]:
+        """Use installed Microsoft Word as a Windows-only legacy DOC fallback."""
+        if os.name != "nt":
+            return None, "当前系统未提供 Microsoft Word 转换能力"
+        try:
+            import pythoncom
+            import win32com.client
+        except ImportError:
+            return None, "当前环境未安装 Microsoft Word 转换组件"
+
+        word = document = None
+        initialized = False
+        try:
+            pythoncom.CoInitialize()
+            initialized = True
+            word = win32com.client.DispatchEx("Word.Application")
+            word.Visible = False
+            word.DisplayAlerts = 0
+            # 3 = msoAutomationSecurityForceDisable; legacy files are untrusted input.
+            try:
+                word.AutomationSecurity = 3
+            except Exception:
+                pass
+            document = word.Documents.Open(
+                str(source.resolve()), ReadOnly=True, AddToRecentFiles=False,
+            )
+            output.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                document.SaveAs2(str(output), FileFormat=16)  # wdFormatDocumentDefault (.docx)
+            except AttributeError:
+                document.SaveAs(str(output), FileFormat=16)
+            if not output.is_file():
+                return None, "Microsoft Word 未生成 DOCX 预览文件"
+            return output.resolve(), ""
+        except Exception as exc:
+            return None, _clean(f"Microsoft Word 转换失败：{exc}", 500)
+        finally:
+            if document is not None:
+                try:
+                    document.Close(False)
+                except Exception:
+                    pass
+            if word is not None:
+                try:
+                    word.Quit()
+                except Exception:
+                    pass
+            if initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
     def _convert_legacy(self, source: Path) -> tuple[Path | None, str]:
         converter = shutil.which("soffice") or shutil.which("libreoffice")
-        if not converter:
-            return None, "服务器 Office 转换 Worker 不可用"
         target_ext = self._legacy_target_extension(source.suffix.lower())
         output_dir = source.parent / f"{source.stem}_converted"
         output_dir.mkdir(parents=True, exist_ok=True)
+        if not converter:
+            if source.suffix.lower() == ".doc":
+                return self._convert_doc_with_word(source, output_dir / f"{source.stem}{target_ext}")
+            return None, "服务器 Office 转换 Worker 不可用"
         result = subprocess.run(
             [converter, "--headless", "--convert-to", target_ext.lstrip("."),
              "--outdir", str(output_dir), str(source)],
@@ -592,31 +687,166 @@ class TeachingArchiveService:
             return value.isoformat()
         return _clean(value, 2000)
 
+    @staticmethod
+    def _schedule_header(value: Any) -> str:
+        return re.sub(r"(?:<br\s*/?>|[\s\r\n\t]+)", "", str(value or "")).strip()
+
+    @classmethod
+    def _schedule_value(cls, data: dict[str, Any], *names: str) -> str:
+        normalized = {cls._schedule_header(key): _clean(value, 2000)
+                      for key, value in data.items() if value is not None}
+        for name in names:
+            value = normalized.get(cls._schedule_header(name), "")
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _schedule_date(value: Any) -> str:
+        text = str(value or "").strip()
+        match = re.search(r"(20\d{2})\s*[年/.-]\s*(\d{1,2})\s*[月/.-]\s*(\d{1,2})", text)
+        if not match:
+            return ""
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+        except ValueError:
+            return ""
+
+    @staticmethod
+    def _schedule_weekday(value: Any) -> int:
+        text = str(value or "").strip().replace("星期", "").replace("周", "")
+        return {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+                "日": 7, "天": 7, "1": 1, "2": 2, "3": 3, "4": 4,
+                "5": 5, "6": 6, "7": 7}.get(text, 0)
+
+    @staticmethod
+    def _schedule_period_range(value: Any) -> tuple[int, int, str]:
+        text = str(value or "").strip()
+        match = re.search(r"(\d+)\s*(?:[-－—–~～至到]\s*(\d+))?", text)
+        if not match:
+            return 0, 0, text
+        start = int(match.group(1))
+        end = int(match.group(2) or start)
+        if end < start:
+            start, end = end, start
+        return start, end, f"{start}-{end}"
+
+    @staticmethod
+    def _schedule_time_span(value: Any) -> tuple[str, str]:
+        match = re.search(
+            r"(?<!\d)(\d{1,2}):(\d{2})\s*[-－—–~～至到]\s*(\d{1,2}):(\d{2})(?!\d)",
+            str(value or ""),
+        )
+        if not match:
+            return "", ""
+        return f"{int(match.group(1)):02d}:{match.group(2)}", f"{int(match.group(3)):02d}:{match.group(4)}"
+
+    @classmethod
+    def _schedule_time_rules(cls, rows: list[list[str]]) -> list[dict[str, Any]]:
+        rules: list[dict[str, Any]] = []
+        pattern = re.compile(
+            r"(?P<start_period>\d+)\s*[-－—–~～至到]\s*(?P<end_period>\d+)\s*节?"
+            r"[^0-9]{0,30}(?P<start>\d{1,2}:\d{2})\s*[-－—–~～至到]\s*"
+            r"(?P<end>\d{1,2}:\d{2})",
+        )
+        for row in rows:
+            text = " ".join(str(value or "") for value in row)
+            for match in pattern.finditer(text):
+                start_time, end_time = cls._schedule_time_span(
+                    f"{match.group('start')}-{match.group('end')}"
+                )
+                if start_time and end_time:
+                    rules.append({
+                        "start_period": int(match.group("start_period")),
+                        "end_period": int(match.group("end_period")),
+                        "start_time": start_time, "end_time": end_time,
+                    })
+        return rules
+
+    @classmethod
+    def _schedule_time_for_row(
+        cls, period_value: Any, data: dict[str, Any], rules: list[dict[str, Any]]
+    ) -> tuple[str, str]:
+        for key, value in data.items():
+            if "时间" in cls._schedule_header(key).lower() or "time" in str(key).lower():
+                start_time, end_time = cls._schedule_time_span(value)
+                if start_time and end_time:
+                    return start_time, end_time
+        start_period, end_period, _period_label = cls._schedule_period_range(period_value)
+        for rule in rules:
+            if start_period >= rule["start_period"] and end_period <= rule["end_period"]:
+                return rule["start_time"], rule["end_time"]
+        return "", ""
+
+    def _schedule_items_from_rows(
+        self, sheet_name: str, rows: list[list[str]], header_index: int
+    ) -> list[dict[str, Any]]:
+        header = [self._schedule_header(value) for value in rows[header_index]]
+        time_rules = self._schedule_time_rules(rows[header_index + 1:])
+        items: list[dict[str, Any]] = []
+        order = 0
+        for row_number, row in enumerate(rows[header_index + 1:], header_index + 2):
+            data = {
+                header[index] or f"column_{index + 1}": row[index]
+                for index in range(min(len(header), len(row)))
+                if row[index] is not None and str(row[index]).strip()
+            }
+            week_value = self._schedule_value(data, "周次")
+            week_match = re.search(r"\d+", week_value)
+            if not week_match:
+                continue
+            week = int(week_match.group())
+            date_value = self._schedule_date(self._schedule_value(data, "日期"))
+            weekday = self._schedule_weekday(self._schedule_value(data, "星期"))
+            if not weekday and date_value:
+                weekday = date.fromisoformat(date_value).isoweekday()
+            period_value = self._schedule_value(data, "节次")
+            start_period, end_period, period_label = self._schedule_period_range(period_value)
+            start_time, end_time = self._schedule_time_for_row(period_value, data, time_rules)
+            course_name = self._schedule_value(data, "课程名称")
+            class_name = self._schedule_value(data, "授课班级", "教学班")
+            content = self._schedule_value(data, "理论/实验授课内容", "授课内容")
+            location = self._schedule_value(data, "理论/实验授课地点", "授课地点", "上课地点")
+            teacher = self._schedule_value(data, "授课（实验带教）教师", "授课教师", "教师")
+            teaching_nature = self._schedule_value(data, "授课性质")
+            calendar = {
+                "date": date_value, "week": week, "weekday": weekday,
+                "period_start": start_period, "period_end": end_period,
+                "period_label": period_label or period_value,
+                "start_time": start_time, "end_time": end_time,
+                "course_name": course_name, "class_name": class_name,
+                "teaching_content": content, "location": location,
+                "teacher": teacher, "teaching_nature": teaching_nature,
+                "credits": self._schedule_value(data, "学分"),
+                "total_hours": self._schedule_value(data, "总学时数（理论/实验）", "总学时数"),
+                "lesson_hours": self._schedule_value(data, "理论/实验学时", "学时"),
+            }
+            order += 1
+            items.append({
+                "record_type": "teaching_schedule_entry",
+                "title": content or course_name or f"第{week}周",
+                "markdown": " · ".join(f"{key}：{value}" for key, value in data.items()),
+                "payload": {"sheet": sheet_name, "row": row_number, **data, "_calendar": calendar},
+                "source": {"sheet": sheet_name, "row": row_number}, "sort": order,
+            })
+        return items
+
     def _parse_schedule(self, source: Path) -> list[dict[str, Any]]:
         if source.suffix.lower() == ".xls":
             return self._parse_legacy_schedule(source)
         workbook = load_workbook(source, read_only=True, data_only=True)
         items: list[dict[str, Any]] = []
-        order = 0
         for sheet in workbook.worksheets:
             rows = [[self._cell_value(value) for value in row] for row in sheet.iter_rows(values_only=True)]
             header_index = next((index for index, row in enumerate(rows)
-                                 if "周次" in row and "课程名称" in row), None)
+                                 if self._schedule_header("周次") in {
+                                     self._schedule_header(value) for value in row
+                                 } and self._schedule_header("课程名称") in {
+                                     self._schedule_header(value) for value in row
+                                 }), None)
             if header_index is None:
                 continue
-            header = rows[header_index]
-            normalized = [value.replace("\n", "") for value in header]
-            for row_number, row in enumerate(rows[header_index + 1:], header_index + 2):
-                if not row or not row[0] or not re.match(r"^\d+$", row[0]):
-                    continue
-                data = {normalized[index] or f"column_{index + 1}": row[index]
-                        for index in range(min(len(normalized), len(row))) if row[index]}
-                order += 1
-                title = data.get("理论/实验授课内容") or data.get("授课内容") or f"第{row[0]}周"
-                items.append({"record_type": "teaching_schedule_entry", "title": title,
-                              "markdown": " · ".join(f"{key}：{value}" for key, value in data.items()),
-                              "payload": {"sheet": sheet.title, "row": row_number, **data},
-                              "source": {"sheet": sheet.title, "row": row_number}, "sort": order})
+            items.extend(self._schedule_items_from_rows(sheet.title, rows, header_index))
         workbook.close()
         if not items:
             raise ValidationError("未在教学进度表中找到包含“周次”和“课程名称”的表头")
@@ -628,28 +858,26 @@ class TeachingArchiveService:
 
         workbook = xlrd.open_workbook(str(source), on_demand=True)
         items: list[dict[str, Any]] = []
-        order = 0
         for sheet in workbook.sheets():
-            rows = [[self._cell_value(sheet.cell_value(row, column))
-                     for column in range(sheet.ncols)] for row in range(sheet.nrows)]
+            rows = []
+            for row in range(sheet.nrows):
+                values = []
+                for column in range(sheet.ncols):
+                    cell = sheet.cell(row, column)
+                    value = cell.value
+                    if cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            value = xlrd.xldate_as_datetime(value, workbook.datemode)
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                    values.append(self._cell_value(value))
+                rows.append(values)
             header_index = next((index for index, row in enumerate(rows)
-                                 if "周次" in row and "课程名称" in row), None)
+                                 if self._schedule_header("周次") in row
+                                 and self._schedule_header("课程名称") in row), None)
             if header_index is None:
                 continue
-            header = [value.replace("\n", "") for value in rows[header_index]]
-            for row_number, row in enumerate(rows[header_index + 1:], header_index + 2):
-                week = row[0].removesuffix(".0") if row else ""
-                if not re.fullmatch(r"\d+", week):
-                    continue
-                data = {header[index] or f"column_{index + 1}": row[index]
-                        for index in range(min(len(header), len(row))) if row[index]}
-                data["周次"] = week
-                order += 1
-                title = data.get("理论/实验授课内容") or data.get("授课内容") or f"第{week}周"
-                items.append({"record_type": "teaching_schedule_entry", "title": title,
-                              "markdown": " · ".join(f"{key}：{value}" for key, value in data.items()),
-                              "payload": {"sheet": sheet.name, "row": row_number, **data},
-                              "source": {"sheet": sheet.name, "row": row_number}, "sort": order})
+            items.extend(self._schedule_items_from_rows(sheet.name, rows, header_index))
         workbook.release_resources()
         if not items:
             raise ValidationError("未在旧版教学进度表中找到包含“周次”和“课程名称”的表头")
@@ -800,11 +1028,14 @@ class TeachingArchiveService:
     @staticmethod
     def _preview_kind(source: Path) -> str:
         return {".pdf": "pdf", ".docx": "docx", ".pptx": "pptx", ".xlsx": "xlsx",
-                ".txt": "text", ".md": "markdown"}.get(source.suffix.lower(), "unavailable")
+                ".xls": "xls", ".txt": "text", ".md": "markdown"}.get(source.suffix.lower(), "unavailable")
 
     def _route_external(self, actor: dict[str, Any], batch: dict[str, Any], row: dict[str, Any]) -> str | None:
         suffix = Path(row["stored_path"]).suffix.lower()
         if row["routing_target"] == "knowledge_center" and self.ingestion and suffix in MODERN_EXTENSIONS - {".xlsx"}:
+            existing = self.db.fetch_one('SELECT document_id FROM course_documents WHERE course_id=? AND sha256=?', (batch['course_id'],row['sha256']))
+            if existing:
+                return str(existing['document_id'])
             with Path(row["stored_path"]).open("rb") as stream:
                 result = self.ingestion.queue_document_stream(
                     actor, batch["course_id"], row["original_name"], row["mime_type"], stream,
@@ -839,9 +1070,87 @@ class TeachingArchiveService:
                     (f"tai_{uuid.uuid4().hex}", archive_document_id, version_id,
                      item["record_type"], _clean(item.get("title"), 240) or "未命名档案项",
                      str(item.get("markdown") or ""), _json(payload), _json(item.get("source") or {}),
-                     lifecycle, _json(sorted(set(risks))), int(item.get("sort", index))),
-                )
+                      lifecycle, _json(sorted(set(risks))), int(item.get("sort", index))),
+                 )
         return published, review
+
+    def _schedule_class_ids(
+        self, actor: dict[str, Any], batch: dict[str, Any], row: dict[str, Any],
+        items: list[dict[str, Any]],
+    ) -> list[str]:
+        selected = list(dict.fromkeys(
+            str(value) for value in _loads(row.get("class_ids_json"), []) if str(value)
+        ))
+        if selected:
+            return selected
+        names = {
+            self._schedule_value(item.get("payload") or {}, "授课班级", "教学班")
+            for item in items
+        }
+        names.discard("")
+        if not names:
+            return []
+        classes = self.db.fetch_all(
+            """SELECT class_id,class_name FROM classes
+               WHERE course_id=? AND teacher_id=? AND (?='' OR term_id=?)""",
+            (batch["course_id"], actor["user_id"], batch.get("term_id") or "", batch.get("term_id") or ""),
+        )
+        normalize = lambda value: re.sub(r"\s+", "", str(value or "")).lower()
+        expected = {normalize(value) for value in names}
+        return [
+            str(item["class_id"]) for item in classes
+            if normalize(item.get("class_name")) in expected
+        ]
+
+    def _sync_schedule_calendar(
+        self, actor: dict[str, Any], batch: dict[str, Any], row: dict[str, Any],
+        archive_document_id: str, items: list[dict[str, Any]],
+    ) -> int:
+        if row["confirmed_record_type"] != "teaching_schedule" or not items:
+            return 0
+        class_ids = self._schedule_class_ids(actor, batch, row, items)
+        if not class_ids:
+            return 0
+        marker = f'%"source_archive_document_id":"{archive_document_id}"%'
+        with self.db.connect() as conn:
+            for class_id in class_ids:
+                conn.execute(
+                    "DELETE FROM class_weekly_schedules WHERE class_id=? AND details_json LIKE ?",
+                    (class_id, marker),
+                )
+            inserted = 0
+            for index, item in enumerate(items, 1):
+                payload = item.get("payload") or {}
+                details = dict(payload.get("_calendar") or {})
+                weekday = int(details.get("weekday") or 0)
+                if weekday not in range(1, 8):
+                    continue
+                week = max(1, int(details.get("week") or 1))
+                source_row = int(item.get("source", {}).get("row") or index)
+                details.update({
+                    "source_archive_document_id": archive_document_id,
+                    "source_row": source_row,
+                    "raw_fields": {
+                        str(key): _clean(value, 2000)
+                        for key, value in payload.items() if key != "_calendar"
+                    },
+                })
+                schedule_id = "cws_" + hashlib.sha256(
+                    f"{archive_document_id}|{source_row}|{week}|{details.get('period_label', '')}".encode()
+                ).hexdigest()[:16]
+                start_time = str(details.get("start_time") or "")
+                end_time = str(details.get("end_time") or "")
+                location = str(details.get("location") or "")[:120]
+                for class_id in class_ids:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO class_weekly_schedules(
+                               schedule_id,class_id,weekday,start_time,end_time,location,starts_week,ends_week,details_json
+                           ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (f"{schedule_id}_{class_id[-8:]}", class_id, weekday, start_time, end_time,
+                         location, week, week, _json(details)),
+                    )
+                    inserted += 1
+        return inserted
 
     def commit_import_batch(self, actor: dict[str, Any], batch_id: str) -> dict[str, Any]:
         batch = self._require_batch(actor, batch_id)
@@ -854,7 +1163,7 @@ class TeachingArchiveService:
         files = self.db.fetch_all(
             "SELECT * FROM teaching_archive_import_files WHERE batch_id=? ORDER BY created_at,file_id", (batch_id,),
         )
-        published_count = review_count = error_count = 0
+        published_count = review_count = error_count = calendar_sync_count = 0
         for row in files:
             if row["status"] in {"ignored", "blocked"}:
                 error_count += row["status"] == "blocked"
@@ -910,10 +1219,14 @@ class TeachingArchiveService:
                 if source.suffix.lower() in LEGACY_EXTENSIONS:
                     converted, error = self._convert_legacy(source)
                     if not converted:
-                        document_risks.append("legacy_conversion_unavailable")
-                        conversion_status = "unavailable"
-                        if source.suffix.lower() == ".xls" and row["confirmed_record_type"] == "teaching_schedule":
+                        if source.suffix.lower() == ".xls":
+                            # XLS is parsed and previewed natively with xlrd;
+                            # LibreOffice remains optional for legacy conversion.
+                            conversion_status = "ready"
                             parse_source = source
+                        else:
+                            document_risks.append("legacy_conversion_unavailable")
+                            conversion_status = "unavailable"
                     else:
                         parse_source = converted
                         preview_source = converted
@@ -947,6 +1260,9 @@ class TeachingArchiveService:
                 published, review = self._insert_items(
                     archive_document_id, version_id, items, document_risks,
                 )
+                calendar_sync_count += self._sync_schedule_calendar(
+                    actor, batch, row, archive_document_id, items,
+                )
                 published_count += published
                 review_count += review or (1 if not items else 0)
                 self.db.execute(
@@ -969,7 +1285,9 @@ class TeachingArchiveService:
                error_count=?,updated_at=CURRENT_TIMESTAMP WHERE batch_id=?""",
             (status, published_count, review_count, error_count, batch_id),
         )
-        return self.get_import_batch(actor, batch_id)
+        result = self.get_import_batch(actor, batch_id)
+        result["calendar_sync_count"] = calendar_sync_count
+        return result
 
     def _validate_sequences(self, course_id: str) -> None:
         for record_type, risk_code, key in (
@@ -1355,11 +1673,31 @@ class TeachingArchiveService:
             raise NotFound("教学档案文件不存在")
         return row, source
 
+    def _ensure_legacy_doc_preview(self, row: dict[str, Any], source: Path) -> Path:
+        """Retry DOC conversion for records imported before a converter was available."""
+        if source.suffix.lower() != ".doc":
+            return source
+        converted, error = self._convert_legacy(source)
+        if not converted:
+            raise ValidationError(
+                f"旧版 Word 文件无法预览：{error}。请将文件另存为 .docx 后重新上传。"
+            )
+        self.db.execute(
+            """UPDATE teaching_archive_documents
+               SET preview_kind='docx',preview_path=?,conversion_status='ready',updated_at=CURRENT_TIMESTAMP
+               WHERE archive_document_id=?""",
+            (str(converted), row["archive_document_id"]),
+        )
+        return converted
+
     def preview_descriptor(self, actor: dict[str, Any], archive_document_id: str) -> dict[str, Any]:
         row, source = self._require_document(actor, archive_document_id)
-        return {"archive_document_id": archive_document_id, "preview_kind": self._preview_kind(source),
+        source = self._ensure_legacy_doc_preview(row, source)
+        preview_kind = self._preview_kind(source)
+        return {"archive_document_id": archive_document_id, "preview_kind": preview_kind,
                 "conversion_status": row["conversion_status"],
-                "preview_error": "" if row["conversion_status"] == "ready" else "旧版 Office 转换尚不可用"}
+                "preview_error": "" if row["conversion_status"] == "ready" or preview_kind == "xls"
+                else "旧版 Office 转换尚不可用"}
 
     @staticmethod
     def _xlsx_preview_html(source: Path) -> str:
@@ -1378,11 +1716,43 @@ class TeachingArchiveService:
         return """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><style>
         body{margin:0;padding:24px;background:#f3f6f8;color:#243447;font:14px/1.5 system-ui,'Microsoft YaHei'}
         h2{margin:20px 0 10px}.scroll{overflow:auto;background:white;border:1px solid #dde5ea;border-radius:10px}
+         table{border-collapse:collapse;min-width:100%}td{padding:7px 10px;border:1px solid #e3e9ed;white-space:pre-wrap;min-width:90px}
+         tr:first-child td{position:sticky;top:0;background:#e8f4f3;font-weight:700}</style></head><body>""" + "".join(sections) + "</body></html>"
+
+    @classmethod
+    def _xls_preview_html(cls, source: Path) -> str:
+        import xlrd
+
+        workbook = xlrd.open_workbook(str(source), on_demand=True)
+        sections: list[str] = []
+        for sheet in workbook.sheets():
+            rows: list[str] = []
+            for row_index in range(min(sheet.nrows, 500)):
+                cells: list[str] = []
+                for column in range(sheet.ncols):
+                    cell = sheet.cell(row_index, column)
+                    value: Any = cell.value
+                    if cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            value = xlrd.xldate_as_datetime(value, workbook.datemode)
+                        except (TypeError, ValueError, OverflowError):
+                            pass
+                    cells.append(f"<td>{html.escape(cls._cell_value(value))}</td>")
+                if any(cell != "<td></td>" for cell in cells):
+                    rows.append("<tr>" + "".join(cells) + "</tr>")
+            sections.append(
+                f"<h2>{html.escape(sheet.name)}</h2><div class='scroll'><table>{''.join(rows)}</table></div>"
+            )
+        workbook.release_resources()
+        return """<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><style>
+        body{margin:0;padding:24px;background:#f3f6f8;color:#243447;font:14px/1.5 system-ui,'Microsoft YaHei'}
+        h2{margin:20px 0 10px}.scroll{overflow:auto;background:white;border:1px solid #dde5ea;border-radius:10px}
         table{border-collapse:collapse;min-width:100%}td{padding:7px 10px;border:1px solid #e3e9ed;white-space:pre-wrap;min-width:90px}
         tr:first-child td{position:sticky;top:0;background:#e8f4f3;font-weight:700}</style></head><body>""" + "".join(sections) + "</body></html>"
 
     def preview_content(self, actor: dict[str, Any], archive_document_id: str) -> tuple[str, Path | str]:
-        _row, source = self._require_document(actor, archive_document_id)
+        row, source = self._require_document(actor, archive_document_id)
+        source = self._ensure_legacy_doc_preview(row, source)
         suffix = source.suffix.lower()
         if suffix == ".docx":
             if not self.ingestion:
@@ -1390,6 +1760,11 @@ class TeachingArchiveService:
             return "text/html", self.ingestion._docx_preview_html(source)
         if suffix == ".xlsx":
             return "text/html", self._xlsx_preview_html(source)
+        if suffix == ".xls":
+            try:
+                return "text/html", self._xls_preview_html(source)
+            except Exception as exc:
+                raise ValidationError(f"XLS 文件无法生成网页预览：{exc}") from exc
         if suffix in {".txt", ".md"}:
             return "text/plain", source.read_text(encoding="utf-8-sig")
         if suffix == ".pdf":

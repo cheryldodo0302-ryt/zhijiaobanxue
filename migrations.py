@@ -1288,10 +1288,182 @@ MIGRATIONS: tuple[tuple[str, str], ...] = (
             ON teaching_archive_documents(sha256,lifecycle);
         """,
     ),
+    (
+        "030_class_weekly_calendar",
+        """
+        CREATE TABLE IF NOT EXISTS class_weekly_schedules (
+            schedule_id TEXT PRIMARY KEY,
+            class_id TEXT NOT NULL,
+            weekday INTEGER NOT NULL CHECK(weekday BETWEEN 1 AND 7),
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            location TEXT NOT NULL DEFAULT '',
+            starts_week INTEGER NOT NULL DEFAULT 1 CHECK(starts_week >= 1),
+            ends_week INTEGER NOT NULL DEFAULT 18 CHECK(ends_week >= starts_week),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(class_id) REFERENCES classes(class_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_class_weekly_schedule
+            ON class_weekly_schedules(class_id,weekday,start_time);
+        """,
+    ),
+    (
+        "031_imported_schedule_details",
+        """
+        ALTER TABLE class_weekly_schedules ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}';
+        """,
+    ),
+    (
+        "032_document_knowledge_review",
+        """
+        ALTER TABLE course_documents ADD COLUMN knowledge_review_mode TEXT NOT NULL DEFAULT 'point_by_point';
+        ALTER TABLE course_documents ADD COLUMN knowledge_review_status TEXT NOT NULL DEFAULT 'pending';
+        ALTER TABLE course_documents ADD COLUMN knowledge_reviewed_by TEXT;
+        ALTER TABLE course_documents ADD COLUMN knowledge_reviewed_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_course_documents_knowledge_review
+            ON course_documents(course_id,knowledge_review_status,knowledge_review_mode);
+        """,
+    ),
+    (
+        "033_account_ai_settings",
+        """
+        CREATE TABLE IF NOT EXISTS account_ai_settings (
+            user_id TEXT PRIMARY KEY REFERENCES users(user_id) ON DELETE CASCADE,
+            mode TEXT NOT NULL CHECK(mode IN ('mock','relay','custom')),
+            provider TEXT NOT NULL DEFAULT '',
+            base_url TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            api_key_encrypted TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        """,
+    ),
+    (
+        "034_review_followup",
+        """
+        ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE course_enrollments ADD COLUMN direct_grant INTEGER NOT NULL DEFAULT 1;
+        ALTER TABLE knowledge_versions ADD COLUMN snapshot_ready INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE published_knowledge_items (
+            version_id TEXT NOT NULL REFERENCES knowledge_versions(version_id) ON DELETE CASCADE,
+            item_id TEXT NOT NULL, kind TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+            PRIMARY KEY(version_id,kind,item_id)
+        );
+        ALTER TABLE knowledge_blocks ADD COLUMN source_node_id TEXT;
+        ALTER TABLE knowledge_blocks ADD COLUMN source_version_id TEXT;
+        CREATE TABLE assessment_papers (
+            paper_id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL, kind TEXT NOT NULL, items_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}', result_json TEXT,
+            responses_json TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_assessment_owner ON assessment_papers(course_id,user_id,kind);
+        CREATE TABLE learning_events (
+            event_id TEXT PRIMARY KEY, course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL, source TEXT NOT NULL, score REAL, total INTEGER NOT NULL DEFAULT 0,
+            records_json TEXT NOT NULL DEFAULT '[]', question TEXT NOT NULL DEFAULT '',
+            refused INTEGER NOT NULL DEFAULT 0, class_ids_json TEXT NOT NULL DEFAULT '[]',
+            legacy INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX idx_learning_event_scope ON learning_events(course_id,user_id,created_at);
+        CREATE TABLE submission_receipts (
+            user_id TEXT NOT NULL, kind TEXT NOT NULL, request_id TEXT NOT NULL,
+            course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+            input_json TEXT NOT NULL, result_json TEXT NOT NULL,
+            PRIMARY KEY(user_id,kind,request_id)
+        );
+        """,
+    ),
+    ('036_question_publication_snapshot', """
+        ALTER TABLE question_bank_version_items ADD COLUMN snapshot_json TEXT;
+    """),
+    ('037_class_calendar_adjustments', """
+        CREATE TABLE class_calendar_adjustments (
+            class_id TEXT NOT NULL REFERENCES classes(class_id) ON DELETE CASCADE,
+            original_date TEXT NOT NULL,
+            makeup_date TEXT,
+            reason TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY(class_id, original_date)
+        );
+    """),
 )
 
 
+MIGRATIONS += (("038_student_portraits", """
+    CREATE TABLE class_tasks (
+        task_id TEXT PRIMARY KEY,
+        course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+        class_id TEXT NOT NULL REFERENCES classes(class_id) ON DELETE CASCADE,
+        teacher_id TEXT NOT NULL, title TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('homework','exam')),
+        version_id TEXT NOT NULL, items_json TEXT NOT NULL,
+        roster_json TEXT NOT NULL, published_at TEXT NOT NULL, due_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_class_tasks_scope ON class_tasks(course_id,class_id,due_at);
+    CREATE TABLE class_task_submissions (
+        submission_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES class_tasks(task_id) ON DELETE CASCADE,
+        student_id TEXT NOT NULL, request_id TEXT NOT NULL,
+        responses_json TEXT NOT NULL, records_json TEXT NOT NULL,
+        submitted_at TEXT NOT NULL, complete INTEGER NOT NULL,
+        answered INTEGER NOT NULL, score REAL NOT NULL, total REAL NOT NULL,
+        UNIQUE(task_id,student_id,request_id)
+    );
+    CREATE INDEX idx_task_submission_owner ON class_task_submissions(task_id,student_id,submitted_at);
+    CREATE TABLE student_portrait_evaluations (
+        evaluation_id TEXT PRIMARY KEY,
+        course_id TEXT NOT NULL REFERENCES courses(course_id) ON DELETE CASCADE,
+        class_id TEXT NOT NULL REFERENCES classes(class_id) ON DELETE CASCADE,
+        student_id TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL,
+        metrics_version TEXT NOT NULL, evidence_version TEXT NOT NULL,
+        content_json TEXT NOT NULL, created_at TEXT NOT NULL,
+        invalidated INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_portrait_evaluation_scope ON student_portrait_evaluations(course_id,class_id,student_id,start_at,end_at);
+"""),)
+
+MIGRATIONS += (("039_remove_default_virtual_course", """
+    UPDATE courses SET visibility='private',updated_at=CURRENT_TIMESTAMP
+     WHERE course_id='virtual_ai_101' AND is_virtual=1;
+"""),)
+
+MIGRATIONS += (("040_detach_legacy_virtual_course", """
+    DELETE FROM course_enrollments WHERE course_id='virtual_ai_101';
+    DELETE FROM classes WHERE course_id='virtual_ai_101';
+"""),)
+
+MIGRATIONS += (("041_purge_legacy_virtual_course", """
+    DELETE FROM knowledge_version_blocks
+     WHERE version_id IN (SELECT version_id FROM knowledge_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM knowledge_version_nodes
+     WHERE version_id IN (SELECT version_id FROM knowledge_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM knowledge_version_relations
+     WHERE version_id IN (SELECT version_id FROM knowledge_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM question_bank_version_items
+     WHERE version_id IN (SELECT version_id FROM question_bank_versions WHERE course_id='virtual_ai_101');
+    DELETE FROM question_bank_attempts WHERE course_id='virtual_ai_101';
+    DELETE FROM question_bank_attachments
+     WHERE item_id IN (SELECT item_id FROM question_bank_items WHERE course_id='virtual_ai_101');
+    DELETE FROM knowledge_node_sources
+     WHERE node_id IN (SELECT node_id FROM knowledge_nodes WHERE course_id='virtual_ai_101');
+    DELETE FROM courses WHERE course_id='virtual_ai_101' AND is_virtual=1;
+"""),)
+
+MIGRATIONS += (("042_normalize_default_term_label", """
+    UPDATE terms
+       SET term_name='第一学期', teaching_period='第一学期'
+     WHERE term_name='默认学期'
+       AND NOT EXISTS (
+           SELECT 1 FROM terms existing
+            WHERE existing.owner_id=terms.owner_id AND existing.term_name='第一学期'
+       );
+"""),)
+
+
 def apply_migrations(conn: sqlite3.Connection) -> None:
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS schema_migrations (
                migration_id TEXT PRIMARY KEY,
@@ -1302,5 +1474,10 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     for migration_id, sql in MIGRATIONS:
         if migration_id in applied:
             continue
-        conn.executescript(sql)
+        statement = ""
+        for char in sql:
+            statement += char
+            if char == ";" and sqlite3.complete_statement(statement):
+                conn.execute(statement)
+                statement = ""
         conn.execute("INSERT INTO schema_migrations(migration_id) VALUES(?)", (migration_id,))

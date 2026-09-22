@@ -464,9 +464,70 @@ class KnowledgeGraphService:
         )
         counts = {status: sum(node["review_status"] == status for node in nodes)
                   for status in NODE_STATUSES}
+        published_knowledge: list[dict[str, Any]] = []
+        published = self.db.fetch_one(
+            """SELECT * FROM knowledge_versions
+               WHERE course_id=? AND status='published'
+               ORDER BY version_number DESC LIMIT 1""",
+            (course_id,),
+        )
+        if published:
+            published_rows = self.db.fetch_all(
+                """SELECT n.node_id,n.title,n.summary,n.markdown,n.keywords_json,
+                          n.material_type,n.sort_order,
+                          v.version_id,v.version_number,v.published_at,
+                          g.graph_node_id,g.title graph_title,g.summary graph_summary,
+                          g.markdown graph_markdown,g.source_revision graph_source_revision,
+                          g.review_status graph_review_status
+                   FROM knowledge_version_nodes vn
+                   JOIN knowledge_nodes n ON n.node_id=vn.node_id
+                   JOIN knowledge_versions v ON v.version_id=vn.version_id
+                   LEFT JOIN knowledge_graph_nodes g
+                     ON g.graph_id=? AND g.source_knowledge_node_id=n.node_id
+                   WHERE vn.version_id=? AND n.node_type='knowledge_point'
+                   ORDER BY n.material_type,n.sort_order,n.title""",
+                (graph["graph_id"], published["version_id"]),
+            )
+            for row in published_rows:
+                if not row.get("graph_node_id"):
+                    state = "not_in_graph"
+                elif self._knowledge_revision(row) != row.get("graph_source_revision"):
+                    state = "changed"
+                else:
+                    state = "synced"
+                published_knowledge.append({
+                    "node_id": row["node_id"],
+                    "title": row["title"],
+                    "summary": row["summary"],
+                    "markdown": row["markdown"],
+                    "material_type": row["material_type"],
+                    "version_id": row["version_id"],
+                    "version_number": row["version_number"],
+                    "published_at": row["published_at"],
+                    "graph_node_id": row["graph_node_id"],
+                    "graph_title": row["graph_title"],
+                    "graph_summary": row["graph_summary"],
+                    "graph_markdown": row["graph_markdown"],
+                    "graph_review_status": row["graph_review_status"],
+                    "state": state,
+                })
+        graph_by_source = {row.get("source_knowledge_node_id"): row for row in nodes}
+        library_knowledge = []
+        for row in self._approved_library_nodes(course_id):
+            linked = graph_by_source.get(row["node_id"]) or {}
+            library_knowledge.append({
+                **row, "graph_node_id": linked.get("graph_node_id"),
+                "graph_title": linked.get("title"), "graph_summary": linked.get("summary"),
+                "graph_markdown": linked.get("markdown"),
+                "state": "not_in_graph" if not linked else (
+                    "synced" if self._knowledge_revision(row) == linked.get("source_revision") else "changed"
+                ),
+            })
         return {
+            "library_knowledge": library_knowledge,
             "graph": {**graph, "relation_definitions": _loads(graph["relation_definitions_json"], {})},
             "nodes": nodes, "relations": relations, "versions": versions, "batches": batches,
+            "published_knowledge": published_knowledge,
             "metrics": {"nodes": len(nodes), "relations": len(relations),
                         "approved": counts["approved"], "review_required": counts["draft"] + sum(
                             relation["review_status"] == "draft" for relation in relations),
@@ -478,19 +539,35 @@ class KnowledgeGraphService:
         payload = _json([row.get("title"), row.get("summary"), row.get("markdown"), row.get("keywords_json")])
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    def _approved_library_nodes(self, course_id: str, *, include_document_nodes: bool = False) -> list[dict[str, Any]]:
+        rows = self.db.fetch_all(
+            """SELECT n.* FROM knowledge_nodes n WHERE n.course_id=?
+               AND n.status='approved' AND n.node_type='knowledge_point' AND n.content_domain='knowledge'
+               AND (n.node_scope='document' OR n.generation_id IN (
+                   SELECT generation_id FROM course_outline_generations WHERE course_id=? AND status='current'
+               ) OR (n.generation_id IS NULL AND NOT EXISTS (
+                   SELECT 1 FROM course_outline_generations WHERE course_id=? AND status='current'
+               ))) ORDER BY n.sort_order,n.title""", (course_id, course_id, course_id),
+        )
+        course_nodes = [row for row in rows if row["node_scope"] == "course"]
+        return rows if include_document_nodes else (course_nodes or rows)
+
+    def _node_title_key(self, graph_id: str, title: str, node_id: str) -> str:
+        """Keep the legacy unique title key without merging distinct source records."""
+        normalized = _normalized_title(title)
+        collision = self.db.fetch_one(
+            "SELECT graph_node_id FROM knowledge_graph_nodes "
+            "WHERE graph_id=? AND normalized_title=? AND graph_node_id<>?",
+            (graph_id, normalized, node_id),
+        )
+        return f"{normalized}::{node_id}" if collision else normalized
+
     def import_approved_nodes(self, actor: dict[str, Any], course_id: str,
                               node_ids: list[str] | None = None) -> dict[str, Any]:
         graph = self._graph(actor, course_id)
-        conditions = ["course_id=?", "status='approved'", "node_type='knowledge_point'",
-                      "content_domain='knowledge'"]
-        params: list[Any] = [course_id]
+        rows = self._approved_library_nodes(course_id, include_document_nodes=bool(node_ids))
         if node_ids:
-            unique = list(dict.fromkeys(node_ids))
-            conditions.append(f"node_id IN ({','.join('?' for _ in unique)})")
-            params.extend(unique)
-        rows = self.db.fetch_all(
-            f"SELECT * FROM knowledge_nodes WHERE {' AND '.join(conditions)} ORDER BY sort_order", tuple(params),
-        )
+            rows = [row for row in rows if row["node_id"] in set(node_ids)]
         if node_ids and len(rows) != len(set(node_ids)):
             raise ValidationError("只能导入当前课程中已审核的知识点")
         imported = 0
@@ -498,17 +575,21 @@ class KnowledgeGraphService:
             revision = self._knowledge_revision(row)
             normalized = _normalized_title(row["title"])
             existing = self.db.fetch_one(
-                "SELECT * FROM knowledge_graph_nodes WHERE graph_id=? AND normalized_title=?",
-                (graph["graph_id"], normalized),
+                """SELECT * FROM knowledge_graph_nodes WHERE graph_id=?
+                   AND (source_knowledge_node_id=? OR (normalized_title=? AND source_knowledge_node_id IS NULL))
+                   ORDER BY CASE WHEN source_knowledge_node_id=? THEN 0 ELSE 1 END LIMIT 1""",
+                (graph["graph_id"], row["node_id"], normalized, row["node_id"]),
             )
             source = {"knowledge_node_id": row["node_id"],
                       "source_pages": _loads(row.get("source_pages_json"), [])}
+            graph_node_id = existing["graph_node_id"] if existing else f"kgn_{uuid.uuid4().hex}"
+            normalized = self._node_title_key(graph["graph_id"], row["title"], graph_node_id)
             if existing:
                 self.db.execute(
-                    """UPDATE knowledge_graph_nodes SET title=?,summary=?,markdown=?,origin='knowledge_center',
+                    """UPDATE knowledge_graph_nodes SET title=?,normalized_title=?,summary=?,markdown=?,origin='knowledge_center',
                        source_knowledge_node_id=?,source_revision=?,source_json=?,review_status='approved',
                        updated_at=CURRENT_TIMESTAMP WHERE graph_node_id=?""",
-                    (row["title"], row["summary"], row["markdown"], row["node_id"], revision,
+                    (row["title"], normalized, row["summary"], row["markdown"], row["node_id"], revision,
                      _json(source), existing["graph_node_id"]),
                 )
             else:
@@ -517,7 +598,7 @@ class KnowledgeGraphService:
                            graph_node_id,graph_id,title,normalized_title,summary,markdown,origin,
                            source_knowledge_node_id,source_revision,review_status,source_json
                        ) VALUES(?,?,?,?,?,?,'knowledge_center',?,?,'approved',?)""",
-                    (f"kgn_{uuid.uuid4().hex}", graph["graph_id"], row["title"], normalized,
+                    (graph_node_id, graph["graph_id"], row["title"], normalized,
                      row["summary"], row["markdown"], row["node_id"], revision, _json(source)),
                 )
             imported += 1
@@ -525,6 +606,7 @@ class KnowledgeGraphService:
 
     def source_diff(self, actor: dict[str, Any], course_id: str) -> list[dict[str, Any]]:
         graph = self._graph(actor, course_id)
+        eligible = {row["node_id"] for row in self._approved_library_nodes(course_id, include_document_nodes=True)}
         rows = self.db.fetch_all(
             """SELECT g.graph_node_id,g.title graph_title,g.source_revision,n.*
                FROM knowledge_graph_nodes g LEFT JOIN knowledge_nodes n ON n.node_id=g.source_knowledge_node_id
@@ -533,36 +615,73 @@ class KnowledgeGraphService:
         result = []
         for row in rows:
             state = "source_missing" if not row.get("node_id") else (
-                "source_unapproved" if row["status"] != "approved" else (
+                "source_unapproved" if row["node_id"] not in eligible else (
                     "changed" if self._knowledge_revision(row) != row["source_revision"] else "current"
                 )
             )
             result.append({"graph_node_id": row["graph_node_id"], "title": row["graph_title"],
                            "source_knowledge_node_id": row.get("node_id"), "state": state})
+        new_rows = self.db.fetch_all(
+            """SELECT n.node_id,n.title
+               FROM knowledge_nodes n
+               WHERE n.course_id=? AND n.status='approved'
+                 AND n.node_type='knowledge_point' AND n.content_domain='knowledge'
+                 AND NOT EXISTS(
+                     SELECT 1 FROM knowledge_graph_nodes g
+                     WHERE g.graph_id=? AND g.source_knowledge_node_id=n.node_id
+                 )
+               ORDER BY n.sort_order,n.title""",
+            (course_id, graph["graph_id"]),
+        )
+        current_library_ids = {row["node_id"] for row in self._approved_library_nodes(course_id)}
+        result.extend({
+            "graph_node_id": None,
+            "title": row["title"],
+            "source_knowledge_node_id": row["node_id"],
+            "state": "new",
+        } for row in new_rows if row["node_id"] in current_library_ids)
         return result
 
     def sync_sources(self, actor: dict[str, Any], course_id: str,
-                     graph_node_ids: list[str] | None = None) -> dict[str, Any]:
+                     graph_node_ids: list[str] | None = None,
+                     source_knowledge_node_ids: list[str] | None = None) -> dict[str, Any]:
         graph = self._graph(actor, course_id)
+        eligible = {row["node_id"] for row in self._approved_library_nodes(course_id, include_document_nodes=True)}
+        if source_knowledge_node_ids and not set(source_knowledge_node_ids).issubset(eligible):
+            raise ValidationError("只能同步当前课程中已批准到知识库的有效知识点")
         conditions = ["g.graph_id=?", "g.origin='knowledge_center'", "n.status='approved'"]
         params: list[Any] = [graph["graph_id"]]
-        if graph_node_ids:
+        if graph_node_ids is not None:
             unique = list(dict.fromkeys(graph_node_ids))
-            conditions.append(f"g.graph_node_id IN ({','.join('?' for _ in unique)})")
+            conditions.append(f"g.graph_node_id IN ({','.join('?' for _ in unique) or 'NULL'})")
             params.extend(unique)
         rows = self.db.fetch_all(
             f"""SELECT g.graph_node_id,n.* FROM knowledge_graph_nodes g
                  JOIN knowledge_nodes n ON n.node_id=g.source_knowledge_node_id
                  WHERE {' AND '.join(conditions)}""", tuple(params),
         )
+        rows = [row for row in rows if row["node_id"] in eligible]
         for row in rows:
             self.db.execute(
                 """UPDATE knowledge_graph_nodes SET title=?,normalized_title=?,summary=?,markdown=?,
                    source_revision=?,updated_at=CURRENT_TIMESTAMP WHERE graph_node_id=?""",
-                (row["title"], _normalized_title(row["title"]), row["summary"], row["markdown"],
+                (row["title"], self._node_title_key(graph["graph_id"], row["title"], row["graph_node_id"]), row["summary"], row["markdown"],
                  self._knowledge_revision(row), row["graph_node_id"]),
             )
-        return {"synced": len(rows)}
+        imported = 0
+        if source_knowledge_node_ids:
+            unique_source_ids = list(dict.fromkeys(source_knowledge_node_ids))
+            approved = self.db.fetch_all(
+                f"""SELECT node_id FROM knowledge_nodes
+                    WHERE course_id=? AND status='approved' AND node_type='knowledge_point'
+                      AND content_domain='knowledge'
+                      AND node_id IN ({','.join('?' for _ in unique_source_ids)})""",
+                (course_id, *unique_source_ids),
+            )
+            if len(approved) != len(unique_source_ids):
+                raise ValidationError("只能同步当前课程中已审核的知识点")
+            imported = self.import_approved_nodes(actor, course_id, unique_source_ids)["imported"]
+        return {"synced": len(rows), "imported": imported, "total": len(rows) + imported}
 
     def update_node(self, actor: dict[str, Any], node_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         row = self.db.fetch_one(
@@ -580,7 +699,7 @@ class KnowledgeGraphService:
             """UPDATE knowledge_graph_nodes SET title=?,normalized_title=?,summary=?,markdown=?,notes=?,
                is_key=?,is_difficult=?,is_exam=?,review_status=?,updated_at=CURRENT_TIMESTAMP
                WHERE graph_node_id=?""",
-            (title, _normalized_title(title), str(payload.get("summary", row["summary"])),
+            (title, self._node_title_key(row["graph_id"], title, node_id), str(payload.get("summary", row["summary"])),
              str(payload.get("markdown", row["markdown"])), _clean(payload.get("notes", row["notes"]), 2000),
              int(payload.get("is_key", row["is_key"])), int(payload.get("is_difficult", row["is_difficult"])),
              int(payload.get("is_exam", row["is_exam"])), status, node_id),
@@ -618,7 +737,16 @@ class KnowledgeGraphService:
         )
         if not nodes:
             raise ValidationError("没有已批准的图谱节点")
+        approved_ids = {row["graph_node_id"] for row in nodes}
+        invalid_sources = [row for row in self.source_diff(actor, course_id)
+                           if row["graph_node_id"] in approved_ids and row["state"] != "current"]
+        if invalid_sources:
+            titles = "、".join(row["title"] for row in invalid_sources[:5])
+            raise ValidationError(f"图谱引用的知识库内容已变化或未获批准（{titles}），请先完成入库并同步，或将对应图谱节点退回审查")
         node_ids = {row["graph_node_id"] for row in nodes}
+        for row in nodes:
+            row['_class_ids'] = [s['class_id'] for s in self.db.fetch_all(
+                'SELECT class_id FROM knowledge_node_class_scopes WHERE node_id=?', (row.get('source_knowledge_node_id'),))]
         relations = [row for row in self.db.fetch_all(
             "SELECT * FROM knowledge_graph_relations WHERE graph_id=? AND review_status='approved'",
             (graph["graph_id"],),
@@ -677,4 +805,17 @@ class KnowledgeGraphService:
             node["source"] = {key: source[key] for key in ("file", "sheet", "row", "source_pages") if key in source}
             if node.get("origin") == "knowledge_center":
                 node["markdown"] = ""
+        classes = {r['class_id'] for r in self.db.fetch_all("""SELECT c.class_id FROM classes c JOIN class_memberships m USING(class_id)
+            WHERE c.course_id=? AND m.student_id=? AND c.status='active' AND m.status='active'""", (course_id,actor['user_id']))}
+        visible = []
+        for node in nodes:
+            scope = node.pop('_class_ids',None)
+            if scope is None:
+                scope = [r['class_id'] for r in self.db.fetch_all('SELECT class_id FROM knowledge_node_class_scopes WHERE node_id=?', (node.get('source_knowledge_node_id'),))]
+            if not scope or classes.intersection(scope):
+                visible.append(node)
+        nodes = visible
+        ids = {n['graph_node_id'] for n in nodes}
+        relations = [r for r in relations if r['source_node_id'] in ids and r['target_node_id'] in ids]
+        version = {**version,'node_count':len(nodes),'relation_count':len(relations)}
         return {"version": version, "nodes": nodes, "relations": relations}

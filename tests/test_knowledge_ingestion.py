@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import json
+
 from auth_service import AuthService
 from campus_service import CampusService
 from database import LearningDatabase
@@ -79,3 +81,49 @@ def test_candidate_approval_materializes_approved_source(tmp_path: Path):
     artifact = Path(document["stored_path"]).parent / f"{job['document_id']}_ingestion" / "approved" / "knowledge_points.jsonl"
     assert artifact.is_file()
     assert "source_block_ids" in artifact.read_text(encoding="utf-8")
+
+
+def test_candidate_approval_ignores_stale_excluded_source_after_revision(tmp_path: Path):
+    db = LearningDatabase(tmp_path / "candidate-excluded.db")
+    campus = CampusService(db, tmp_path / "uploads", provider_factory=lambda: None)
+    teacher = AuthService(db, tmp_path / "secret").create_user(
+        "teacher", "safe-password-123", "teacher"
+    )
+    course = TeacherService(db, campus).create_course(teacher, "排除来源清理")
+    ingestion = IngestionService(db, campus)
+    job = ingestion.queue_document(
+        teacher, course["course_id"], "mixed.md", "text/markdown",
+        "# 关系模型\n\n关系模型是二维表结构。\n\n## 习题\n\n求关系模型的元组数量。".encode(),
+        analysis_mode="local",
+    )
+    ingestion.process_job(job["job_id"])
+    candidates = ingestion.list_knowledge_candidates(teacher, job["document_id"])
+    candidate = candidates[0]
+    excluded = db.fetch_one(
+        """SELECT block_id FROM document_blocks WHERE document_id=?
+           AND (include_as_knowledge=0 OR region_type!='knowledge') LIMIT 1""",
+        (job["document_id"],),
+    )
+    assert excluded
+    source_ids = [*candidate["source_block_ids"], excluded["block_id"]]
+    db.execute(
+        "INSERT OR IGNORE INTO knowledge_candidate_blocks(candidate_id,block_id,sort_order) VALUES(?,?,?)",
+        (candidate["candidate_id"], excluded["block_id"], len(source_ids)),
+    )
+    db.execute(
+        "UPDATE knowledge_candidates SET source_block_ids_json=? WHERE candidate_id=?",
+        (json.dumps(source_ids, ensure_ascii=False), candidate["candidate_id"]),
+    )
+
+    saved = ingestion.update_knowledge_candidate(
+        teacher, candidate["candidate_id"],
+        {"teacher_revision": candidate["markdown_content"]},
+    )
+
+    assert excluded["block_id"] not in saved["source_block_ids"]
+    assert excluded["block_id"] not in {
+        block["block_id"] for block in saved["source_blocks"]
+    }
+    assert ingestion.approve_knowledge_candidate(
+        teacher, candidate["candidate_id"]
+    )["review_status"] == "APPROVED"

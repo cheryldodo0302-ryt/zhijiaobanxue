@@ -4,6 +4,7 @@ from typing import Any
 
 from llm_provider import LLMProvider
 from skills.retrieval import CourseRetriever, Evidence
+from .grounding import supported_evidence
 
 
 @dataclass
@@ -153,7 +154,7 @@ def guide_question(
         raise ValueError("不支持的引导阶段")
 
     candidates = retriever.search(original_question, top_k)
-    evidence = [item for item in candidates if item.score >= min_score]
+    evidence = supported_evidence(question, candidates, min_score)
     if evidence_refs:
         expected = {
             (
@@ -228,7 +229,7 @@ def answer_question(question: str, retriever: CourseRetriever, provider: LLMProv
     if contains_prompt_injection(question):
         return QAResult(_injection_refusal(), [], [], True)
     candidates = retriever.search(question, top_k)
-    evidence = [item for item in candidates if item.score >= min_score]
+    evidence = supported_evidence(question, candidates, min_score)
     if not evidence:
         return QAResult(_format_refusal(question, candidates), [], [], True)
     context = _evidence_context(evidence)

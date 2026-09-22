@@ -62,6 +62,44 @@ def lesson_plan_bytes() -> bytes:
     return stream.getvalue()
 
 
+def test_legacy_doc_preview_retries_conversion_on_demand(tmp_path: Path, monkeypatch):
+    _db, teacher, course, term, class_row, service = archive_scope(tmp_path)
+    batch = service.create_import_batch(teacher, course["course_id"], term_id=term["term_id"])
+    uploaded = service.add_import_file(
+        teacher, batch["batch_id"], "旧版教案.doc", "application/msword",
+        io.BytesIO(b"legacy-doc"), relative_path="教案/旧版教案.doc",
+    )
+    service.update_import_file(
+        teacher, batch["batch_id"], uploaded["file_id"], {"class_ids": [class_row["class_id"]]},
+    )
+    monkeypatch.setattr(service, "_convert_legacy", lambda _source: (None, "转换服务未启动"))
+    service.commit_import_batch(teacher, batch["batch_id"])
+    row = service.workbench(teacher, course["course_id"])["documents"][0]
+    assert row["preview_kind"] == "unavailable"
+
+    converted = tmp_path / "converted.docx"
+    document = Document()
+    document.add_heading("旧版 Word 预览", level=1)
+    document.add_paragraph("历史档案正文")
+    document.save(converted)
+    service.ingestion = type(
+        "PreviewRenderer", (),
+        {"_docx_preview_html": staticmethod(lambda _source: "<html>旧版 Word 预览</html>")},
+    )()
+    monkeypatch.setattr(service, "_convert_legacy", lambda _source: (converted, ""))
+    media_type, preview = service.preview_content(teacher, row["archive_document_id"])
+
+    assert media_type == "text/html"
+    assert "旧版 Word 预览" in preview
+    saved = _db.fetch_one(
+        "SELECT preview_kind,preview_path,conversion_status FROM teaching_archive_documents WHERE archive_document_id=?",
+        (row["archive_document_id"],),
+    )
+    assert saved["preview_kind"] == "docx"
+    assert saved["preview_path"] == str(converted)
+    assert saved["conversion_status"] == "ready"
+
+
 def schedule_bytes() -> bytes:
     workbook = Workbook()
     sheet = workbook.active
