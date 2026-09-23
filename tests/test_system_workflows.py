@@ -96,9 +96,11 @@ def test_shared_source_status_and_cards_use_published_knowledge_only(system):
         memory.build_blocks(course_id, student_id, job["document_id"])
     ingestion.approve_document_knowledge(teacher, job["document_id"])
     ingestion.publish(teacher, course_id)
+    ingestion.update_material_metadata(teacher, job["document_id"], material_type="slides", tags=["第一章", "重点"])
     db.execute("UPDATE course_documents SET student_file_visible=1 WHERE document_id=?", (job["document_id"],))
     docs = campus.list_documents(course_id, student_id, "student")
     assert len(docs) == 1 and "text_preview" not in docs[0]
+    assert docs[0]["material_type"] == "slides" and docs[0]["tags"] == ["第一章", "重点"]
     assert ingestion.list_student_source_files(student, course_id) == docs
     agent = CampusAgentService(campus)
     response = agent.invoke({"request_id":"docs", "agent":"student_assistant", "action":"document_status",

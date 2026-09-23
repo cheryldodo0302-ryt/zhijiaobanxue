@@ -59,6 +59,10 @@ html:is([data-portal="teacher"], [data-portal="student"]),
 }
 html:is([data-portal="teacher"], [data-portal="student"]) ::selection { background: #dce3d3; color: #294b3c; }
 html:is([data-portal="teacher"], [data-portal="student"]) :focus-visible { outline: 2px solid #5d7350; outline-offset: 3px; }
+/* Element Plus inputs already have a rounded outer control; focus that control instead of drawing a square around the inner text field. */
+html:is([data-portal="teacher"], [data-portal="student"]) :is(.el-input__inner, .el-textarea__inner):focus-visible { outline: none; }
+html:is([data-portal="teacher"], [data-portal="student"]) .el-input__wrapper:focus-within,
+html:is([data-portal="teacher"], [data-portal="student"]) .el-textarea__inner:focus { box-shadow: 0 0 0 2px #5d7350 inset; }
 html:is([data-portal="teacher"], [data-portal="student"]) :is(input, textarea) { caret-color: #294b3c; }
 
 /* Override legacy component-level teal rules, including their selected states. */

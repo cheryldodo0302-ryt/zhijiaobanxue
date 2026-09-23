@@ -84,13 +84,18 @@ class ClassTaskService:
             result.append(item)
         return result
 
-    def publish(self, actor, course_id, class_id, title, kind, version_id, due_at, items):
+    def publish(self, actor, course_id, class_id, title, kind, version_id, due_at, items, max_submissions=1):
         self.scope(actor, course_id, class_id)
         if actor["role"] != "teacher":
             raise PermissionDenied("仅教师可以发布任务")
         now, due = self.clock(), timestamp(due_at)
         if kind not in {"homework", "exam"} or not isinstance(title, str) or not title.strip() or len(title) > 160:
             raise ValidationError("任务名称或类型无效")
+        if max_submissions is None:
+            if kind != "homework":
+                raise ValidationError("考试必须设置提交次数")
+        elif isinstance(max_submissions, bool) or not isinstance(max_submissions, int) or not 1 <= max_submissions <= 100:
+            raise ValidationError("提交次数必须为 1 至 100")
         if due <= now:
             raise ValidationError("截止时间必须晚于发布时间")
         if not isinstance(items, list) or not 1 <= len(items) <= 100:
@@ -125,8 +130,10 @@ class ClassTaskService:
             if not roster:
                 raise ValidationError("教学班没有有效学生，无法发布任务")
             task_id = "task_" + uuid4().hex
-            conn.execute("INSERT INTO class_tasks VALUES(?,?,?,?,?,?,?,?,?,?,?)", (task_id, course_id, class_id,
-                actor["user_id"], title.strip(), kind, version_id, encode(snapshots), encode(roster), stamp(now), stamp(due)))
+            conn.execute("""INSERT INTO class_tasks
+                (task_id,course_id,class_id,teacher_id,title,kind,version_id,items_json,roster_json,published_at,due_at,max_submissions)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (task_id, course_id, class_id,
+                actor["user_id"], title.strip(), kind, version_id, encode(snapshots), encode(roster), stamp(now), stamp(due), max_submissions))
         return self.detail(actor, task_id)
 
     def raw_task(self, task_id):
@@ -149,6 +156,9 @@ class ClassTaskService:
         task["items"] = [{k: v for k, v in q.items() if k != "answer"} for q in json.loads(raw["items_json"])]
         task["submissions"] = self.db.fetch_all("""SELECT submission_id,submitted_at,complete,answered,score,total
             FROM class_task_submissions WHERE task_id=? AND student_id=? ORDER BY submission_id""", (task_id, actor["user_id"])) if actor["role"] == "student" else []
+        if actor["role"] == "student":
+            task["submission_count"] = len(task["submissions"])
+            task["remaining_submissions"] = None if raw["max_submissions"] is None else max(0, raw["max_submissions"] - task["submission_count"])
         return task
 
     def list_tasks(self, actor, course_id, class_id):
@@ -168,7 +178,7 @@ class ClassTaskService:
         supplied = encode(responses)
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            self.require_task(actor, task_id)
+            task = self.require_task(actor, task_id)
             old = conn.execute("SELECT * FROM class_task_submissions WHERE task_id=? AND student_id=? AND request_id=?", (task_id, actor["user_id"], request_id)).fetchone()
             if old:
                 if old["responses_json"] != supplied:
@@ -180,8 +190,9 @@ class ClassTaskService:
             if task["kind"] == "exam":
                 if now > timestamp(task["due_at"]):
                     raise ValidationError("考试已截止")
-                if conn.execute("SELECT 1 FROM class_task_submissions WHERE task_id=? AND student_id=?", (task_id, actor["user_id"])).fetchone():
-                    raise ValidationError("考试仅允许一次正式提交")
+            count = conn.execute("SELECT COUNT(*) FROM class_task_submissions WHERE task_id=? AND student_id=?", (task_id, actor["user_id"])).fetchone()[0]
+            if task["max_submissions"] is not None and count >= task["max_submissions"]:
+                raise ValidationError("该任务的提交次数已用尽")
             records = []
             for q in items:
                 answer = responses.get(q["item_id"])

@@ -5628,6 +5628,8 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                 "preview_kind": "docx", "conversion_status": "ready",
                 "preview_error": "", "total_pages": 1,
             }
+        if suffix == ".xls":
+            return {"preview_kind": "spreadsheet", "conversion_status": "ready", "preview_error": ""}
         artifact = self.db.fetch_one(
             "SELECT * FROM document_artifacts WHERE document_id=? AND artifact_type='preview_pdf'",
             (document_id,),
@@ -5661,6 +5663,12 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
                 return "text/html", self._docx_preview_html(source)
             except Exception as exc:
                 raise ValidationError(f"Word 文件无法生成网页预览：{exc}") from exc
+        if suffix == ".xls":
+            try:
+                from teaching_archive_service import TeachingArchiveService
+                return "text/html", TeachingArchiveService._xls_preview_html(source)
+            except Exception as exc:
+                raise ValidationError(f"XLS 文件无法生成网页预览：{exc}") from exc
         artifact = self.db.fetch_one(
             """SELECT * FROM document_artifacts WHERE document_id=? AND artifact_type='preview_pdf'
                AND status='ready'""", (document_id,),

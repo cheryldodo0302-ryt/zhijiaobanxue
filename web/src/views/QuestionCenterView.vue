@@ -41,6 +41,7 @@ const taskVersionId = ref('')
 const taskSelectedItems = ref<any[]>([])
 const taskTitle = ref('')
 const taskKind = ref('homework')
+const taskMaxSubmissions = ref<number | null>(1)
 const taskDue = ref('')
 const taskPoints = ref<Record<string, number>>({})
 const classTasks = ref<any[]>([])
@@ -84,6 +85,7 @@ function resetTaskWorkspace() {
   taskVersionId.value = ''
   taskSelectedItems.value = []
   taskTitle.value = ''
+  taskMaxSubmissions.value = 1
   taskDue.value = ''
   taskPoints.value = {}
   classTasks.value = []
@@ -350,6 +352,7 @@ async function publishTask() {
     await api.post(`/teacher/courses/${courseId.value}/classes/${classId.value}/tasks`, {
       title: taskTitle.value.trim(),
       kind: taskKind.value,
+      max_submissions: taskMaxSubmissions.value,
       version_id: taskVersionId.value,
       due_at: dueAt.toISOString(),
       items: taskSelectedItems.value.map(item => ({ item_id: item.item_id, points: taskPoints.value[item.item_id] ?? 1 })),
@@ -357,6 +360,7 @@ async function publishTask() {
     ElMessage.success(`已向“${selectedClass.value?.class_name || '当前教学班'}”发布${taskKind.value === 'exam' ? '考试' : '作业'}`)
     taskTitle.value = ''
     taskDue.value = ''
+    taskMaxSubmissions.value = 1
     taskSelectedItems.value = []
     taskPoints.value = {}
     taskPublishAttempted.value = false
@@ -571,7 +575,13 @@ onMounted(loadBase)
           </el-select>
         </el-form-item>
         <el-form-item label="任务类型">
-          <el-select v-model="taskKind"><el-option label="作业（允许订正和补交）" value="homework" /><el-option label="考试（一次正式提交）" value="exam" /></el-select>
+          <el-select v-model="taskKind" @change="taskMaxSubmissions=1"><el-option label="作业" value="homework" /><el-option label="考试" value="exam" /></el-select>
+        </el-form-item>
+        <el-form-item label="最多提交次数">
+          <el-select v-model="taskMaxSubmissions" filterable>
+            <el-option v-if="taskKind==='homework'" label="不限次数" :value="null" />
+            <el-option v-for="count in 100" :key="count" :label="`${count} 次`" :value="count" />
+          </el-select>
         </el-form-item>
         <el-form-item label="任务名称" required :error="taskPublishAttempted && !taskTitle.trim() ? '请输入任务名称' : ''">
           <el-input v-model="taskTitle" maxlength="160" placeholder="例如：第三章课后作业" />

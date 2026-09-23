@@ -13,6 +13,7 @@ const range = ref<[string, string]>(['', ''])
 const students = ref<any[]>([]), portrait = ref<any>(null), tasks = ref<any[]>([]), sources = ref<any[]>([])
 const loading = ref(false), publishing = ref(false), evaluating = ref(false), error = ref('')
 const activeTab = ref('portraits'), title = ref(''), kind = ref('homework'), due = ref(''), versionId = ref('')
+const maxSubmissions = ref<number | null>(1)
 const selectedItems = ref<any[]>([])
 const publishAttempted = ref(false)
 let epoch = 0, detailEpoch = 0, timer: number | undefined, disposed = false
@@ -97,8 +98,8 @@ async function publish() {
   if (!title.value.trim() || !versionId.value || !due.value || !selectedItems.value.length) { ElMessage.warning('请填写任务名称、题库、题目和截止时间'); return }
   publishing.value = true
   try {
-    await api.post(`${prefix.value}/tasks`, { title: title.value, kind: kind.value, version_id: versionId.value, due_at: new Date(due.value).toISOString(), items: selectedItems.value.map(q => ({ item_id: q.item_id, points: points.value[q.item_id] ?? 1 })) })
-    publishAttempted.value = false; ElMessage.success('任务已发布，试题与应完成人员已固定'); title.value = ''; selectedItems.value = []; await loadClass()
+    await api.post(`${prefix.value}/tasks`, { title: title.value, kind: kind.value, max_submissions: maxSubmissions.value, version_id: versionId.value, due_at: new Date(due.value).toISOString(), items: selectedItems.value.map(q => ({ item_id: q.item_id, points: points.value[q.item_id] ?? 1 })) })
+    publishAttempted.value = false; ElMessage.success('任务已发布，试题与应完成人员已固定'); title.value = ''; maxSubmissions.value = 1; selectedItems.value = []; await loadClass()
   } catch (e) { ElMessage.error(msg(e)) } finally { publishing.value = false }
 }
 const chartSeries = computed(() => ['homework', 'exam'].map(type => {
@@ -168,7 +169,8 @@ onUnmounted(() => { disposed = true; epoch++; detailEpoch++; window.clearInterva
         <el-card shadow="never"><h2>发布班级任务</h2><p class="muted">仅支持已发布题库中的客观题。发布后固定试题、分值与应完成人员；考试仅能提交一次。</p>
           <el-form label-position="top" class="task-publish-form">
             <el-form-item label="任务名称" required :error="publishAttempted && !title.trim() ? '请输入任务名称' : ''"><el-input v-model="title" placeholder="例如：细胞结构课后练习" maxlength="160" /></el-form-item>
-            <el-form-item label="任务类型"><el-select v-model="kind"><el-option label="作业（允许订正和补交）" value="homework"/><el-option label="考试（一次正式提交）" value="exam"/></el-select></el-form-item>
+            <el-form-item label="任务类型"><el-select v-model="kind" @change="maxSubmissions=1"><el-option label="作业" value="homework"/><el-option label="考试" value="exam"/></el-select></el-form-item>
+            <el-form-item label="最多提交次数"><el-select v-model="maxSubmissions" filterable><el-option v-if="kind==='homework'" label="不限次数" :value="null"/><el-option v-for="count in 100" :key="count" :label="`${count} 次`" :value="count"/></el-select></el-form-item>
             <el-form-item label="截止时间" required :error="publishAttempted && !due ? '请选择截止时间' : ''"><el-date-picker v-model="due" type="datetime" placeholder="选择日期与时间" /></el-form-item>
             <el-form-item label="已发布题库" required :error="publishAttempted && !versionId ? '请选择题库' : ''"><el-select v-model="versionId" placeholder="选择题库" @change="selectedItems=[]; points={}"><el-option v-for="s in sources" :key="s.version_id" :value="s.version_id" :label="`${s.folder_name || '题库'} · 版本 ${s.version_number}`"/></el-select></el-form-item>
           </el-form>

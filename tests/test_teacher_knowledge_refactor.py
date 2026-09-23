@@ -180,6 +180,26 @@ def test_docx_supports_safe_browser_preview_without_libreoffice(tmp_path, monkey
     assert "<table>" in preview
 
 
+def test_uploaded_document_source_and_preview_keep_original_text(tmp_path):
+    _, campus, teacher, course = teacher_scope(tmp_path)
+    document = Document()
+    document.add_paragraph("温州医科大学 · 本部 · 仁济")
+    stream = io.BytesIO()
+    document.save(stream)
+    original = stream.getvalue()
+    service = IngestionService(campus.db, campus)
+    job = service.queue_document(
+        teacher, course["course_id"], "仁济教材.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", original,
+    )
+    row, source = service.source_file(teacher, job["document_id"])
+    assert row["original_name"] == "仁济教材.docx"
+    assert source.read_bytes() == original
+    media_type, preview = service.preview_file(teacher, job["document_id"])
+    assert media_type == "text/html"
+    assert "温州医科大学 · 本部 · 仁济" in preview
+
+
 def test_pptx_groups_consecutive_same_titles_and_exposes_slide_numbers(tmp_path, monkeypatch):
     db, campus, teacher, course = teacher_scope(tmp_path)
     service = IngestionService(db, campus)
@@ -466,7 +486,7 @@ def test_teaching_archive_upload_can_target_one_or_multiple_classes(tmp_path):
     assert metadata == {"material_type": "syllabus", "classification_status": "confirmed"}
     archive = service.teaching_archive(teacher, course["course_id"])
     uploaded = next(row for row in archive["documents"] if row["document_id"] == job["document_id"])
-    assert set(uploaded["class_labels"]) == {"A班（本部）", "B班（仁济）"}
+    assert set(uploaded["class_labels"]) == {"A班（校区A）", "B班（校区B）"}
 
     chapter_id, section_id, point_id = "kn_level_chapter", "kn_level_section", "kn_level_point"
     db.execute(

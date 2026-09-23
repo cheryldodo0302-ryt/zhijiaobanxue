@@ -52,13 +52,6 @@ function Find-CompatiblePython {
         $command = Get-Command $commandName -ErrorAction SilentlyContinue
         if ($command) { $candidates.Add((New-PythonCandidate $command.Source)) }
     }
-    # Compatibility fallback for the user's existing Anaconda layout. An
-    # explicit ZHIJIAO_PYTHON value always takes priority.
-    foreach ($knownPath in @("D:\anapython\python.exe")) {
-        if (Test-Path -LiteralPath $knownPath) {
-            $candidates.Add((New-PythonCandidate $knownPath))
-        }
-    }
     foreach ($candidate in $candidates) {
         if (Test-CompatiblePython $candidate.Executable $candidate.Arguments) {
             return $candidate

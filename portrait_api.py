@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from campus_service import CampusError, PermissionDenied, NotFound
 from class_task_service import ClassTaskService
 from student_portrait_service import StudentPortraitService
+from student_todo_service import StudentTodoService
 
 
 class TaskItem(BaseModel):
@@ -18,11 +19,20 @@ class TaskPublish(BaseModel):
     version_id: str
     due_at: str
     items: list[TaskItem] = Field(min_length=1, max_length=100)
+    max_submissions: int | None = 1
 
 
 class TaskSubmit(BaseModel):
     request_id: str = Field(min_length=1, max_length=100)
     responses: dict = Field(default_factory=dict)
+
+
+class TodoCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+
+
+class TodoCompletion(BaseModel):
+    completed: bool
 
 
 class SharingScope(BaseModel):
@@ -47,6 +57,23 @@ def portrait_router(campus, study_room, current_teacher, current_student):
     router = APIRouter(prefix="/api/v1")
     tasks = ClassTaskService(campus)
     portraits = StudentPortraitService(campus, study_room)
+    todos = StudentTodoService(campus)
+
+    @router.get("/student/todos")
+    def list_todos(user: dict = Depends(current_student)):
+        return checked(todos.list_items, user)
+
+    @router.post("/student/todos")
+    def create_todo(payload: TodoCreate, user: dict = Depends(current_student)):
+        return checked(todos.create, user, payload.title)
+
+    @router.patch("/student/todos/{todo_id}")
+    def complete_todo(todo_id: str, payload: TodoCompletion, user: dict = Depends(current_student)):
+        return checked(todos.set_completed, user, todo_id, payload.completed)
+
+    @router.delete("/student/todos/{todo_id}")
+    def delete_todo(todo_id: str, user: dict = Depends(current_student)):
+        return checked(todos.delete, user, todo_id)
 
     @router.get("/student/task-scopes")
     def scopes(user: dict = Depends(current_student)):

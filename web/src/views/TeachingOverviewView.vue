@@ -110,12 +110,16 @@ onUnmounted(() => { disposed = true; requestVersion++ })
 
 <template>
   <main class="content teaching-overview" v-loading="loading">
-    <div class="page-title">
-      <span class="eyebrow">班级学情分析</span>
-      <h1>教学诊断</h1>
-      <el-button @click="$router.push({path:'/student-portraits',query:{course_id:courseId,class_id:classId}})">班级学生画像与任务</el-button>
-      <p class="muted">在同一课程和教学班下，查看教学概况、习题学习统计与需要改进的内容。</p>
-    </div>
+    <header class="page-title">
+      <div class="diagnosis-heading">
+        <div class="diagnosis-heading-copy">
+          <span class="eyebrow">班级学情分析</span>
+          <h1>教学诊断</h1>
+          <p class="muted">在同一课程和教学班下，查看教学概况、习题学习统计与需要改进的内容。</p>
+        </div>
+        <el-button class="diagnosis-heading-action" @click="$router.push({path:'/student-portraits',query:{course_id:courseId,class_id:classId}})">班级学生画像与任务</el-button>
+      </div>
+    </header>
 
     <el-card shadow="never" class="overview-filter">
       <div class="diagnostic-filters">
@@ -255,6 +259,9 @@ onUnmounted(() => { disposed = true; requestVersion++ })
 </template>
 
 <style scoped>
+.diagnosis-heading { display: flex; align-items: center; justify-content: space-between; gap: 32px; width: 100%; min-width: 0; }
+.diagnosis-heading-copy { min-width: 0; }
+.diagnosis-heading-action { flex: none; min-width: 176px; margin: 0; }
 .diagnostic-filters { display: flex; align-items: end; gap: 14px; flex-wrap: wrap; }
 .diagnostic-filters label { display: grid; gap: 7px; flex: 1; min-width: 220px; color: #47655e; font-size: 13px; }
 .diagnostic-filters .el-select { width: 100%; }
@@ -277,6 +284,7 @@ onUnmounted(() => { disposed = true; requestVersion++ })
 .weak-point-stat span { color: #687d77; font-size: 12px; }
 .weak-point-stat :deep(.el-progress-bar__outer) { background: #edf3f1; }
 @media (max-width: 900px) { .question-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 1100px) { .diagnosis-heading { align-items: flex-start; flex-direction: column; gap: 18px; } }
 @media (max-width: 760px) {
   .weak-point-grid { grid-template-columns: 1fr; }
   .diagnostic-filters label { flex-basis: 100%; min-width: 0; }

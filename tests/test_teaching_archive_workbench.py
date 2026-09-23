@@ -8,6 +8,7 @@ from openpyxl import Workbook
 from auth_service import AuthService
 from campus_service import CampusService
 from database import LearningDatabase
+from ingestion_service import IngestionService
 from teacher_service import TeacherService
 from teaching_archive_service import TeachingArchiveService
 
@@ -28,6 +29,17 @@ def archive_scope(tmp_path: Path):
         "周三3-5节", "仁济", "2024", "信息管理与信息系统", "标准",
     )
     return db, teacher, course, term, class_row, TeachingArchiveService(db, campus)
+
+
+def test_scope_inference_normalizes_legacy_campus_names():
+    for path, expected in (
+        ("教案/本部24级信管.docx", "校区A"),
+        ("教案/仁济24级信管.docx", "校区B"),
+        ("教案/校区A24级信管.docx", "校区A"),
+    ):
+        scope = TeachingArchiveService._infer_scope(path)
+        assert scope["campus"] == expected
+        assert scope["cohort_year"] == "2024"
 
 
 def lesson_plan_bytes() -> bytes:
@@ -77,7 +89,7 @@ def test_legacy_doc_preview_retries_conversion_on_demand(tmp_path: Path, monkeyp
     row = service.workbench(teacher, course["course_id"])["documents"][0]
     assert row["preview_kind"] == "unavailable"
 
-    converted = tmp_path / "converted.docx"
+    converted = service.storage_root / "converted.docx"
     document = Document()
     document.add_heading("旧版 Word 预览", level=1)
     document.add_paragraph("历史档案正文")
@@ -135,17 +147,18 @@ def archive_bytes() -> bytes:
 
 def test_class_dimensions_and_lesson_plan_batch_publish(tmp_path: Path):
     _db, teacher, course, term, class_row, service = archive_scope(tmp_path)
-    assert class_row["campus"] == "仁济"
+    assert class_row["campus"] == "校区B"
     assert class_row["cohort_year"] == "2024"
     assert class_row["major"] == "信息管理与信息系统"
     batch = service.create_import_batch(
         teacher, course["course_id"], term_id=term["term_id"],
         defaults={"campus": "仁济", "cohort_year": "2024", "major": "信息管理与信息系统"},
     )
+    original = lesson_plan_bytes()
     uploaded = service.add_import_file(
         teacher, batch["batch_id"], "数据库原理与应用-第1次课-教案.docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        io.BytesIO(lesson_plan_bytes()), relative_path="教案/数据库原理与应用-第1次课-教案.docx",
+        io.BytesIO(original), relative_path="教案/数据库原理与应用-第1次课-教案.docx",
     )
     service.update_import_file(
         teacher, batch["batch_id"], uploaded["file_id"], {"class_ids": [class_row["class_id"]]},
@@ -158,6 +171,14 @@ def test_class_dimensions_and_lesson_plan_batch_publish(tmp_path: Path):
     assert lesson["structured"]["chapter"] == "第1章 数据库系统概述"
     assert lesson["structured"]["teaching_steps"][1][2] == "基本概念"
     assert any(item["record_type"] == "teaching_reflection" for item in workbench["items"])
+    document = workbench["documents"][0]
+    row, source = service.public_document(teacher, document["archive_document_id"])
+    assert row["original_name"] == "数据库原理与应用-第1次课-教案.docx"
+    assert source.read_bytes() == original
+    service.ingestion = IngestionService(_db, service.campus)
+    media_type, preview = service.preview_content(teacher, document["archive_document_id"])
+    assert media_type == "text/html"
+    assert "温州医科大学教案" in preview
 
 
 def test_schedule_and_assessment_quality_gate(tmp_path: Path):

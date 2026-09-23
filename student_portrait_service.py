@@ -64,7 +64,7 @@ class StudentPortraitService:
             all_subs = [s for s in all_subs if timestamp(s["submitted_at"]) < end and timestamp(s["submitted_at"]) <= now]
             own = [s for s in all_subs if s["student_id"] == student_id]
             ontime = [s for s in own if timestamp(s["submitted_at"]) <= due]
-            graded = ontime[-1] if ontime else None
+            graded = (ontime[0] if task["kind"] == "exam" else ontime[-1]) if ontime else None
             # Score cohorts are defined by deadline, so each task belongs to one period.
             in_period = start <= due < end
             if graded and in_period:

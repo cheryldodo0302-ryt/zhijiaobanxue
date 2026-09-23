@@ -18,6 +18,7 @@ from openpyxl import load_workbook
 
 from campus_service import MAX_UPLOAD_BYTES, CampusService, NotFound, PermissionDenied, ValidationError
 from database import LearningDatabase
+from institution_anonymization import anonymize_text
 
 
 ARCHIVE_RECORD_TYPES = {
@@ -223,8 +224,8 @@ class TeachingArchiveService:
 
     @staticmethod
     def _infer_scope(relative_path: str, sample_text: str = "") -> dict[str, str]:
-        text = f"{relative_path} {sample_text[:5000]}"
-        campus = "仁济" if "仁济" in text else ("本部" if "本部" in text else "")
+        text = anonymize_text(f"{relative_path} {sample_text[:5000]}")
+        campus = "校区B" if "校区B" in text else ("校区A" if "校区A" in text else "")
         if "信息管理与信息系统" in text or "信管" in text:
             major = "信息管理与信息系统"
         elif "生物医学工程" in text or "生工" in text:
@@ -232,7 +233,7 @@ class TeachingArchiveService:
         else:
             major = ""
         cohort = ""
-        match = re.search(r"(?:仁济?|本部)?\s*(20\d{2}|\d{2})\s*级?", text)
+        match = re.search(r"(?:校区[AB])?\s*(20\d{2}|\d{2})\s*级?", text)
         if match:
             value = match.group(1)
             cohort = value if len(value) == 4 else f"20{value}"
@@ -1682,6 +1683,9 @@ class TeachingArchiveService:
             raise ValidationError(
                 f"旧版 Word 文件无法预览：{error}。请将文件另存为 .docx 后重新上传。"
             )
+        converted = converted.resolve()
+        if self.storage_root.resolve() not in converted.parents:
+            raise ValidationError("转换文件不在受控档案目录内")
         self.db.execute(
             """UPDATE teaching_archive_documents
                SET preview_kind='docx',preview_path=?,conversion_status='ready',updated_at=CURRENT_TIMESTAMP
@@ -1698,6 +1702,14 @@ class TeachingArchiveService:
                 "conversion_status": row["conversion_status"],
                 "preview_error": "" if row["conversion_status"] == "ready" or preview_kind == "xls"
                 else "旧版 Office 转换尚不可用"}
+
+    def public_document(self, actor: dict[str, Any], archive_document_id: str) -> tuple[dict[str, Any], Path]:
+        row, _preview = self._require_document(actor, archive_document_id)
+        source = Path(row["stored_path"]).resolve()
+        allowed_roots = (self.storage_root.resolve(), self.campus.storage_dir.resolve())
+        if not any(root in source.parents for root in allowed_roots) or not source.is_file():
+            raise NotFound("教学档案原始文件不存在")
+        return row, source
 
     @staticmethod
     def _xlsx_preview_html(source: Path) -> str:

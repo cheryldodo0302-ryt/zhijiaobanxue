@@ -766,8 +766,9 @@ def teacher_teaching_archive_document_preview(
     try:
         media_type, value = teaching_archives.preview_content(user, archive_document_id)
         if isinstance(value, str):
-            return Response(value, media_type=media_type)
-        return FileResponse(value, media_type=media_type, content_disposition_type="inline")
+            return Response(value, media_type=media_type, headers={"Cache-Control": "no-store"})
+        return FileResponse(value, media_type=media_type, content_disposition_type="inline",
+                            headers={"Cache-Control": "no-store"})
     except CampusError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -777,9 +778,10 @@ def teacher_teaching_archive_document_download(
     archive_document_id: str, user: dict = Depends(current_teacher),
 ) -> FileResponse:
     try:
-        row, _preview = teaching_archives._require_document(user, archive_document_id)
-        source = Path(row["stored_path"]).resolve()
-        return FileResponse(source, media_type="application/octet-stream", filename=row["original_name"])
+        row, source = teaching_archives.public_document(user, archive_document_id)
+        return FileResponse(source, media_type="application/octet-stream",
+                            filename=row["original_name"],
+                            headers={"Cache-Control": "no-store"})
     except CampusError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -1507,7 +1509,7 @@ def student_course_documents(course_id: str, user: dict = Depends(current_studen
 @app.post("/api/v1/documents/{document_id}/preview-token")
 def document_preview_token(document_id: str, user: dict = Depends(current_ready_user)) -> dict:
     try:
-        document = ingestion.require_document_access(user, document_id)
+        document, _source = ingestion.source_file(user, document_id)
         token = auth.issue_document_token(user, document_id)
         descriptor = ingestion.preview_descriptor(user, document_id)
         return {

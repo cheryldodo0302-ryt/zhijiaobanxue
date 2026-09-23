@@ -169,7 +169,7 @@ Mock 模式会显示 `offline://deterministic-mock` 和 `SUCCESS`；其他模式
 首次使用先创建教师账号：
 
 ```powershell
-D:\anapython\python.exe scripts\create_teacher.py teacher01 --display-name "教师"
+python scripts\create_teacher.py teacher01 --display-name "教师"
 ```
 
 需要远程解析时，先在未提交的 `server.env` 中配置 MinerU/Pix2Text；随后一个命令即可启动 API、Worker 和 Vue：

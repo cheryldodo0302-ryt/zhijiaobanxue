@@ -1460,6 +1460,24 @@ MIGRATIONS += (("042_normalize_default_term_label", """
        );
 """),)
 
+MIGRATIONS += (("043_class_task_submission_limits", """
+    ALTER TABLE class_tasks ADD COLUMN max_submissions INTEGER
+        CHECK(max_submissions IS NULL OR max_submissions BETWEEN 1 AND 100);
+    UPDATE class_tasks SET max_submissions=1 WHERE kind='exam';
+"""),)
+
+MIGRATIONS += (("044_student_todos", """
+    CREATE TABLE student_todos (
+        todo_id TEXT PRIMARY KEY,
+        student_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        completed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX idx_student_todos_owner ON student_todos(student_id,completed_at,created_at);
+"""),)
+
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
     conn.commit()

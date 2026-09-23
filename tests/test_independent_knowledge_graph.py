@@ -1,4 +1,5 @@
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,10 @@ from knowledge_graph_service import KnowledgeGraphService
 from teacher_service import TeacherService
 
 
-SAMPLE_ROOT = Path(r"F:\我的桌面\wmu事务\人工智能\智慧伴学资料\智慧伴学资料\知识图谱")
+SAMPLE_ROOT = Path(os.environ.get(
+    "ZHIJIAO_GRAPH_SAMPLE_ROOT",
+    Path(__file__).resolve().parents[3] / "智慧伴学资料" / "智慧伴学资料" / "知识图谱",
+))
 
 
 def graph_scope(tmp_path: Path):

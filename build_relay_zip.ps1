@@ -17,11 +17,28 @@ if (-not $outputPath.StartsWith($projectPrefix, [StringComparison]::OrdinalIgnor
     throw "Unsafe output path: $outputPath"
 }
 
-$python = if (Test-Path "D:\anapython\python.exe") {
-    "D:\anapython\python.exe"
-} else {
-    (Get-Command python -ErrorAction Stop).Source
+$pythonArgs = @()
+$python = $null
+if ($env:ZHIJIAO_PYTHON) {
+    if (Test-Path -LiteralPath $env:ZHIJIAO_PYTHON) {
+        $python = (Resolve-Path -LiteralPath $env:ZHIJIAO_PYTHON).Path
+    } else {
+        $command = Get-Command $env:ZHIJIAO_PYTHON -ErrorAction SilentlyContinue
+        if ($command) { $python = $command.Source }
+    }
 }
+if (-not $python) {
+    $command = Get-Command python -ErrorAction SilentlyContinue
+    if ($command) { $python = $command.Source }
+}
+if (-not $python) {
+    $launcher = Get-Command py -ErrorAction SilentlyContinue
+    if ($launcher) {
+        $python = $launcher.Source
+        $pythonArgs = @("-$PythonVersion")
+    }
+}
+if (-not $python) { throw "未找到 Python，请安装 Python $PythonVersion 或设置 ZHIJIAO_PYTHON。" }
 
 if (Test-Path -LiteralPath $outputPath) {
     Remove-Item -LiteralPath $outputPath -Force
@@ -30,7 +47,7 @@ New-Item -ItemType Directory -Path $buildDir | Out-Null
 
 Write-Host "Installing isolated relay dependencies..."
 $pythonAbi = "cp" + $PythonVersion.Replace(".", "")
-& $python -m pip install `
+& $python @pythonArgs -m pip install `
     --disable-pip-version-check `
     --no-compile `
     --upgrade `

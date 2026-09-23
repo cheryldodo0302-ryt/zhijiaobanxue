@@ -12,6 +12,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from institution_anonymization import anonymize_text
 
 
 REGION_TYPES = {
@@ -831,7 +832,7 @@ class PptFastInspector:
         return (
             lowered.startswith("principle & application of dat")
             or bool(re.fullmatch(r"(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?", lowered))
-            or lowered in {"温州医科大学", "wenzhou medical university"}
+            or anonymize_text(lowered) == "某高校"
         )
 
     @staticmethod

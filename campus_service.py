@@ -450,8 +450,11 @@ class CampusService:
             # Source-file permission is separate from permission to use published
             # knowledge. Never expose raw chunk previews through Agent status.
             documents = self.db.fetch_all(
-                """SELECT d.document_id,d.original_name,d.mime_type,d.size_bytes,d.status,d.created_at
+                """SELECT d.document_id,d.original_name,d.mime_type,d.size_bytes,d.status,d.created_at,
+                          COALESCE(m.material_type,'other') material_type,
+                          COALESCE(m.tags_json,'[]') tags_json
                    FROM course_documents d
+                   LEFT JOIN document_material_metadata m USING(document_id)
                    WHERE d.course_id=? AND d.student_file_visible=1
                      AND EXISTS (
                        SELECT 1 FROM document_blocks b
@@ -463,7 +466,16 @@ class CampusService:
                    ORDER BY d.created_at DESC""", (course_id,),
             )
             from published_knowledge import document_allowed
-            return [d for d in documents if document_allowed(self.db,course_id,d['document_id'],user_id)]
+            visible = [d for d in documents if document_allowed(self.db,course_id,d['document_id'],user_id)]
+            for document in visible:
+                try:
+                    document["tags"] = json.loads(document.pop("tags_json") or "[]")
+                except (TypeError, ValueError):
+                    document["tags"] = []
+                document["material_label"] = COURSE_MATERIAL_LABELS.get(
+                    str(document.get("material_type") or "other"), "其他"
+                )
+            return visible
         return self.db.fetch_all("""SELECT d.document_id,d.original_name,d.mime_type,d.size_bytes,d.status,d.error_message,d.created_at,
                                    COUNT(c.chunk_id) chunk_count,
                                    (SELECT dc.content FROM document_chunks dc WHERE dc.document_id=d.document_id ORDER BY dc.chunk_id LIMIT 1) text_preview

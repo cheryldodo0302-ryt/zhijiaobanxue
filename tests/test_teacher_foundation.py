@@ -126,8 +126,8 @@ def test_teaching_year_period_and_class_variant_are_independent_dimensions(servi
     )
     assert term["academic_year"] == "2026-2027"
     assert term["teaching_period"] == "秋季学期"
-    assert main_campus["class_variant"] == "A班（本部）"
-    assert renji["class_variant"] == "B班（仁济）"
+    assert main_campus["class_variant"] == "A班（校区A）"
+    assert renji["class_variant"] == "B班（校区B）"
     assert {row["teaching_time_slot"] for row in teachers.list_classes(teacher)} == {
         "周一 1-2 节", "周三 3-4 节",
     }
@@ -147,7 +147,7 @@ def test_institution_profile_merges_configuration_and_history(services, monkeypa
     monkeypatch.setenv("ZHIJIAO_SCHOOL_MAJORS", "信息管理与信息系统")
     profile = teachers.institution_profile(teacher)
     assert profile["school_name"] == "测试大学"
-    assert profile["campuses"] == ["本部", "仁济", "滨海"]
+    assert profile["campuses"] == ["校区A", "校区B", "滨海"]
     assert profile["majors"] == ["信息管理与信息系统", "医学信息工程"]
 
 

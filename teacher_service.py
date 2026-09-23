@@ -15,6 +15,7 @@ from openpyxl import load_workbook
 from campus_service import CampusService, PermissionDenied, ValidationError
 from database import LearningDatabase
 from config import get_runtime_setting, get_student_default_password
+from institution_anonymization import anonymize_text
 
 
 class TeacherService:
@@ -57,15 +58,15 @@ class TeacherService:
 
         def choices(env_name: str, historical: list[str], fallback: str = "") -> list[str]:
             configured = get_runtime_setting(env_name, fallback)
-            values = [part.strip() for part in configured.split(",") if part.strip()]
-            return list(dict.fromkeys([*values, *historical]))
+            values = [anonymize_text(part.strip()) for part in configured.split(",") if part.strip()]
+            return list(dict.fromkeys([*values, *(anonymize_text(value) for value in historical)]))
 
         return {
-            "school_name": get_runtime_setting("ZHIJIAO_SCHOOL_NAME", "温州医科大学"),
+            "school_name": anonymize_text(get_runtime_setting("ZHIJIAO_SCHOOL_NAME", "某高校")),
             "campuses": choices(
                 "ZHIJIAO_SCHOOL_CAMPUSES",
                 [str(row.get("campus") or "").strip() for row in rows if row.get("campus")],
-                "本部,仁济",
+                "校区A,校区B",
             ),
             "majors": choices(
                 "ZHIJIAO_SCHOOL_MAJORS",
@@ -161,12 +162,12 @@ class TeacherService:
         term = self.db.fetch_one("SELECT * FROM terms WHERE term_id=? AND owner_id=?", (term_id, teacher_id))
         if not term:
             raise PermissionDenied("无权使用该学期")
-        class_name = class_name.strip()
+        class_name = anonymize_text(class_name.strip())
         if not class_name:
             raise ValidationError("教学班名称不能为空")
-        class_variant = class_variant.strip()[:100]
+        class_variant = anonymize_text(class_variant.strip())[:100]
         teaching_time_slot = teaching_time_slot.strip()[:120]
-        campus = campus.strip()[:100]
+        campus = anonymize_text(campus.strip())[:100]
         cohort_year = cohort_year.strip()[:32]
         major = major.strip()[:120]
         teaching_level = teaching_level.strip()[:100]
@@ -196,12 +197,12 @@ class TeacherService:
         )
         if not term:
             raise PermissionDenied("无权使用该学期")
-        class_name = str(updates.get("class_name", current["class_name"]) or "").strip()
+        class_name = anonymize_text(str(updates.get("class_name", current["class_name"]) or "").strip())
         if not class_name:
             raise ValidationError("教学班名称不能为空")
-        class_variant = str(updates.get("class_variant", current.get("class_variant")) or "").strip()[:100]
+        class_variant = anonymize_text(str(updates.get("class_variant", current.get("class_variant")) or "").strip())[:100]
         teaching_time_slot = str(updates.get("teaching_time_slot", current.get("teaching_time_slot")) or "").strip()[:120]
-        campus = str(updates.get("campus", current.get("campus")) or "").strip()[:100]
+        campus = anonymize_text(str(updates.get("campus", current.get("campus")) or "").strip())[:100]
         cohort_year = str(updates.get("cohort_year", current.get("cohort_year")) or "").strip()[:32]
         major = str(updates.get("major", current.get("major")) or "").strip()[:120]
         teaching_level = str(updates.get("teaching_level", current.get("teaching_level")) or "").strip()[:100]

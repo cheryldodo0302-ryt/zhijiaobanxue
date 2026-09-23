@@ -69,7 +69,7 @@ async function preview() {
   try {
     const { data } = await api.post(`/documents/${selectedId.value}/preview-token`, {}, { signal })
     if (token !== request) return
-    if (!['pdf', 'pptx', 'docx', 'markdown', 'text'].includes(data.preview_kind))
+    if (!['pdf', 'pptx', 'docx', 'spreadsheet', 'markdown', 'text'].includes(data.preview_kind))
       throw new Error(data.preview_error || '暂不支持此格式预览，请教师提供 PDF 或 PPTX 文件')
     const response = await fetch(data.preview_kind === 'pptx' ? data.download_url : data.preview_url, { signal, cache: 'no-store' })
     if (!response.ok) throw new Error(response.status === 403
@@ -80,7 +80,7 @@ async function preview() {
     if (token !== request) return
     kind.value = data.preview_kind
     if (props.documentId && !props.pageNumber) pageNotice.value = '来源未提供页码，已打开资料首页，请参照章节提示查找。'
-    if (props.documentId && ['text', 'markdown', 'docx'].includes(kind.value)) pageNotice.value = '此格式没有可靠的原始分页，请参照章节提示阅读。'
+    if (props.documentId && ['text', 'markdown', 'docx', 'spreadsheet'].includes(kind.value)) pageNotice.value = '此格式没有可靠的原始分页，请参照章节提示阅读。'
     if (kind.value === 'pdf') pdfUrl.value = URL.createObjectURL(body as Blob)
     else if (kind.value === 'pptx') {
       await nextTick()
@@ -123,7 +123,7 @@ onBeforeUnmount(() => { listRequest++; clearPreview() })
 <template>
   <el-card class="student-material-preview" shadow="never">
     <template v-if="!compact" #header><div class="preview-header"><b>{{ props.documentId ? '来源资料预览' : '教师发布资料预览' }}</b><el-button :loading="listing" @click="loadFiles">刷新资料</el-button></div></template>
-    <p v-if="!props.documentId" class="muted">选择教师已发布并开放原文件的资料，可直接阅读 PDF、PPTX、Word 和文本。</p>
+    <p v-if="!props.documentId" class="muted">选择教师已发布并开放原文件的资料，可直接阅读 PDF、PPTX、Word、表格和文本。</p>
     <p v-else class="muted">{{ props.sourceName }}<template v-if="props.section"> · {{ props.section }}</template></p>
     <p v-if="pageNotice" class="muted">{{ pageNotice }}</p>
     <el-alert v-if="listError" :title="listError" type="error" :closable="false" />
@@ -143,7 +143,7 @@ onBeforeUnmount(() => { listRequest++; clearPreview() })
       <div v-loading="loading" class="preview-body" element-loading-text="正在加载资料">
         <template v-if="error"><el-alert :title="error" type="error" :closable="false"/><el-button v-if="compact" @click="preview">重新预览</el-button></template>
         <iframe v-else-if="kind === 'pdf' && pdfUrl" :key="pdfPageUrl" :src="pdfPageUrl" :title="selected?.original_name || 'PDF 预览'" />
-        <iframe v-else-if="kind === 'docx'" :srcdoc="content" sandbox="" :title="selected?.original_name || 'Word 预览'" />
+        <iframe v-else-if="kind === 'docx' || kind === 'spreadsheet'" :srcdoc="content" sandbox="" :title="selected?.original_name || '资料预览'" />
         <div v-else-if="kind === 'pptx'" ref="pptHost" class="ppt-host" />
         <KnowledgeMarkdown v-else-if="kind === 'markdown'" :content="content" />
         <pre v-else-if="kind === 'text'" class="text-preview">{{ content }}</pre>

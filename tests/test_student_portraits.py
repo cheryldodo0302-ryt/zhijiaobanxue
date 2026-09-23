@@ -13,6 +13,7 @@ from database import LearningDatabase
 from ingestion_service import IngestionService
 from question_bank_service import QuestionBankService
 from student_portrait_service import StudentPortraitService
+from student_todo_service import StudentTodoService
 from teacher_service import TeacherService
 from test_reviewed_question_bank import question_workbook, XLSX_MIME
 
@@ -52,9 +53,10 @@ def world(tmp_path, monkeypatch):
     study.engine.dispose(); db.engine.dispose()
 
 
-def publish(w, kind='homework', days=1, points=(1, 1)):
+def publish(w, kind='homework', days=1, points=(1, 1), max_submissions=None):
     return w['tasks'].publish(w['teacher'], w['course'], w['classroom'], '正式测试任务', kind, w['version'],
-        stamp(w['now'][0]+timedelta(days=days)), [{'item_id':q['item_id'], 'points':p} for q,p in zip(w['items'], points)])
+        stamp(w['now'][0]+timedelta(days=days)), [{'item_id':q['item_id'], 'points':p} for q,p in zip(w['items'], points)],
+        1 if kind == 'exam' and max_submissions is None else max_submissions)
 
 
 def responses(w):
@@ -67,6 +69,46 @@ def get(w, index=0, start='2026-09-01T00:00:00+00:00', end='2026-10-01T00:00:00+
 
 def submit(w, task, index=0, key='first', answers=None):
     return w['tasks'].submit(w['students'][index], task['task_id'], key, responses(w) if answers is None else answers)
+
+
+def test_submission_limits_and_first_exam_score(world):
+    w = world
+    items = [{'item_id': q['item_id'], 'points': 1} for q in w['items']]
+    homework = w['tasks'].publish(w['teacher'], w['course'], w['classroom'], '一次作业',
+        'homework', w['version'], stamp(w['now'][0] + timedelta(days=1)), items)
+    partial = submit(w, homework, key='partial', answers={})
+    assert submit(w, homework, key='partial', answers={}) == partial
+    with pytest.raises(ValidationError, match='次数'):
+        submit(w, homework, key='second')
+    exam = publish(w, kind='exam', max_submissions=2)
+    first = submit(w, exam, key='exam-1', answers={})
+    second = submit(w, exam, key='exam-2')
+    assert first['score'] == 0 and second['score'] == 100
+    assert get(w)['metrics']['exam']['average_score'] == 0
+    with pytest.raises(ValidationError, match='次数'):
+        submit(w, exam, key='exam-3')
+
+
+def test_private_todos_and_class_task_projection(world):
+    w = world
+    service = StudentTodoService(w['campus'])
+    owner, another = w['students']
+    todo_id = service.create(owner, '复习第一章')['todo_id']
+    task = publish(w, max_submissions=2)
+    items = service.list_items(owner)
+    assert any(item['id'] == 'personal:' + todo_id and item['state'] == 'pending' for item in items)
+    assert any(item['task_id'] == task['task_id'] and item['state'] == 'pending' for item in items)
+    assert not any(item['id'] == 'personal:' + todo_id for item in service.list_items(another))
+    with pytest.raises(Exception):
+        service.set_completed(another, todo_id, True)
+    service.set_completed(owner, todo_id, True)
+    assert any(item['id'] == 'personal:' + todo_id and item['state'] == 'completed' for item in service.list_items(owner))
+    submit(w, task, answers={})
+    assert next(item for item in service.list_items(owner) if item['task_id'] == task['task_id'])['state'] == 'pending'
+    submit(w, task, key='complete')
+    assert next(item for item in service.list_items(owner) if item['task_id'] == task['task_id'])['state'] == 'completed'
+    service.delete(owner, todo_id)
+    assert not any(item['id'] == 'personal:' + todo_id for item in service.list_items(owner))
 
 
 def test_real_publication_submit_portrait_and_immutable_snapshot(world):

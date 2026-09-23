@@ -14,7 +14,6 @@
 在项目根目录打开 PowerShell：
 
 ```powershell
-cd "F:\我的桌面\wmu事务\人工智能\sysytem\zhijiao_banxue"
 .\start.ps1 -Mode all
 ```
 

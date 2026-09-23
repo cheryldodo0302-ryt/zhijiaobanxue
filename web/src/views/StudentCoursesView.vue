@@ -9,14 +9,14 @@ import StudentLearningFocus from "../components/StudentLearningFocus.vue";
 import PaperWorkspace from "../components/PaperWorkspace.vue";
 import ExpandableList from "../components/ExpandableList.vue";
 import { vStudyMotion } from "../study-motion";
-import { Setting, Share, ArrowDown, Reading, Plus, Collection, Document, FullScreen, Close } from "@element-plus/icons-vue";
-import { saveStudentDraft, readStudentDraft, clearStudentDrafts } from "../student-navigation";
+import { ArrowDown, Reading, Plus, Collection, Document, FullScreen, Close } from "@element-plus/icons-vue";
+import { saveStudentDraft, readStudentDraft } from "../student-navigation";
 import { createCardSpeech } from "../card-speech";
 import { useAuthStore } from "../stores/auth";
 import KnowledgeGraphCanvas from "../components/KnowledgeGraphCanvas.vue";
-import AiSettingsDialog from "../components/AiSettingsDialog.vue";
 import KnowledgeMarkdown from "../components/KnowledgeMarkdown.vue";
 import StudentMaterialPreview from "../components/StudentMaterialPreview.vue";
+import { buildMaterialTree, type MaterialTreeNode } from "../material-tree";
 import { readWorkspace, writeWorkspace } from "../workspace-storage";
 import {
   learningModeLabel,
@@ -50,7 +50,6 @@ function resumeLearning() {
   (target || root).focus({ preventScroll: true });
 }
 const loading = ref(false);
-const aiSettingsOpen = ref(false);
 const aiStatus = ref<any>(null);
 const uploadState = ref<UploadState>({
   stage: "idle",
@@ -112,6 +111,20 @@ const profile = ref<any>(null);
 const retrievalMaterial = ref("all");
 const documents = ref<any[]>([]);
 const previewDocumentId = ref("");
+const materialTreeProps = { children: "children", label: "label" };
+const sharedMaterialTree = computed(() => buildMaterialTree(documents.value));
+const previewTreeNodeId = computed(() => {
+  for (const category of sharedMaterialTree.value) {
+    for (const tag of category.children || []) {
+      const document = (tag.children || []).find(item => item.document_id === previewDocumentId.value);
+      if (document) return document.id;
+    }
+  }
+  return "";
+});
+function selectMaterialTreeNode(data: MaterialTreeNode) {
+  if (data.kind === "document" && data.document_id) previewDocumentId.value = data.document_id;
+}
 watch(documents, (items) => {
   if (!items.some(item => item.document_id === previewDocumentId.value))
     previewDocumentId.value = items[0]?.document_id || "";
@@ -1225,16 +1238,11 @@ async function exportWorkbook() {
   }
 }
 
-async function logout() {
-  clearStudentDrafts(draftOwner);
-  await auth.logout();
-  location.href = "/login";
-}
-function openSharingSettings() {
-  void router.push({ path: "/student/study-room", query: { sharing: "settings" } });
-}
 function updateAiStatus(settings: any) {
   aiStatus.value = settings;
+}
+function onAiSettingsChanged(event: Event) {
+  updateAiStatus((event as CustomEvent).detail);
 }
 function learningQuery(course = courseId.value, view = activeTab.value) {
   const { preview, page, source, section, ...query } = route.query;
@@ -1293,6 +1301,7 @@ watch([activeTab, questionCount, speechRate], () => {
   });
 });
 onMounted(async () => {
+  window.addEventListener("student-ai-settings-changed", onAiSettingsChanged);
   activeTab.value = normalizeStudentView(route.query.view, true);
   await loadCourses();
   const initialQuery = String(route.query.course || '') === courseId.value
@@ -1308,6 +1317,7 @@ onMounted(async () => {
   }
 });
 onUnmounted(async () => {
+  window.removeEventListener("student-ai-settings-changed", onAiSettingsChanged);
   speech?.stop();
   if (recorder?.state === "recording") recorder.stop();
   recorderStream?.getTracks().forEach((track) => track.stop());
@@ -1322,13 +1332,6 @@ onUnmounted(async () => {
     <el-dialog :model-value="Boolean(sourcePreview) && (activeTab !== 'qa' || sourceExpanded)" title="来源资料预览" width="min(1200px, 96vw)" destroy-on-close @update:model-value="!$event && (activeTab === 'qa' ? sourceExpanded = false : closeSourcePreview())">
       <StudentMaterialPreview v-if="sourcePreview" :key="sourcePreview.document_id + ':' + sourcePreview.page_number" :course-id="courseId" :document-id="sourcePreview.document_id" :page-number="sourcePreview.page_number" :source-name="sourcePreview.source_file" :section="sourcePreview.section" />
     </el-dialog>
-    <header class="student-topbar">
-      <RouterLink to="/student/courses" class="student-brand"><el-icon><Reading/></el-icon><span>智教伴学<small>以知识陪伴成长</small></span></RouterLink>
-      <nav aria-label="学生端导航"><RouterLink to="/student/courses">学习空间</RouterLink><RouterLink to="/student/study-room">自习室</RouterLink><RouterLink to="/student/tasks">班级作业 / 考试</RouterLink></nav>
-      <el-dropdown trigger="click" placement="bottom-end"><el-button class="account-menu">{{ auth.user?.display_name || auth.user?.username }}<el-icon><ArrowDown/></el-icon></el-button>
-        <template #dropdown><el-dropdown-menu><el-dropdown-item :icon="Share" @click="openSharingSettings">自习数据共享</el-dropdown-item><el-dropdown-item :icon="Setting" @click="aiSettingsOpen = true">学习服务设置</el-dropdown-item><el-dropdown-item divided @click="logout">退出</el-dropdown-item></el-dropdown-menu></template>
-      </el-dropdown>
-    </header>
     <div class="student-app-grid">
       <aside class="student-course-nav" aria-label="课程导航">
         <div class="course-nav-heading"><button class="course-nav-toggle" :aria-expanded="courseNavOpen" @click="courseNavOpen = !courseNavOpen">我的课程<el-icon><ArrowDown/></el-icon></button><el-button :icon="Plus" circle aria-label="创建个人课程" @click="showCourseCreation"/></div>
@@ -1411,7 +1414,7 @@ onUnmounted(async () => {
       v-if="!courses.length"
       description="暂无已授权课程，请联系任课教师或创建个人课程"
     />
-    <el-card v-if="!courseId" shadow="never" class="empty-course-card"
+    <el-card v-if="!courseId" shadow="never" class="empty-course-card personal-course-card"
       ><template #header><b>先创建一个属于自己的学习空间</b></template>
       <p class="muted">
         个人课程适合整理教材、讲义或自己的复习材料；内容只对你可见。
@@ -1622,34 +1625,39 @@ onUnmounted(async () => {
             description="还没有课程材料"
             :image-size="72"
           />
+          <div v-if="selectedCourse.course_type === 'shared_course' && documents.length" class="material-tree-wrap">
+            <el-tree
+              :data="sharedMaterialTree"
+              node-key="id"
+              default-expand-all
+              highlight-current
+              :current-node-key="previewTreeNodeId"
+              :props="materialTreeProps"
+              empty-text="暂无教师发布资料"
+              @node-click="selectMaterialTreeNode"
+            >
+              <template #default="{ data }">
+                <div class="material-tree-node" :class="`is-${data.kind}`">
+                  <el-icon class="material-tree-icon"><Document v-if="data.kind === 'document'" /><Collection v-else /></el-icon>
+                  <span class="material-tree-label">{{ data.label }}</span>
+                  <small v-if="data.kind !== 'document'">{{ data.count }}</small>
+                </div>
+              </template>
+            </el-tree>
+          </div>
           <div
+            v-else
             v-for="document in documents"
             :key="document.document_id"
             class="document-row"
           >
-            <button
-              v-if="selectedCourse.course_type === 'shared_course'"
-              type="button"
-              class="material-select"
-              :class="{ 'is-selected': previewDocumentId === document.document_id }"
-              :aria-pressed="previewDocumentId === document.document_id"
-              @click="previewDocumentId = document.document_id"
-            >
+            <div>
               <strong>{{ document.original_name }}</strong>
-              <span class="muted">{{ document.chunk_count }} 个文字片段 · {{ document.status }}</span>
-              <span class="document-preview">{{ document.text_preview || "点击查看材料" }}</span>
-            </button>
-            <div v-else>
-              <strong>{{ document.original_name }}</strong>
-              <p class="muted">
-                {{ document.chunk_count }} 个文字片段 · {{ document.status }}
-              </p>
               <p class="document-preview">
                 {{ document.text_preview || "暂无文字预览" }}
               </p>
             </div>
             <el-button
-              v-if="selectedCourse.course_type === 'personal_course'"
               type="danger"
               text
               @click="deleteDocument(document.document_id)"
@@ -1665,20 +1673,20 @@ onUnmounted(async () => {
           />
         </div>
         <div class="student-two-column">
-          <el-card shadow="never"
-            ><template #header><b>创建个人课程</b></template
-            ><div class="form-field"><label for="personal-newCourseName-3">课程名称</label><el-input id="personal-newCourseName-3"
-              v-model="newCourseName"
-              placeholder="例如：细胞生物学背诵"
-            /></div><div class="form-field"><label for="personal-newCourseDescription-4">课程说明（可选）</label><el-input id="personal-newCourseDescription-4"
-              v-model="newCourseDescription"
-              type="textarea"
-              :rows="3"
-              class="stack-input"
-              placeholder="课程说明（可选）"
-            /></div><el-button type="primary" @click="createPersonalCourse"
-              >创建并开始整理</el-button
-            ><el-divider
+          <el-card shadow="never" class="personal-course-card"
+            ><template #header><b>创建个人课程</b></template>
+            <div class="personal-course-form">
+              <div class="form-field">
+                <label for="personal-newCourseName-3">课程名称</label>
+                <el-input id="personal-newCourseName-3" v-model="newCourseName" placeholder="例如：细胞生物学背诵" />
+              </div>
+              <div class="form-field">
+                <label for="personal-newCourseDescription-4">课程说明（可选）</label>
+                <el-input id="personal-newCourseDescription-4" v-model="newCourseDescription" type="textarea" :rows="3" class="stack-input" placeholder="课程说明（可选）" />
+              </div>
+              <el-button type="primary" @click="createPersonalCourse">创建并开始整理</el-button>
+            </div>
+            <el-divider
               v-if="selectedCourse?.course_type === 'personal_course'"
             /><el-button
               v-if="selectedCourse?.course_type === 'personal_course'"
@@ -2381,7 +2389,6 @@ onUnmounted(async () => {
       @resume="resumeLearning" @review="startReview" @profile="activeTab = 'profile'" />
       </div>
     </div>
-    <AiSettingsDialog v-model="aiSettingsOpen" @changed="updateAiStatus" />
   </main>
 </template>
 
@@ -2399,11 +2406,14 @@ onUnmounted(async () => {
 .visible-materials{min-width:0}
 .visible-materials :deep(.el-card__body){max-height:75vh;overflow:auto}
 .materials-workspace :deep(.student-material-preview){margin-bottom:0}
-.material-select{display:grid;gap:8px;width:100%;min-width:0;padding:12px;text-align:left;font:inherit;color:inherit;background:transparent;border:1px solid var(--el-border-color);border-radius:8px;cursor:pointer;overflow-wrap:anywhere}
-.material-select:hover{background:var(--el-fill-color-light)}
-.material-select.is-selected{border-color:var(--el-color-primary);background:var(--el-color-primary-light-9)}
-.material-select:focus-visible{outline:2px solid var(--el-color-primary);outline-offset:2px}
-.material-select .document-preview{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.material-tree-wrap{padding:4px 2px 8px}
+.material-tree-wrap :deep(.el-tree){background:transparent;--el-tree-node-hover-bg-color:#f1f5ee;--el-tree-text-color:#294b3c}
+.material-tree-node{display:flex;align-items:center;gap:8px;width:100%;min-width:0;padding:4px 6px 4px 0}
+.material-tree-icon{flex:none;color:#688463}
+.material-tree-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.material-tree-node.is-category .material-tree-label{font-weight:700}
+.material-tree-node.is-tag .material-tree-label{color:#56634d}
+.material-tree-node small{margin-left:auto;color:#718174;font-variant-numeric:tabular-nums}
 @media(max-width:800px){.materials-workspace.has-preview{grid-template-columns:minmax(0,1fr)}.visible-materials :deep(.el-card__body){max-height:280px}}
 
 .student-workspace{--study-ease:cubic-bezier(.16,1,.3,1);padding-top:28px;max-width:1440px}
@@ -2425,6 +2435,12 @@ onUnmounted(async () => {
 
 /* A3: course navigation / learning canvas / evidence, with artwork outside reading areas. */
 .student-workspace{--study-ease:cubic-bezier(.16,1,.3,1);max-width:1920px!important;padding:0 22px 28px!important;margin:0 auto;background:#dfe3d5;min-height:100dvh;color:#293c30}
+.personal-course-card{align-self:start}
+.personal-course-form{display:grid;gap:18px;min-width:0;align-content:start}
+.personal-course-form>.el-button{justify-self:start;margin:2px 0 0}
+.personal-course-card :deep(.el-input__inner:focus-visible),.personal-course-card :deep(.el-textarea__inner:focus-visible){outline:none}
+.personal-course-card :deep(.el-input__wrapper.is-focus),.personal-course-card :deep(.el-textarea__inner:focus){box-shadow:0 0 0 2px #355d4b inset}
+.student-topbar{padding-inline:clamp(12px,1.5vw,26px);background:#fcfcf8}
 .student-topbar{height:78px;display:flex;align-items:center;gap:36px;border-bottom:1px solid #e0e8e3;margin-bottom:18px}.student-brand{display:flex;align-items:center;gap:12px;min-width:208px;text-decoration:none;color:#193e38;font-size:22px;font-weight:650}.student-brand>.el-icon{font-size:32px;color:#294b3c}.student-brand small{display:block;font-size:10px;font-weight:400;letter-spacing:.15em;color:#56634d;margin-top:3px}.student-topbar nav{display:flex;gap:32px;align-self:stretch;align-items:center;flex:1}.student-topbar nav a{font-size:14px;text-decoration:none;color:#56634d;height:100%;display:flex;align-items:center;position:relative;white-space:nowrap}.student-topbar nav a.router-link-active{color:#294b3c;font-weight:600}.student-topbar nav a.router-link-active::after{content:'';position:absolute;bottom:12px;left:0;right:0;height:2px;background:#294b3c;border-radius:2px}.account-menu{gap:12px;max-width:230px}.account-menu :deep(span){overflow:hidden;text-overflow:ellipsis}
 .student-app-grid{display:grid;grid-template-columns:210px minmax(0,1fr);gap:18px;align-items:start}.student-main{min-width:0}.student-course-nav{position:sticky;top:18px;min-height:calc(100dvh - 120px);max-height:calc(100dvh - 36px);display:flex;flex-direction:column;background:#fcfcf8;border:1px solid #dce1d4;border-radius:12px;padding:18px 10px 0;overflow:auto}.course-nav-heading{display:flex;align-items:center;justify-content:space-between;padding:0 6px 8px;gap:10px}.course-nav-toggle{border:0;background:none;font:inherit;font-size:15px;font-weight:600;color:#293c30;padding:4px;cursor:pointer}.course-nav-toggle .el-icon{display:none}.course-nav-group{padding:16px 0}.course-nav-group+.course-nav-group{border-top:1px solid #dce1d4}.course-nav-group h2{font-size:13px;margin:0 10px 7px}.course-nav-group p{font-size:11px;line-height:1.7;color:#56634d;margin:0 10px 12px}.course-nav-item{display:flex;align-items:center;text-align:left;gap:10px;width:100%;padding:12px 11px;border:0;border-radius:7px;margin:3px 0;background:transparent;color:#495741;font:inherit;font-size:13px;cursor:pointer;min-width:0}.course-nav-item span{overflow-wrap:anywhere;line-height:1.5}.course-nav-item .el-icon{font-size:17px;flex-shrink:0}.course-nav-item.selected{background:#e4e9da;color:#294b3c;font-weight:600}.course-nav-item:hover{background:#edf0e7}.course-nav-art{margin-top:auto;padding-top:26px;overflow:hidden}.course-nav-art>span{display:block;font-size:11px;color:#56634d;margin:0 10px 22px}.student-header{position:relative;display:flex;align-items:center;min-height:76px;margin:0 0 14px;padding:6px 16px;overflow:hidden}.student-header .page-title{display:flex;gap:20px;align-items:baseline;position:relative;z-index:1}.student-header h1{font-size:28px;letter-spacing:-.025em;margin:0}.student-header .study-artwork{position:absolute;right:0;top:-8px;width:138px;height:96px;opacity:.5}.student-header p{font-size:13px;max-width:40ch}.course-strip{margin-bottom:14px;border-color:#dce1d4;border-radius:10px}.course-strip :deep(.el-card__body){padding:12px 16px}.course-strip-main{display:flex;align-items:center;gap:12px}.course-selector{display:grid;grid-template-columns:auto minmax(150px,240px);gap:10px;align-items:center;flex:1}.course-selector>.muted{grid-column:1/-1;font-size:12px}.course-selector label{font-size:12px;font-weight:600}.learning-workspace{margin-top:0}.student-workspace-tabs :deep(.el-tabs__header){margin:0 0 14px;background:#fcfcf8;border:1px solid #dce1d4;border-radius:9px;padding:0 12px}.student-workspace-tabs :deep(.el-tabs__item){height:49px;font-size:13px;padding:0 16px}.student-workspace-tabs :deep(.el-tabs__nav-wrap::after){display:none}.student-workspace-tabs :deep(.el-tabs__active-bar){height:3px;background:#294b3c}.student-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,32%);gap:16px}.student-grid>*{min-width:0}.student-workspace-tabs :deep(.el-card){border-color:#dce1d4;border-radius:10px}.student-workspace-tabs :deep(.el-card__header){padding:16px 18px}.student-workspace-tabs :deep(.el-card__body){padding:18px}.qa-panel :deep(>.el-card__body){display:flex;flex-direction:column;min-height:480px}.qa-composer{order:5;margin-top:20px;padding-top:18px;border-top:1px solid #e4ece7}.qa-composer>label{display:block;font-size:12px;color:#56634d;margin-bottom:8px}.qa-composer>.el-select{margin-bottom:10px}.qa-composer>.form-button{margin-top:10px}.qa-welcome{margin:auto 0;padding:40px 22px;max-width:55ch}.qa-welcome>.el-icon{font-size:30px;color:#294b3c;margin-bottom:14px}.qa-welcome h2{font-size:24px;font-weight:600;margin:0 0 12px}.qa-welcome p{font-size:14px;line-height:1.8;margin:0 0 8px;color:#56634d}.qa-welcome>span{font-size:12px;color:#56634d}.dialogue{margin:0}.dialogue-row{padding:18px 16px;border-radius:8px}.dialogue-row p{font-size:14px;line-height:1.9}.dialogue-row.student{background:#eef5f2}.dialogue-row.assistant{background:transparent}.source-jump{border:1px solid #dce1d4;border-radius:8px;padding:12px;gap:12px;background:#fcfcf8}.source-jump>span{overflow-wrap:anywhere}.profile-column{display:flex;flex-direction:column;gap:16px}.profile-column :deep(.el-card){background:#fcfcf8}.source-inspector{border:1px solid #dce1d4;border-radius:10px;background:#fcfcf8;overflow:hidden}.source-inspector-heading{display:flex;justify-content:space-between;align-items:center;gap:8px;min-height:53px;padding:12px 16px;border-bottom:1px solid #e4ece7}.source-inspector-heading h2{font-size:14px;margin:0;font-weight:600}.source-inspector-heading .el-button{margin:0;padding:4px}.source-placeholder{padding:34px 22px;min-height:245px}.source-placeholder>.el-icon{font-size:32px;color:#729889}.source-placeholder h3{font-size:15px;margin:20px 0 10px}.source-placeholder p{font-size:13px;line-height:1.8;color:#56634d}.source-placeholder>span{font-size:11px;color:#56634d}.source-reference-list{padding:12px}.source-reference{width:100%;display:flex;align-items:center;gap:10px;text-align:left;font:inherit;font-size:12px;padding:14px 8px;background:transparent;border:0;border-bottom:1px solid #e4ece7;color:#294b3c;cursor:pointer}.source-reference>span:nth-child(2){flex:1;min-width:0}.source-reference strong,.source-reference small{display:block;overflow-wrap:anywhere;line-height:1.7}.source-reference small{color:#56634d}.source-inspector :deep(.student-material-preview){border:0;margin:0}.source-inspector :deep(.preview-body iframe){height:410px;min-height:260px}.source-inspector :deep(.preview-header){flex-wrap:wrap}.source-inspector :deep(.preview-header b){font-size:12px}.source-inspector :deep(.preview-pagination){flex-wrap:wrap;font-size:12px}.source-inspector :deep(.preview-toolbar){flex-wrap:wrap}.source-inspector :deep(.preview-toolbar .el-select){flex-basis:100%}.source-inspector :deep(.el-card__body){padding:14px}.card-view-switch{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}.card-view-switch>span{font-size:13px;color:#56634d}.student-workspace :deep(.learning-focus){margin-top:18px}.student-workspace :deep(.el-input__inner),.student-workspace :deep(.el-textarea__inner){caret-color:#294b3c}.student-workspace :deep(.el-textarea__inner::placeholder){color:#68705e}.student-workspace :deep(.el-input__inner::placeholder){color:#68705e}.student-workspace :deep(:focus-visible){outline:2px solid #294b3c;outline-offset:3px}.student-workspace ::selection{background:#dce3d3;color:#294b3c}
 @media(prefers-reduced-motion:no-preference){.course-nav-item{transition:background .18s,transform .22s var(--study-ease)}.course-nav-item:hover{transform:translateX(3px)}.student-workspace :deep(.el-button){transition:transform .18s var(--study-ease),background-color .18s}.student-workspace :deep(.el-button:active:not(:disabled)){transform:scale(.97)}.source-slide-enter-active,.source-slide-leave-active{transition:transform .24s var(--study-ease),opacity .18s}.source-slide-enter-from{transform:translateX(20px);opacity:0}.source-slide-leave-to{transform:translateX(8px);opacity:0}.knowledge-card{transition:transform .22s var(--study-ease)}.knowledge-card:hover{transform:translateY(-3px)}}
@@ -2439,4 +2455,5 @@ onUnmounted(async () => {
 @media(max-width:980px){.training-context-card{grid-template-columns:1fr}.training-context-select{padding:16px 0 0;border-top:1px solid #dce1d4;border-left:0}.training-layout{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:760px){.training-context-card{padding:18px}.training-context-title{align-items:flex-start;flex-direction:column;gap:6px}.training-context-title b{white-space:normal;font-size:19px}.training-panel-heading{padding:18px 16px 16px;grid-template-columns:34px minmax(0,1fr)}.training-panel-heading>.el-tag,.training-live-dot{grid-column:2;justify-self:start}.training-card-context,.training-form-block,.training-empty-state,.training-result-panel{margin-left:16px;margin-right:16px}.training-stage-list{padding-inline:16px}.training-stage-title{align-items:flex-start;flex-direction:column;gap:4px}.training-panel-heading h2{font-size:17px}}
 
+.training-form-block > .training-primary-action{margin-top:8px}
 </style>

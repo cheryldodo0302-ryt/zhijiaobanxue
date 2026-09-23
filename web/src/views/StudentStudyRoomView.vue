@@ -1,23 +1,60 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, Setting, Share } from '@element-plus/icons-vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api'
-import { useAuthStore } from '../stores/auth'
 import { BrowserStudyAnalyzer, type StudyAiResult } from '../studyRoomAi'
-import AiSettingsDialog from '../components/AiSettingsDialog.vue'
 
-const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const loading = ref(false)
 const status = ref<any>({ status: '等待开始', learning: false, score: 0, focus: 0, study_time: 0 })
 const records = ref<any[]>([])
+const todos = ref<any[]>([])
+const todoTitle = ref('')
+const todoLoading = ref(false), todoSaving = ref(false), todoError = ref(''), showFinishedTodos = ref(false)
+const pendingTodos = computed(() => todos.value.filter(item => item.state === 'pending'))
+const finishedTodos = computed(() => todos.value.filter(item => item.state !== 'pending'))
+const visibleTodos = computed(() => showFinishedTodos.value ? finishedTodos.value : pendingTodos.value)
+async function loadTodos() {
+  todoLoading.value = true
+  try { todos.value = (await api.get('/student/todos')).data; todoError.value = '' }
+  catch (error: any) {
+    todoError.value = error.response?.status === 404
+      ? '待办接口尚未加载。请确认本地 API 已更新并重新启动。'
+      : error.response?.data?.detail || (error.request ? '无法连接待办服务，请确认本地 API 已启动。' : '待办加载失败，请稍后重试。')
+  }
+  finally { todoLoading.value = false }
+}
+async function addTodo() {
+  const title = todoTitle.value.trim()
+  if (!title || todoSaving.value) return
+  todoSaving.value = true
+  try { await api.post('/student/todos', { title }); todoTitle.value = ''; showFinishedTodos.value = false; await loadTodos() }
+  catch (error: any) { ElMessage.error(error.response?.data?.detail || '添加待办失败') }
+  finally { todoSaving.value = false }
+}
+async function setTodoCompleted(item: any, completed: boolean) {
+  if (todoSaving.value) return
+  todoSaving.value = true
+  try { await api.patch(`/student/todos/${item.id.slice(9)}`, { completed }); await loadTodos() }
+  catch (error: any) { ElMessage.error(error.response?.data?.detail || '更新待办失败') }
+  finally { todoSaving.value = false }
+}
+async function deleteTodo(item: any) {
+  if (todoSaving.value) return
+  todoSaving.value = true
+  try { await api.delete(`/student/todos/${item.id.slice(9)}`); await loadTodos() }
+  catch (error: any) { ElMessage.error(error.response?.data?.detail || '删除待办失败') }
+  finally { todoSaving.value = false }
+}
+function openClassTask(item: any) {
+  void router.push({ path: '/student/tasks', query: { class_id: item.class_id, task_id: item.task_id } })
+}
+function refreshTodosOnFocus() { if (document.visibilityState === 'visible') void loadTodos() }
 const sharingScopes = ref<any[]>([]), sharingGrants = ref<any[]>([]), sharingClass = ref(''), sharingEnabled = ref(false)
 const sharingBusy = ref(false)
 const sharingDialogOpen = ref(false)
-const aiSettingsOpen = ref(false)
 async function loadSharing() {
   try {
     const [scopes, grants] = await Promise.all([api.get('/student/task-scopes'), api.get('/student/study-room/grants')])
@@ -242,16 +279,16 @@ async function clearHistory() {
   ElMessage.success('历史记录已清空')
 }
 
-async function logout() { await auth.logout(); location.href = '/login' }
-onMounted(() => { loadData(); loadSharing(); startPolling() })
-onMounted(async () => {
+onMounted(() => { loadData(); loadSharing(); loadTodos(); window.addEventListener('focus', refreshTodosOnFocus); startPolling() })
+watch(() => route.query.sharing, async () => {
   if (route.query.sharing === 'settings') {
     sharingDialogOpen.value = true
     const { sharing: _sharing, ...query } = route.query
     await router.replace({ path: route.path, query })
   }
-})
+}, { immediate: true })
 onUnmounted(() => {
+  window.removeEventListener('focus', refreshTodosOnFocus)
   if (poller) window.clearInterval(poller)
   stopStudyCamera()
   analyzer?.close()
@@ -267,16 +304,6 @@ onUnmounted(() => {
       </div>
       <div class="student-account">
         <el-button plain @click="$router.push('/student/courses')">返回课程</el-button>
-        <el-dropdown trigger="click" placement="bottom-end">
-          <el-button class="account-menu">{{ auth.user?.display_name || auth.user?.username }}<el-icon><ArrowDown /></el-icon></el-button>
-          <template #dropdown>
-            <el-dropdown-menu>
-              <el-dropdown-item :icon="Share" @click="sharingDialogOpen = true">自习数据共享</el-dropdown-item>
-              <el-dropdown-item :icon="Setting" @click="aiSettingsOpen = true">学习服务设置</el-dropdown-item>
-              <el-dropdown-item divided @click="logout">退出</el-dropdown-item>
-            </el-dropdown-menu>
-          </template>
-        </el-dropdown>
       </div>
     </header>
 
@@ -304,6 +331,7 @@ onUnmounted(() => {
         </div>
       </el-card>
 
+      <div class="study-side-column">
       <el-card shadow="never" class="study-summary-card">
         <template #header><b>我的自习概况</b></template>
         <div class="study-summary-grid">
@@ -316,6 +344,29 @@ onUnmounted(() => {
         <p class="muted small">模型在浏览器本地运行，不上传画面；后端按参考模型计算专注度、实时分和结束综合分。</p>
         <el-button text type="danger" @click="clearHistory" :disabled="!records.length">清空我的记录</el-button>
       </el-card>
+      <el-card shadow="never" class="study-todo-card" :aria-busy="todoLoading">
+        <template #header><div class="card-heading"><b>学习待办</b><span class="todo-count">{{ pendingTodos.length }} 项待完成</span></div></template>
+        <form class="todo-compose" @submit.prevent="addTodo">
+          <el-input v-model="todoTitle" maxlength="120" show-word-limit placeholder="写下一件要完成的事" aria-label="新建个人待办" :disabled="todoSaving || Boolean(todoError)" />
+          <el-button native-type="submit" type="primary" :loading="todoSaving" :disabled="!todoTitle.trim() || Boolean(todoError)">添加</el-button>
+        </form>
+        <div class="todo-switch" role="group" aria-label="待办状态">
+          <button type="button" :class="{active:!showFinishedTodos}" @click="showFinishedTodos=false">待完成 <span>{{ pendingTodos.length }}</span></button>
+          <button type="button" :class="{active:showFinishedTodos}" @click="showFinishedTodos=true">已完成 / 已结束 <span>{{ finishedTodos.length }}</span></button>
+        </div>
+        <div v-if="todoError" class="todo-error" role="status"><strong>待办暂时无法加载</strong><p>{{ todoError }}</p><el-button size="small" @click="loadTodos">重新加载</el-button></div>
+        <div v-else class="todo-list" role="list" aria-label="学习待办列表">
+          <p v-if="!todoLoading && !visibleTodos.length" class="todo-empty">{{ showFinishedTodos ? '这里还没有已完成或已结束的事项。' : '暂无待完成事项，添加一件学习计划吧。' }}</p>
+          <div v-for="item in visibleTodos" :key="item.id" class="todo-row" role="listitem">
+            <el-checkbox v-if="item.source==='personal'" :model-value="item.state==='completed'" :disabled="todoSaving" :aria-label="`${item.state==='completed'?'取消完成':'完成'}：${item.title}`" @change="setTodoCompleted(item, Boolean($event))" />
+            <span v-else class="todo-kind" :class="item.kind">{{ item.kind==='exam'?'考试':'作业' }}</span>
+            <div class="todo-copy"><strong :class="{done:item.state!=='pending'}">{{ item.title }}</strong><small v-if="item.source==='class_task'">{{ item.course_name }} · 截止 {{ new Date(item.due_at).toLocaleString('zh-CN') }} · {{ item.state==='closed'?'已结束':item.state==='completed'?'已完成':item.submission_count ? '部分提交，待完成' : '待提交' }}</small><small v-else>个人待办</small></div>
+            <el-button v-if="item.source==='class_task'" text type="primary" @click="openClassTask(item)">查看</el-button>
+            <el-button v-else text type="danger" :disabled="todoSaving" :aria-label="`删除：${item.title}`" @click="deleteTodo(item)">删除</el-button>
+          </div>
+        </div>
+      </el-card>
+      </div>
     </section>
 
     <el-card shadow="never" class="study-history-card">
@@ -363,7 +414,6 @@ onUnmounted(() => {
         <el-button v-if="sharingEnabled && sharingClass" type="primary" :loading="sharingBusy" :disabled="isLearning" @click="saveSharingGrant">保存授权</el-button>
       </template>
     </el-dialog>
-    <AiSettingsDialog v-model="aiSettingsOpen" />
   </main>
 </template>
 
@@ -373,9 +423,17 @@ onUnmounted(() => {
 .student-study-room>.student-header .page-title{min-width:0}.student-study-room>.student-header h1{margin:0 0 8px;color:var(--study-ink);font-size:clamp(30px,4vw,42px);letter-spacing:-.035em;line-height:1.12}.student-study-room>.student-header p{max-width:62ch;margin:0;color:var(--study-muted);font-size:14px;line-height:1.8}.student-account{display:flex;align-items:center;gap:10px;flex-shrink:0}.account-menu{gap:9px;max-width:180px}.account-menu :deep(span){overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .study-room-hero{margin:0 0 24px!important;padding:30px 32px!important;border-radius:16px!important;background:linear-gradient(135deg,#f1f6f0 0%,#fcfcf8 72%)!important;box-shadow:0 18px 34px -28px rgba(41,75,60,.6)!important}.study-room-hero h2{margin:0 0 9px!important;font-size:clamp(22px,3vw,30px)!important;line-height:1.35!important;letter-spacing:-.02em}.study-room-warning{margin:0!important;color:#8b5b28!important;font-size:14px;line-height:1.75}.study-room-privacy{margin:6px 0 0;color:#657268;font-size:12px;line-height:1.7}.study-room-actions{padding-top:2px}.study-room-actions :deep(.el-button){min-width:118px;min-height:42px}
 .study-room-layout{gap:24px!important}.study-camera-card,.study-summary-card,.study-history-card{border-radius:14px!important;overflow:hidden}.study-camera-card :deep(.el-card__header),.study-summary-card :deep(.el-card__header),.study-history-card :deep(.el-card__header){padding:18px 22px;border-bottom-color:#e5ebe3}.study-camera-card :deep(.el-card__body),.study-summary-card :deep(.el-card__body),.study-history-card :deep(.el-card__body){padding:22px}.study-video-placeholder{min-height:300px}.study-metrics>div,.study-summary-grid>div{padding:16px!important;border:1px solid #e3ebe3;background:#f4f8f4!important}.study-history-card{margin-top:24px!important}.study-history-card :deep(.el-table th.el-table__cell){background:#f4f7f1;color:#52665a}.study-history-card :deep(.el-table td.el-table__cell),.study-history-card :deep(.el-table th.el-table__cell){padding:13px 0}
+.study-room-layout{align-items:stretch}.study-side-column{min-width:0;min-height:0;contain:size;display:grid;grid-template-rows:auto minmax(0,1fr);gap:24px}.study-todo-card{min-height:0;border-radius:14px!important;display:flex;flex-direction:column}.study-todo-card :deep(.el-card__header){padding:18px 22px;border-bottom-color:#e5ebe3}.study-todo-card :deep(.el-card__body){display:flex;flex:1;flex-direction:column;gap:14px;min-height:0;padding:18px 22px}.todo-count{font-size:12px;color:#657268;font-variant-numeric:tabular-nums}.todo-compose{display:flex;gap:8px}.todo-compose .el-input{min-width:0}.todo-compose .el-button{flex:none}.todo-switch{display:flex;gap:16px;border-bottom:1px solid #e5ebe3}.todo-switch button{border:0;border-bottom:2px solid transparent;background:none;color:#657268;padding:3px 0 9px;font:inherit;font-size:12px;cursor:pointer}.todo-switch button.active{color:#294b3c;border-bottom-color:#294b3c;font-weight:650}.todo-switch span{font-variant-numeric:tabular-nums}.todo-list{min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-color:#b9c9bd transparent;scrollbar-width:thin}.todo-row{display:flex;align-items:center;gap:10px;min-width:0;padding:10px 0}.todo-row+.todo-row{border-top:1px solid #edf0e9}.todo-row .el-button{margin-left:auto;flex:none}.todo-copy{display:grid;gap:4px;min-width:0;flex:1}.todo-copy strong{font-size:13px;font-weight:600;color:#294b3c;line-height:1.45;overflow-wrap:anywhere}.todo-copy strong.done{color:#657268;text-decoration:line-through}.todo-copy small{font-size:11px;color:#657268;line-height:1.4}.todo-kind{display:grid;place-items:center;flex:none;min-width:36px;padding:3px 5px;border-radius:6px;background:#e3ece6;color:#294b3c;font-size:11px;font-weight:700}.todo-kind.exam{background:#f5e9dd;color:#805b37}.todo-empty{margin:auto 0;padding:14px 0;color:#657268;font-size:13px;line-height:1.6}.todo-switch button:focus-visible{outline:2px solid #294b3c;outline-offset:3px}
+.study-video-placeholder{aspect-ratio:auto;height:clamp(300px,34vw,510px)}
+.study-camera-card{align-self:start}
+.todo-compose :deep(.el-input__inner:focus-visible){outline:none}
+.todo-compose .el-input:focus-within{outline:2px solid #355d4b;outline-offset:-2px;border-radius:6px}
+.todo-error{display:flex;flex:1;min-height:0;overflow-y:auto;flex-direction:column;align-items:flex-start;gap:7px;padding:10px 12px;border:1px solid #e2e8df;border-radius:8px;background:#f7f8f4;color:#4b6255;font-size:12px}
+.todo-error p{margin:0;line-height:1.5}
 .sharing-dialog-body{display:grid;gap:18px}.sharing-dialog-intro{padding:4px 2px 0}.sharing-dialog-kicker{display:block;margin-bottom:8px;color:#657f67;font-size:11px;letter-spacing:.12em;font-weight:700}.sharing-dialog-intro h2{margin:0 0 8px;color:#294b3c;font-size:22px;line-height:1.35}.sharing-dialog-intro p,.sharing-dialog-note{margin:0;color:#657268;font-size:13px;line-height:1.85}.sharing-dialog-section{display:grid;gap:12px;padding-top:16px;border-top:1px solid #e5ebe3}.sharing-section-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px}.sharing-scope-select{width:100%}.sharing-grants-list{display:grid;gap:8px}.sharing-grant-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 14px;border:1px solid #dce6dc;border-radius:10px;background:#f8fbf7}.sharing-grant-row>div{display:grid;gap:3px;min-width:0}.sharing-grant-row strong{color:#294b3c;font-size:14px}.sharing-grant-row span{color:#657268;font-size:12px}.sharing-dialog-note{padding:12px 14px;border-radius:10px;background:#f4f6ee;color:#68705e;font-size:12px}
 @media(prefers-reduced-motion:no-preference){.student-study-room>.student-header,.study-room-hero,.study-room-layout,.study-history-card{animation:study-room-enter .42s cubic-bezier(.16,1,.3,1) both}.study-room-hero{animation-delay:.04s}.study-room-layout{animation-delay:.08s}.study-history-card{animation-delay:.12s}.sharing-grant-row{transition:transform .2s cubic-bezier(.16,1,.3,1),border-color .18s,background-color .18s}.sharing-grant-row:hover{transform:translateY(-2px);border-color:#9dbba8;background:#f4faf4}}
 @keyframes study-room-enter{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-@media(max-width:760px){.student-study-room{padding:20px 14px 36px}.student-study-room>.student-header{display:block;padding:20px 18px}.student-account{justify-content:flex-start;margin-top:16px;flex-wrap:wrap}.student-study-room>.student-header h1{font-size:30px}.study-room-hero{padding:24px 20px!important}.study-room-actions{margin-top:18px}.study-room-layout{grid-template-columns:1fr}.study-camera-card :deep(.el-card__body),.study-summary-card :deep(.el-card__body),.study-history-card :deep(.el-card__body){padding:16px}.sharing-grant-row{align-items:flex-start;flex-direction:column;gap:8px}}
+@media(max-width:1280px){.study-room-layout{grid-template-columns:1fr!important}.study-side-column{contain:none;grid-template-rows:auto auto}.todo-list{max-height:340px}.study-todo-card{min-height:290px}}
+@media(max-width:760px){.student-study-room{padding:20px 14px 36px}.student-study-room>.student-header{display:block;padding:20px 18px}.student-account{justify-content:flex-start;margin-top:16px;flex-wrap:wrap}.student-study-room>.student-header h1{font-size:30px}.study-room-hero{padding:24px 20px!important}.study-room-actions{margin-top:18px}.study-room-layout{grid-template-columns:1fr}.study-camera-card :deep(.el-card__body),.study-summary-card :deep(.el-card__body),.study-history-card :deep(.el-card__body),.study-todo-card :deep(.el-card__body){padding:16px}.sharing-grant-row{align-items:flex-start;flex-direction:column;gap:8px}}
 @media(prefers-reduced-motion:reduce){.student-study-room>.student-header,.study-room-hero,.study-room-layout,.study-history-card{animation:none}}
 </style>
