@@ -18,7 +18,11 @@ PROJECT_PREFIX = ""
 FORBIDDEN_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".pem", ".key"}
 FORBIDDEN_NAMES = {"server.env", "user_ai.env", "relay_client.env", "demo_credentials.txt"}
 SECRET_PATTERNS = (
-    re.compile(rb"sk-[A-Za-z0-9_-]{16,}"),
+    # Require a long contiguous key body and token boundaries. This avoids
+    # treating CSS classes such as ``task-selection-heading`` as ``sk-*`` keys.
+    re.compile(
+        rb"(?<![A-Za-z0-9_-])sk-(?:(?:proj|live|admin)-)?[A-Za-z0-9]{20,}(?![A-Za-z0-9_-])"
+    ),
     re.compile(
         rb"(?im)^[ \t]*(?:DASHSCOPE_API_KEY|ZHIJIAO_RELAY_TOKEN|ZHIJIAO_CUSTOM_API_KEY|"
         rb"ZHIJIAO_JWT_SECRET)[ \t]*=[ \t]*(?![ \t]*(?:$|replace|example|your|<|\xe4\xbd\xa0\xe7\x9a\x84|\xe4\xb8\x8a\xe4\xb8\x80\xe6\xad\xa5))[^\s#]{12,}"
