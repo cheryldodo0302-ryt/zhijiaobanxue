@@ -72,12 +72,14 @@ https://你的中转域名/health
 
 应返回 `{"status":"ok"}`。
 
-### 使用 `cheryldodo0302.xyz` 自定义域名
+### 使用自定义域名（示例：`example.com`）
+
+以下域名仅为示例，部署时请替换为自己持有的域名。
 
 自定义域名只改变访问入口，不会恢复函数计算免费额度。额度耗尽后，必须为原函数
 开通按量付费/资源包，或把 relay 迁移到仍有计算资源的服务器。
 
-建议使用子域名 `api.cheryldodo0302.xyz`：
+建议使用子域名 `api.example.com`：
 
 1. 在函数计算控制台打开对应函数，进入“自定义域名”，复制控制台给出的公网
    CNAME 目标（通常形如 `<account-id>.cn-beijing.fc.aliyuncs.com`）。
@@ -87,14 +89,14 @@ https://你的中转域名/health
    DNSSEC/删除旧 DS。
 3. Cloudflare 中添加 `CNAME api -> FC 公网 CNAME`，首次必须使用灰云
    **DNS only**。等 FC 完成域名校验后再考虑切为橙云。
-4. 回到 FC 创建 `api.cheryldodo0302.xyz` 自定义域名，将路径 `/*` 路由到 relay
+4. 回到 FC 创建 `api.example.com` 自定义域名，将路径 `/*` 路由到 relay
    函数和当前版本，并配置与该子域名匹配的 HTTPS 证书。
-5. 验证 `https://api.cheryldodo0302.xyz/health` 返回 `{"status":"ok"}`。如开启
+5. 验证 `https://api.example.com/health` 返回 `{"status":"ok"}`。如开启
    Cloudflare 橙云，将 SSL/TLS 模式设置为 **Full (strict)**。
 6. 最后把 `relay_client.env` 中的地址改成：
 
 ```text
-ZHIJIAO_RELAY_URL=https://api.cheryldodo0302.xyz/compatible-mode/v1
+ZHIJIAO_RELAY_URL=https://api.example.com/compatible-mode/v1
 ```
 
 中国内地地域的 FC 自定义域名需要完成 ICP 备案；Cloudflare 免费版不提供中国大陆

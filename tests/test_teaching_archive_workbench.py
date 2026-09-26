@@ -25,16 +25,18 @@ def archive_scope(tmp_path: Path):
         teacher, "2025-2026 第一学期", academic_year="2025-2026", teaching_period="第一学期"
     )
     class_row = teachers.create_class(
-        teacher, course["course_id"], term["term_id"], "仁24信管1", "A班",
-        "周三3-5节", "仁济", "2024", "信息管理与信息系统", "标准",
+        teacher, course["course_id"], term["term_id"], "校区B24信管1", "A班",
+        "周三3-5节", "校区B", "2024", "信息管理与信息系统", "标准",
     )
     return db, teacher, course, term, class_row, TeachingArchiveService(db, campus)
 
 
-def test_scope_inference_normalizes_legacy_campus_names():
+def test_scope_inference_normalizes_private_campus_aliases(monkeypatch):
+    monkeypatch.setenv("ZHIJIAO_LEGACY_CAMPUS_A_NAMES", "旧甲校区")
+    monkeypatch.setenv("ZHIJIAO_LEGACY_CAMPUS_B_NAMES", "旧乙校区")
     for path, expected in (
-        ("教案/本部24级信管.docx", "校区A"),
-        ("教案/仁济24级信管.docx", "校区B"),
+        ("教案/旧甲校区24级信管.docx", "校区A"),
+        ("教案/旧乙校区24级信管.docx", "校区B"),
         ("教案/校区A24级信管.docx", "校区A"),
     ):
         scope = TeachingArchiveService._infer_scope(path)
@@ -44,13 +46,13 @@ def test_scope_inference_normalizes_legacy_campus_names():
 
 def lesson_plan_bytes() -> bytes:
     document = Document()
-    document.add_heading("温州医科大学教案", level=1)
+    document.add_heading("某高校教案", level=1)
     table = document.add_table(rows=4, cols=2)
     for row, values in zip(table.rows, (
         ("课程名称", "数据库原理与应用"),
-        ("授课对象", "仁济24级信管"),
-        ("授课教师", "刘老师"),
-        ("教师单位", "温州医科大学"),
+        ("授课对象", "校区B24级信管"),
+        ("授课教师", "测试教师"),
+        ("教师单位", "某高校"),
     )):
         for cell, value in zip(row.cells, values):
             cell.text = value
@@ -115,11 +117,11 @@ def test_legacy_doc_preview_retries_conversion_on_demand(tmp_path: Path, monkeyp
 def schedule_bytes() -> bytes:
     workbook = Workbook()
     sheet = workbook.active
-    sheet.title = "仁24信管"
-    sheet.append(["温州医科大学教学进度表"])
+    sheet.title = "校区B24信管"
+    sheet.append(["某高校教学进度表"])
     sheet.append(["周次", "日期", "星期", "节次", "课程名称", "授课班级", "理论/实验学时", "理论/实验授课内容", "教师", "授课性质"])
-    sheet.append([1, "2025-09-10", "三", "3-5", "数据库原理与应用", "仁24信管1", 3, "数据库系统概述", "刘老师", "理论"])
-    sheet.append([2, "2025-09-17", "三", "8-11", "数据库原理与应用", "仁24信管1", 4, "SQL管理器简单应用", "刘老师", "实验"])
+    sheet.append([1, "2025-09-10", "三", "3-5", "数据库原理与应用", "校区B24信管1", 3, "数据库系统概述", "测试教师", "理论"])
+    sheet.append([2, "2025-09-17", "三", "8-11", "数据库原理与应用", "校区B24信管1", 4, "SQL管理器简单应用", "测试教师", "实验"])
     stream = io.BytesIO()
     workbook.save(stream)
     return stream.getvalue()
@@ -152,7 +154,7 @@ def test_class_dimensions_and_lesson_plan_batch_publish(tmp_path: Path):
     assert class_row["major"] == "信息管理与信息系统"
     batch = service.create_import_batch(
         teacher, course["course_id"], term_id=term["term_id"],
-        defaults={"campus": "仁济", "cohort_year": "2024", "major": "信息管理与信息系统"},
+        defaults={"campus": "校区B", "cohort_year": "2024", "major": "信息管理与信息系统"},
     )
     original = lesson_plan_bytes()
     uploaded = service.add_import_file(
@@ -178,7 +180,7 @@ def test_class_dimensions_and_lesson_plan_batch_publish(tmp_path: Path):
     service.ingestion = IngestionService(_db, service.campus)
     media_type, preview = service.preview_content(teacher, document["archive_document_id"])
     assert media_type == "text/html"
-    assert "温州医科大学教案" in preview
+    assert "某高校教案" in preview
 
 
 def test_schedule_and_assessment_quality_gate(tmp_path: Path):
@@ -187,7 +189,7 @@ def test_schedule_and_assessment_quality_gate(tmp_path: Path):
     schedule = service.add_import_file(
         teacher, batch["batch_id"], "2025-2026教学进度.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        io.BytesIO(schedule_bytes()), relative_path="教学进度/仁济/信管/2025-2026教学进度.xlsx",
+        io.BytesIO(schedule_bytes()), relative_path="教学进度/校区B/信管/2025-2026教学进度.xlsx",
     )
     assessment = service.add_import_file(
         teacher, batch["batch_id"], "考核标准及内容.txt", "text/plain",

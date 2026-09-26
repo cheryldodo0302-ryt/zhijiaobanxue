@@ -183,21 +183,21 @@ def test_docx_supports_safe_browser_preview_without_libreoffice(tmp_path, monkey
 def test_uploaded_document_source_and_preview_keep_original_text(tmp_path):
     _, campus, teacher, course = teacher_scope(tmp_path)
     document = Document()
-    document.add_paragraph("温州医科大学 · 本部 · 仁济")
+    document.add_paragraph("某高校 · 校区A · 校区B")
     stream = io.BytesIO()
     document.save(stream)
     original = stream.getvalue()
     service = IngestionService(campus.db, campus)
     job = service.queue_document(
-        teacher, course["course_id"], "仁济教材.docx",
+        teacher, course["course_id"], "校区B教材.docx",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document", original,
     )
     row, source = service.source_file(teacher, job["document_id"])
-    assert row["original_name"] == "仁济教材.docx"
+    assert row["original_name"] == "校区B教材.docx"
     assert source.read_bytes() == original
     media_type, preview = service.preview_file(teacher, job["document_id"])
     assert media_type == "text/html"
-    assert "温州医科大学 · 本部 · 仁济" in preview
+    assert "某高校 · 校区A · 校区B" in preview
 
 
 def test_pptx_groups_consecutive_same_titles_and_exposes_slide_numbers(tmp_path, monkeypatch):
@@ -460,10 +460,10 @@ def test_teaching_archive_upload_can_target_one_or_multiple_classes(tmp_path):
         teacher, "2026-2027 秋季", academic_year="2026-2027", teaching_period="秋季学期"
     )
     class_a = teachers.create_class(
-        teacher, course["course_id"], term["term_id"], "数据库A班", "A班（本部）"
+        teacher, course["course_id"], term["term_id"], "数据库A班", "A班（校区A）"
     )
     class_b = teachers.create_class(
-        teacher, course["course_id"], term["term_id"], "数据库B班", "B班（仁济）"
+        teacher, course["course_id"], term["term_id"], "数据库B班", "B班（校区B）"
     )
     service = IngestionService(db, campus)
     job = service.queue_teaching_archive_document_stream(

@@ -7,6 +7,7 @@ import StudyArtwork from "../components/StudyArtwork.vue";
 import StudyCardDeck from "../components/StudyCardDeck.vue";
 import StudentLearningFocus from "../components/StudentLearningFocus.vue";
 import PaperWorkspace from "../components/PaperWorkspace.vue";
+import { questionOptions } from "../question-display";
 import ExpandableList from "../components/ExpandableList.vue";
 import { vStudyMotion } from "../study-motion";
 import { ArrowDown, Reading, Plus, Collection, Document, FullScreen, Close } from "@element-plus/icons-vue";
@@ -2122,8 +2123,8 @@ onUnmounted(async () => {
             :subtitle="`题库版本 ${publishedBank.version_number} · 共 ${publishedBank.items.length} 题`" :items="publishedBank.items"
             :answered="publishedBank.items.map((_:any,index:number)=>Array.isArray(publishedResponses[index]) ? publishedResponses[index].length>0 : publishedResponses[index]!=null && String(publishedResponses[index]).trim()!=='')" :disabled="loading">
             <template #answer="{item,index}">
-              <el-checkbox-group v-if="isMultiple(item)" v-model="publishedResponses[index]" :disabled="loading"><el-checkbox v-for="option in item.options || []" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-checkbox></el-checkbox-group>
-              <el-radio-group v-else-if="isChoice(item)" v-model="publishedResponses[index]" :disabled="loading"><el-radio v-for="option in item.options || ['正确', '错误']" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-radio></el-radio-group>
+              <el-checkbox-group v-if="isMultiple(item)" v-model="publishedResponses[index]" :disabled="loading"><el-checkbox v-for="option in questionOptions(item)" :key="option.key" :value="option.key">{{ option.text }}</el-checkbox></el-checkbox-group>
+              <el-radio-group v-else-if="isChoice(item)" v-model="publishedResponses[index]" :disabled="loading"><el-radio v-for="option in questionOptions(item)" :key="option.key" :value="option.key">{{ option.text }}</el-radio></el-radio-group>
               <el-input v-else v-model="publishedResponses[index]" type="textarea" :rows="4" placeholder="请输入答案" :aria-label="`第 ${index+1} 题答案`" :disabled="loading" />
             </template>
             <template #submit><el-button type="primary" :loading="loading" @click="submitPublishedBank">提交本次答案</el-button></template>
@@ -2173,8 +2174,8 @@ onUnmounted(async () => {
           <PaperWorkspace v-else title="专项练习" subtitle="完成后统一提交，查看本次练习反馈。" :items="memoryQuestions"
             :answered="memoryQuestions.map((_:any,index:number)=>Array.isArray(memoryResponses[index]) ? memoryResponses[index].length>0 : memoryResponses[index]!=null && String(memoryResponses[index]).trim()!=='')" :disabled="loading">
             <template #answer="{item,index}">
-              <el-checkbox-group v-if="isMultiple(item)" v-model="memoryResponses[index]" :disabled="loading"><el-checkbox v-for="option in item.options || []" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-checkbox></el-checkbox-group>
-              <el-radio-group v-else-if="isChoice(item)" v-model="memoryResponses[index]" :disabled="loading"><el-radio v-for="option in item.options || ['正确','错误']" :key="option.key || option" :value="option.key || option">{{ option.text || option }}</el-radio></el-radio-group>
+              <el-checkbox-group v-if="isMultiple(item)" v-model="memoryResponses[index]" :disabled="loading"><el-checkbox v-for="option in questionOptions(item)" :key="option.key" :value="option.key">{{ option.text }}</el-checkbox></el-checkbox-group>
+              <el-radio-group v-else-if="isChoice(item)" v-model="memoryResponses[index]" :disabled="loading"><el-radio v-for="option in questionOptions(item)" :key="option.key" :value="option.key">{{ option.text }}</el-radio></el-radio-group>
               <el-input v-else v-model="memoryResponses[index]" type="textarea" :rows="4" placeholder="请输入简答内容" :aria-label="`第 ${index+1} 题答案`" :disabled="loading" />
             </template>
             <template #submit><el-button type="primary" :loading="loading" @click="submitMemoryQuestions">提交并查看批改</el-button></template>

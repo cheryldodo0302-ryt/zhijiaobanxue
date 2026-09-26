@@ -41,7 +41,7 @@ const taskVersionId = ref('')
 const taskSelectedItems = ref<any[]>([])
 const taskTitle = ref('')
 const taskKind = ref('homework')
-const taskMaxSubmissions = ref<number | null>(1)
+const taskMaxSubmissions = ref<number | 'unlimited'>(1)
 const taskDue = ref('')
 const taskPoints = ref<Record<string, number>>({})
 const classTasks = ref<any[]>([])
@@ -158,6 +158,7 @@ async function openTaskPublish() {
   if (!courseId.value) return ElMessage.warning('请先选择课程')
   taskDialogOpen.value = true
   if (!classes.value.length) await changeCourse()
+  if (classId.value) await changeClass()
 }
 function focusQuestionBank() {
   document.getElementById('question-bank-import')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -338,6 +339,7 @@ async function publish(folderId = importFolderId.value) {
     })).data
     ElMessage.success(`题库 v${result.version_number} 已发布到课程学生端`)
     await changeCourse()
+    if (classId.value) await changeClass()
   } catch (error) { fail(error, '题库发布失败') }
 }
 async function publishTask() {
@@ -352,7 +354,7 @@ async function publishTask() {
     await api.post(`/teacher/courses/${courseId.value}/classes/${classId.value}/tasks`, {
       title: taskTitle.value.trim(),
       kind: taskKind.value,
-      max_submissions: taskMaxSubmissions.value,
+      max_submissions: taskMaxSubmissions.value === 'unlimited' ? null : taskMaxSubmissions.value,
       version_id: taskVersionId.value,
       due_at: dueAt.toISOString(),
       items: taskSelectedItems.value.map(item => ({ item_id: item.item_id, points: taskPoints.value[item.item_id] ?? 1 })),
@@ -563,7 +565,7 @@ onMounted(loadBase)
     <el-dialog v-model="taskDialogOpen" title="发布班级作业 / 考试" width="min(1080px, 94vw)" top="5vh" :close-on-click-modal="false" destroy-on-close>
       <div class="task-dialog-intro">
         <div><h3>从已发布题库组建班级任务</h3></div>
-        <el-tag type="warning" effect="plain">班级级发布</el-tag>
+        <el-tag type="warning" effect="plain">班级发布</el-tag>
       </div>
       <el-alert v-if="!classes.length && !taskLoading" type="warning" :closable="false" show-icon title="当前课程还没有可用教学班，请先到“教学管理”创建教学班并添加学生。" />
       <el-form v-else label-position="top" class="task-dialog-form" :disabled="taskPublishing">
@@ -579,7 +581,7 @@ onMounted(loadBase)
         </el-form-item>
         <el-form-item label="最多提交次数">
           <el-select v-model="taskMaxSubmissions" filterable>
-            <el-option v-if="taskKind==='homework'" label="不限次数" :value="null" />
+            <el-option v-if="taskKind==='homework'" label="不限次数" value="unlimited" />
             <el-option v-for="count in 100" :key="count" :label="`${count} 次`" :value="count" />
           </el-select>
         </el-form-item>
@@ -601,7 +603,7 @@ onMounted(loadBase)
       <el-table v-else :key="taskVersionId" v-loading="taskLoading" :data="taskSourceItems" max-height="330" empty-text="请选择已发布题库；暂无可用题目时请先审核并发布客观题" @selection-change="taskSelectedItems=$event">
         <el-table-column type="selection" width="52" />
         <el-table-column prop="stem_markdown" label="题目" min-width="360" show-overflow-tooltip />
-        <el-table-column label="分值" width="150"><template #default="scope"><el-input-number :model-value="taskPoints[scope.row.item_id] ?? 1" :min="0.01" :max="1000" :precision="2" @update:model-value="taskPoints[scope.row.item_id]=$event ?? 1" /></template></el-table-column>
+        <el-table-column label="分值" width="210"><template #default="scope"><el-input-number class="task-points-input" :model-value="taskPoints[scope.row.item_id] ?? 1" :min="0.01" :max="1000" :precision="2" @update:model-value="taskPoints[scope.row.item_id]=$event ?? 1" /></template></el-table-column>
       </el-table>
       <div v-if="classId && taskSelectedItems.length" class="task-selection-summary">已选择 {{ taskSelectedItems.length }} 道题，将发布到“{{ selectedClass?.class_name }}”。</div>
       <el-divider v-if="classId" />
@@ -654,6 +656,7 @@ onMounted(loadBase)
 @media(max-width:700px){.question-sidebar .folder-board{grid-template-columns:1fr}.question-head{gap:8px}.upload-row>*{max-width:100%}}
 
 .task-dialog-intro,.task-selection-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.task-dialog-intro h3,.task-dialog-intro p,.task-selection-heading h3,.task-selection-heading p{margin:0}.task-dialog-intro p,.task-selection-heading p{margin-top:6px;color:#687d77;font-size:13px;line-height:1.6}.task-dialog-form{display:grid;grid-template-columns:1.2fr .8fr 1.2fr .9fr;gap:14px;margin-top:18px}.task-dialog-form :deep(.el-form-item){min-width:0;margin-bottom:0}.task-dialog-form :deep(.el-select),.task-dialog-form :deep(.el-date-editor){width:100%}.class-option-meta{float:right;margin-left:24px;color:#81938f}.task-selection-heading{align-items:center;margin-bottom:12px}.task-selection-heading>.el-select{width:310px;max-width:100%}.task-selection-summary{margin-top:12px;padding:10px 12px;border-radius:9px;background:#edf8f5;color:#365b55;font-size:13px}.published-task-list{display:grid;gap:10px}.published-task-list .task-selection-heading{margin-bottom:0}.task-dialog-intro+.el-alert{margin-top:18px}
+.task-points-input{width:100%}
 @media(max-width:900px){.task-dialog-form{grid-template-columns:1fr 1fr}.task-selection-heading{align-items:flex-start;flex-direction:column}.task-selection-heading>.el-select{width:100%}}
 @media(max-width:560px){.task-dialog-form{grid-template-columns:1fr}.task-dialog-intro{flex-direction:column}}
 </style>

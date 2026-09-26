@@ -13,7 +13,7 @@ const range = ref<[string, string]>(['', ''])
 const students = ref<any[]>([]), portrait = ref<any>(null), tasks = ref<any[]>([]), sources = ref<any[]>([])
 const loading = ref(false), publishing = ref(false), evaluating = ref(false), error = ref('')
 const activeTab = ref('portraits'), title = ref(''), kind = ref('homework'), due = ref(''), versionId = ref('')
-const maxSubmissions = ref<number | null>(1)
+const maxSubmissions = ref<number | 'unlimited'>(1)
 const selectedItems = ref<any[]>([])
 const publishAttempted = ref(false)
 let epoch = 0, detailEpoch = 0, timer: number | undefined, disposed = false
@@ -98,7 +98,7 @@ async function publish() {
   if (!title.value.trim() || !versionId.value || !due.value || !selectedItems.value.length) { ElMessage.warning('请填写任务名称、题库、题目和截止时间'); return }
   publishing.value = true
   try {
-    await api.post(`${prefix.value}/tasks`, { title: title.value, kind: kind.value, max_submissions: maxSubmissions.value, version_id: versionId.value, due_at: new Date(due.value).toISOString(), items: selectedItems.value.map(q => ({ item_id: q.item_id, points: points.value[q.item_id] ?? 1 })) })
+    await api.post(`${prefix.value}/tasks`, { title: title.value, kind: kind.value, max_submissions: maxSubmissions.value === 'unlimited' ? null : maxSubmissions.value, version_id: versionId.value, due_at: new Date(due.value).toISOString(), items: selectedItems.value.map(q => ({ item_id: q.item_id, points: points.value[q.item_id] ?? 1 })) })
     publishAttempted.value = false; ElMessage.success('任务已发布，试题与应完成人员已固定'); title.value = ''; maxSubmissions.value = 1; selectedItems.value = []; await loadClass()
   } catch (e) { ElMessage.error(msg(e)) } finally { publishing.value = false }
 }
@@ -170,11 +170,11 @@ onUnmounted(() => { disposed = true; epoch++; detailEpoch++; window.clearInterva
           <el-form label-position="top" class="task-publish-form">
             <el-form-item label="任务名称" required :error="publishAttempted && !title.trim() ? '请输入任务名称' : ''"><el-input v-model="title" placeholder="例如：细胞结构课后练习" maxlength="160" /></el-form-item>
             <el-form-item label="任务类型"><el-select v-model="kind" @change="maxSubmissions=1"><el-option label="作业" value="homework"/><el-option label="考试" value="exam"/></el-select></el-form-item>
-            <el-form-item label="最多提交次数"><el-select v-model="maxSubmissions" filterable><el-option v-if="kind==='homework'" label="不限次数" :value="null"/><el-option v-for="count in 100" :key="count" :label="`${count} 次`" :value="count"/></el-select></el-form-item>
+            <el-form-item label="最多提交次数"><el-select v-model="maxSubmissions" filterable><el-option v-if="kind==='homework'" label="不限次数" value="unlimited"/><el-option v-for="count in 100" :key="count" :label="`${count} 次`" :value="count"/></el-select></el-form-item>
             <el-form-item label="截止时间" required :error="publishAttempted && !due ? '请选择截止时间' : ''"><el-date-picker v-model="due" type="datetime" placeholder="选择日期与时间" /></el-form-item>
             <el-form-item label="已发布题库" required :error="publishAttempted && !versionId ? '请选择题库' : ''"><el-select v-model="versionId" placeholder="选择题库" @change="selectedItems=[]; points={}"><el-option v-for="s in sources" :key="s.version_id" :value="s.version_id" :label="`${s.folder_name || '题库'} · 版本 ${s.version_number}`"/></el-select></el-form-item>
           </el-form>
-          <el-table :key="versionId" :data="sourceItems" empty-text="请选择已发布题库；无题目时请先在习题中心审核并发布客观题" @selection-change="selectedItems=$event"><el-table-column type="selection"/><el-table-column prop="stem_markdown" label="题目"/><el-table-column label="分值" width="140"><template #default="{row}"><el-input-number :model-value="points[row.item_id] ?? 1" :min="0.01" :max="1000" :precision="2" @update:model-value="points[row.item_id]=$event ?? 1"/></template></el-table-column></el-table>
+          <el-table :key="versionId" :data="sourceItems" empty-text="请选择已发布题库；无题目时请先在习题中心审核并发布客观题" @selection-change="selectedItems=$event"><el-table-column type="selection"/><el-table-column prop="stem_markdown" label="题目"/><el-table-column label="分值" width="210"><template #default="{row}"><el-input-number class="task-points-input" :model-value="points[row.item_id] ?? 1" :min="0.01" :max="1000" :precision="2" @update:model-value="points[row.item_id]=$event ?? 1"/></template></el-table-column></el-table>
           <el-button type="primary" :loading="publishing" :disabled="!selectedItems.length" @click="publish">发布给当前班级（{{selectedItems.length}} 题）</el-button>
         </el-card>
         <el-card shadow="never"><h3>已发布任务</h3><ExpandableList :items="tasks" label="已发布任务" :reset-key="courseId + ':' + classId + ':' + studentId"><template #default="{items:visibleItems}"><el-table :data="visibleItems" empty-text="暂无已发布任务"><el-table-column prop="title" label="名称"/><el-table-column label="类型"><template #default="{row}">{{row.kind==='exam'?'考试':'作业'}}</template></el-table-column><el-table-column prop="expected_count" label="应完成人数"/><el-table-column label="截止时间"><template #default="{row}">{{dateLabel(row.due_at)}}</template></el-table-column></el-table></template></ExpandableList></el-card>
@@ -185,6 +185,7 @@ onUnmounted(() => { disposed = true; epoch++; detailEpoch++; window.clearInterva
 
 <style scoped>
 .task-publish-form{display:grid;grid-template-columns:1.2fr 1.2fr 1fr 1fr;gap:16px}.task-publish-form :deep(.el-date-editor){width:100%}.task-publish-form :deep(.el-form-item){min-width:0}@media(max-width:1200px){.task-publish-form{grid-template-columns:1fr 1fr}}
+.task-points-input{width:100%}
 
 .portrait-page{display:grid;gap:18px}.filters{display:flex;gap:12px;flex-wrap:wrap}.filters>.el-select,.filters>.el-input{width:220px}.portrait-layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:20px}.portrait-detail{display:grid;gap:18px;min-width:0}.metric-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.metric-grid strong{display:block;font-size:26px;margin:10px 0;color:#294b3c}.metric-grid small,.student-row small{display:block;color:#56634d}.student-row{display:block;width:100%;text-align:left;padding:13px;border:0;border-radius:8px;background:transparent;cursor:pointer}.student-row.active{background:#e4e9da;color:#294b3c}.score-chart{width:100%;max-height:250px}.evaluation-heading{display:flex;align-items:center;justify-content:space-between}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}h2 small{font-size:13px;font-weight:normal}.el-tab-pane>.el-card{margin-bottom:18px}@media(max-width:1000px){.portrait-layout{grid-template-columns:1fr}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>

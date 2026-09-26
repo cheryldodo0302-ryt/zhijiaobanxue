@@ -45,6 +45,23 @@ export function questionAnswerLabel(value: unknown, questionType?: unknown) {
   return String(value ?? "");
 }
 
+export function questionOptions(item: { type?: unknown; question_type?: unknown; options?: unknown }) {
+  const raw = item.options;
+  if (Array.isArray(raw) && raw.length) {
+    return raw.map((option) => typeof option === "string"
+      ? { key: option, text: option }
+      : { key: String(option.key ?? option.label ?? ""), text: String(option.text ?? option.label ?? option.key ?? "") });
+  }
+  if (raw && typeof raw === "object" && !Array.isArray(raw) && Object.keys(raw).length) {
+    return Object.values(raw).map((option) => typeof option === "string"
+      ? { key: option, text: option }
+      : { key: String(option.key ?? option.label ?? ""), text: String(option.text ?? option.label ?? option.key ?? "") });
+  }
+  return questionTypeLabel(item.type || item.question_type) === "判断题"
+    ? [{ key: "T", text: "正确" }, { key: "F", text: "错误" }]
+    : [];
+}
+
 export function learningModeLabel(value: unknown) {
   return ({ cloze: "挖空练习", recitation: "背诵检测" } as Record<string, string>)[String(value ?? "")] || String(value ?? "");
 }

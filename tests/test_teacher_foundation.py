@@ -20,7 +20,7 @@ def services(tmp_path: Path):
 
 def test_teacher_auth_refresh_and_revocation(services):
     _, auth, _ = services
-    created = auth.create_user("teacher@example.edu", "safe-password-123", "teacher", "王老师")
+    created = auth.create_user("teacher@example.edu", "safe-password-123", "teacher", "测试教师")
     assert created["role"] == "teacher"
     user, access, refresh = auth.login("teacher@example.edu", "safe-password-123")
     assert auth.authenticate(access)["user_id"] == user["user_id"]
@@ -64,7 +64,7 @@ def test_teacher_can_update_and_delete_own_class(services, monkeypatch):
     updated = teachers.update_class(teacher, class_row["class_id"], {
         "course_id": next_course["course_id"], "term_id": next_term["term_id"],
         "class_name": "信管强化班", "class_variant": "A班",
-        "teaching_time_slot": "周一 1-2 节", "campus": "仁济",
+        "teaching_time_slot": "周一 1-2 节", "campus": "校区B",
         "cohort_year": "2025", "major": "医学信息工程", "teaching_level": "进阶",
     })
     assert updated["course_id"] == next_course["course_id"]
@@ -118,16 +118,16 @@ def test_teaching_year_period_and_class_variant_are_independent_dimensions(servi
     )
     main_campus = teachers.create_class(
         teacher, course["course_id"], term["term_id"], "数据库A班",
-        "A班（本部）", "周一 1-2 节",
+        "A班（校区A）", "周一 1-2 节",
     )
-    renji = teachers.create_class(
+    campus_b = teachers.create_class(
         teacher, course["course_id"], term["term_id"], "数据库B班",
-        "B班（仁济）", "周三 3-4 节",
+        "B班（校区B）", "周三 3-4 节",
     )
     assert term["academic_year"] == "2026-2027"
     assert term["teaching_period"] == "秋季学期"
     assert main_campus["class_variant"] == "A班（校区A）"
-    assert renji["class_variant"] == "B班（校区B）"
+    assert campus_b["class_variant"] == "B班（校区B）"
     assert {row["teaching_time_slot"] for row in teachers.list_classes(teacher)} == {
         "周一 1-2 节", "周三 3-4 节",
     }
@@ -139,15 +139,15 @@ def test_institution_profile_merges_configuration_and_history(services, monkeypa
     course = teachers.create_course(teacher, "数据库原理")
     term = teachers.create_term(teacher, "2026-2027 第一学期")
     teachers.create_class(
-        teacher, course["course_id"], term["term_id"], "滨海班", campus="滨海",
+        teacher, course["course_id"], term["term_id"], "校区C班", campus="校区C",
         major="医学信息工程",
     )
     monkeypatch.setenv("ZHIJIAO_SCHOOL_NAME", "测试大学")
-    monkeypatch.setenv("ZHIJIAO_SCHOOL_CAMPUSES", "本部,仁济")
+    monkeypatch.setenv("ZHIJIAO_SCHOOL_CAMPUSES", "校区A,校区B")
     monkeypatch.setenv("ZHIJIAO_SCHOOL_MAJORS", "信息管理与信息系统")
     profile = teachers.institution_profile(teacher)
     assert profile["school_name"] == "测试大学"
-    assert profile["campuses"] == ["校区A", "校区B", "滨海"]
+    assert profile["campuses"] == ["校区A", "校区B", "校区C"]
     assert profile["majors"] == ["信息管理与信息系统", "医学信息工程"]
 
 
