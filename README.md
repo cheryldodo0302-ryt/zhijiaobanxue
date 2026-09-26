@@ -100,7 +100,7 @@
 ## 目录职责
 
 ```text
-zhijiao_banxue/
+仓库根目录/
 ├── api.py                         # FastAPI 接口
 ├── campus_service.py              # 课程、资料、问答、练习和统计
 ├── agent_service.py               # Agent 校验和 Action 路由
@@ -129,9 +129,12 @@ zhijiao_banxue/
 支持 Python 3.10、3.11 和 3.12；前端推荐 Node.js 22.12+ 或 24。首次启动需要联网安装 Python 和 npm 依赖。启动器会在项目目录创建虚拟环境，不会替换系统 Python 或 Anaconda。
 
 ```powershell
-cd zhijiao_banxue
+git clone --branch main https://github.com/cheryldodo0302-ryt/zhijiaobanxue.git
+cd zhijiaobanxue
 .\start.cmd
 ```
+
+也可以在 GitHub 选择 **Code → Download ZIP**，解压后进入包含 `start.cmd` 的项目根目录，再运行 `start.cmd`。
 
 也可以按模块启动：
 
@@ -169,7 +172,7 @@ Mock 模式会显示 `offline://deterministic-mock` 和 `SUCCESS`；其他模式
 首次使用先创建教师账号：
 
 ```powershell
-python scripts\create_teacher.py teacher01 --display-name "教师"
+.\.venv\Scripts\python.exe scripts\create_teacher.py teacher01 --display-name "教师"
 ```
 
 需要远程解析时，先在未提交的 `server.env` 中配置 MinerU/Pix2Text；随后一个命令即可启动 API、Worker 和 Vue：
@@ -299,7 +302,7 @@ npm run build
 
 ### Windows 干净 Python 环境复现
 
-已在独立 Python 3.12.4 虚拟环境安装并运行全部后端测试和端到端流程。锁定的环境见 `requirements-lock.txt`；不依赖全局 httpx。下面从项目 `zhijiao_banxue` 目录执行，验证目录使用临时位置，不覆盖运行数据：
+已在独立 Python 3.12.4 虚拟环境安装并运行全部后端测试和端到端流程。锁定的环境见 `requirements-lock.txt`；不依赖全局 httpx。下面从仓库根目录执行，验证目录使用临时位置，不覆盖运行数据：
 
 ```powershell
 python -m venv .venv-verify
