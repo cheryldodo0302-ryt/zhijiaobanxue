@@ -8,7 +8,7 @@
 
 ## 本地验证
 
-在 `zhijiao_banxue` 目录执行：
+在仓库根目录执行：
 
 ```powershell
 .\start.ps1 -Mode test

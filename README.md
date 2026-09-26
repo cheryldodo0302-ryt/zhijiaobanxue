@@ -135,6 +135,7 @@ cd zhijiaobanxue
 ```
 
 也可以在 GitHub 选择 **Code → Download ZIP**，解压后进入包含 `start.cmd` 的项目根目录，再运行 `start.cmd`。
+macOS/Linux 用户在仓库根目录运行 `./start.sh`。
 
 也可以按模块启动：
 
