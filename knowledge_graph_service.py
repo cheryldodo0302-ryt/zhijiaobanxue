@@ -287,7 +287,7 @@ class KnowledgeGraphService:
             risks = _loads(existing["risk_codes_json"], [])
             if existing["title"] != item["title"] and "normalized_name_collision" not in risks:
                 risks.append("normalized_name_collision")
-            status = "draft" if risks else "approved"
+            status = "rejected" if existing["review_status"] == "rejected" else ("draft" if risks else "approved")
             self.db.execute(
                 """UPDATE knowledge_graph_nodes SET title=?,is_key=?,is_difficult=?,is_exam=?,notes=?,
                    origin=?,review_status=?,risk_codes_json=?,source_json=?,updated_at=CURRENT_TIMESTAMP
@@ -446,7 +446,11 @@ class KnowledgeGraphService:
     def workbench(self, actor: dict[str, Any], course_id: str) -> dict[str, Any]:
         graph = self._graph(actor, course_id)
         nodes = [self._decode_node(row) for row in self.db.fetch_all(
-            "SELECT * FROM knowledge_graph_nodes WHERE graph_id=? ORDER BY title", (graph["graph_id"],),
+            """SELECT g.*,source_node.status source_knowledge_status
+               FROM knowledge_graph_nodes g
+               LEFT JOIN knowledge_nodes source_node ON source_node.node_id=g.source_knowledge_node_id
+               WHERE g.graph_id=? ORDER BY g.title,g.graph_node_id""",
+            (graph["graph_id"],),
         )]
         relations = [self._decode_relation(row) for row in self.db.fetch_all(
             """SELECT r.*,s.title source_title,t.title target_title
@@ -462,7 +466,10 @@ class KnowledgeGraphService:
             """SELECT * FROM knowledge_graph_import_batches WHERE graph_id=?
                ORDER BY created_at DESC LIMIT 20""", (graph["graph_id"],),
         )
-        counts = {status: sum(node["review_status"] == status for node in nodes)
+        visible_nodes = [node for node in nodes if node["review_status"] != "rejected" and not (
+            node["origin"] == "knowledge_center" and node.get("source_knowledge_status") == "rejected"
+        )]
+        counts = {status: sum(node["review_status"] == status for node in visible_nodes)
                   for status in NODE_STATUSES}
         published_knowledge: list[dict[str, Any]] = []
         published = self.db.fetch_one(
@@ -484,7 +491,7 @@ class KnowledgeGraphService:
                    JOIN knowledge_versions v ON v.version_id=vn.version_id
                    LEFT JOIN knowledge_graph_nodes g
                      ON g.graph_id=? AND g.source_knowledge_node_id=n.node_id
-                   WHERE vn.version_id=? AND n.node_type='knowledge_point'
+                   WHERE vn.version_id=? AND n.node_type='knowledge_point' AND n.status!='rejected'
                    ORDER BY n.material_type,n.sort_order,n.title""",
                 (graph["graph_id"], published["version_id"]),
             )
@@ -528,7 +535,7 @@ class KnowledgeGraphService:
             "graph": {**graph, "relation_definitions": _loads(graph["relation_definitions_json"], {})},
             "nodes": nodes, "relations": relations, "versions": versions, "batches": batches,
             "published_knowledge": published_knowledge,
-            "metrics": {"nodes": len(nodes), "relations": len(relations),
+            "metrics": {"nodes": len(visible_nodes), "relations": len(relations),
                         "approved": counts["approved"], "review_required": counts["draft"] + sum(
                             relation["review_status"] == "draft" for relation in relations),
                         "published_version": versions[0]["version_number"] if versions else 0},
@@ -587,7 +594,8 @@ class KnowledgeGraphService:
             if existing:
                 self.db.execute(
                     """UPDATE knowledge_graph_nodes SET title=?,normalized_title=?,summary=?,markdown=?,origin='knowledge_center',
-                       source_knowledge_node_id=?,source_revision=?,source_json=?,review_status='approved',
+                       source_knowledge_node_id=?,source_revision=?,source_json=?,
+                       review_status=CASE WHEN review_status='rejected' THEN 'rejected' ELSE 'approved' END,
                        updated_at=CURRENT_TIMESTAMP WHERE graph_node_id=?""",
                     (row["title"], normalized, row["summary"], row["markdown"], row["node_id"], revision,
                      _json(source), existing["graph_node_id"]),
@@ -793,6 +801,19 @@ class KnowledgeGraphService:
         nodes = [_loads(row["snapshot_json"], {}) for row in self.db.fetch_all(
             "SELECT snapshot_json FROM knowledge_graph_version_nodes WHERE graph_version_id=?",
             (version["graph_version_id"],),
+        )]
+        live_nodes = self.db.fetch_all(
+            """SELECT g.graph_node_id,g.review_status,source_node.status source_knowledge_status
+               FROM knowledge_graph_nodes g
+               LEFT JOIN knowledge_nodes source_node ON source_node.node_id=g.source_knowledge_node_id
+               WHERE g.graph_id=?""",
+            (version["graph_id"],),
+        )
+        live_by_id = {row["graph_node_id"]: row for row in live_nodes}
+        nodes = [node for node in nodes if not (
+            live_by_id.get(node.get("graph_node_id"), {}).get("review_status") == "rejected"
+            or (node.get("origin") == "knowledge_center" and
+                live_by_id.get(node.get("graph_node_id"), {}).get("source_knowledge_status") == "rejected")
         )]
         relations = [_loads(row["snapshot_json"], {}) for row in self.db.fetch_all(
             "SELECT snapshot_json FROM knowledge_graph_version_relations WHERE graph_version_id=?",

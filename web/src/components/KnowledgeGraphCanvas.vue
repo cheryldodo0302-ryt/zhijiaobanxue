@@ -21,8 +21,25 @@ let chart:echarts.ECharts|undefined
 let observer:ResizeObserver|undefined
 const kindLabels:Record<string,string>={part_of:'整体—部分',prerequisite:'前置关系',progression:'后续进阶',parallel:'双向并列',related:'相关'}
 const kindColors:Record<string,string>={part_of:'#378f81',prerequisite:'#b57a27',progression:'#5d8179',parallel:'#8b6e4e',related:'#899793'}
-const visibleRelations=computed(()=>props.relations.filter(row=>!props.relationKinds.length||props.relationKinds.includes(row.relation_kind)))
-const connectedIds=computed(()=>new Set(visibleRelations.value.flatMap(row=>[row.source_node_id,row.target_node_id])))
+function normalizedTitle(value:any){return String(value||'').normalize('NFKC').trim().toLocaleLowerCase().replace(/[\s·•,，。；;：:（）()《》\[\]【】_—-]+/gu,'')}
+function normalizedContent(node:any){const parts=[node.summary,node.markdown].map(value=>String(value||'').normalize('NFKC').toLocaleLowerCase().replace(/\s+/gu,''));return parts.some(Boolean)?parts.join('|'):''}
+const visibleNodes=computed(()=>props.nodes.filter(node=>node.review_status!=='rejected'&&!(node.origin==='knowledge_center'&&node.source_knowledge_status==='rejected')))
+const nodeGroups=computed(()=>{
+  const groups=new Map<string,any[]>()
+  for(const node of visibleNodes.value){
+    const title=normalizedTitle(node.title),content=normalizedContent(node)
+    const key=title&&content?`${title}\u0000${content}`:node.graph_node_id
+    groups.set(key,[...(groups.get(key)||[]),node])
+  }
+  return [...groups.values()]
+})
+const representativeById=computed(()=>{
+  const result=new Map<string,string>()
+  for(const group of nodeGroups.value){for(const node of group)result.set(node.graph_node_id,group[0].graph_node_id)}
+  return result
+})
+const visibleRelations=computed(()=>props.relations.filter(row=>row.review_status!=='rejected'&&(!props.relationKinds.length||props.relationKinds.includes(row.relation_kind))))
+const connectedIds=computed(()=>new Set(visibleRelations.value.flatMap(row=>[row.source_node_id,row.target_node_id].map(id=>representativeById.value.get(id)||id))))
 
 function category(node:any){return node.is_exam?2:node.is_difficult?1:node.is_key?0:3}
 function render(){
@@ -31,21 +48,31 @@ function render(){
   const colors=props.forestPalette ? {key:'#294b3c',difficult:'#95652f',exam:'#a34f28',ordinary:'#5d7350',text:'#56634d',tooltip:'#294b3c'} : {key:'#378f81',difficult:'#b57a27',exam:'#b24b45',ordinary:'#91aaa4',text:'#657773',tooltip:'#173e49'}
   const relationColors=props.forestPalette ? {part_of:'#294b3c',prerequisite:'#95652f',progression:'#5d7350',parallel:'#8b6e4e',related:'#8d9c80'} as Record<string,string> : kindColors
   const needle=props.search.trim().toLocaleLowerCase()
-  const graphNodes=props.nodes.filter(node=>!needle||String(node.title).toLocaleLowerCase().includes(needle)||connectedIds.value.has(node.graph_node_id)).map(node=>({
-    id:node.graph_node_id,name:node.title,value:node,category:category(node),
+  const graphNodes=nodeGroups.value.filter(group=>!needle||String(group[0].title).toLocaleLowerCase().includes(needle)||connectedIds.value.has(group[0].graph_node_id)).map(group=>{
+    const node=group[0]
+    const value={...node,duplicate_count:group.length,duplicate_graph_node_ids:group.slice(1).map(item=>item.graph_node_id)}
+    return {
+    id:node.graph_node_id,name:node.title,value,category:category(node),
     symbolSize:node.is_exam?48:node.is_difficult?42:node.is_key?38:30,
     itemStyle:{opacity:needle&&!String(node.title).toLocaleLowerCase().includes(needle)?.34:1},
-    label:{show:Boolean(needle)||props.nodes.length<80},
-  }))
+    label:{show:Boolean(needle)||nodeGroups.value.length<80},
+  }})
   const ids=new Set(graphNodes.map(node=>node.id))
-  const links=visibleRelations.value.filter(row=>ids.has(row.source_node_id)&&ids.has(row.target_node_id)).map(row=>({
-    source:row.source_node_id,target:row.target_node_id,value:row,
+  const relationKeys=new Set<string>()
+  const links=visibleRelations.value.flatMap(row=>{
+    const source=representativeById.value.get(row.source_node_id)||row.source_node_id
+    const target=representativeById.value.get(row.target_node_id)||row.target_node_id
+    if(source===target||!ids.has(source)||!ids.has(target))return []
+    const key=[source,target,row.relation_kind,row.relation_label||''].join('|')
+    if(relationKeys.has(key))return []
+    relationKeys.add(key)
+    return [{source,target,value:row,
     lineStyle:{color:relationColors[row.relation_kind]||colors.ordinary,width:row.review_status==='approved'?1.8:1,type:row.origin==='suggested'?'dashed':'solid',opacity:.72,curveness:row.relation_kind==='parallel'?.12:0},
     symbol:row.relation_kind==='parallel'?['none','none']:['none','arrow'],symbolSize:8,
-  }))
+  }]})
   chart.setOption({
     animationDurationUpdate:500,backgroundColor:'transparent',
-    tooltip:{trigger:'item',backgroundColor:colors.tooltip,borderWidth:0,textStyle:{color:'#fff'},formatter:(p:any)=>p.dataType==='edge'?`${p.data.value.source_title||''} · ${kindLabels[p.data.value.relation_kind]||p.data.value.relation_label} · ${p.data.value.target_title||''}`:`<b>${p.data.name}</b><br/>${[p.data.value.is_key&&'重点',p.data.value.is_difficult&&'难点',p.data.value.is_exam&&'考点'].filter(Boolean).join(' · ')||'普通知识点'}`},
+    tooltip:{trigger:'item',backgroundColor:colors.tooltip,borderWidth:0,textStyle:{color:'#fff'},formatter:(p:any)=>p.dataType==='edge'?`${p.data.value.source_title||''} · ${kindLabels[p.data.value.relation_kind]||p.data.value.relation_label} · ${p.data.value.target_title||''}`:`<b>${p.data.name}</b><br/>${[p.data.value.is_key&&'重点',p.data.value.is_difficult&&'难点',p.data.value.is_exam&&'考点'].filter(Boolean).join(' · ')||'普通知识点'}${p.data.value.duplicate_count>1?`<br/>已合并显示 ${p.data.value.duplicate_count} 个同名同内容记录`:''}`},
     legend:[{bottom:8,data:['重点','难点','考点','普通'],textStyle:{color:colors.text}}],
     series:[{type:'graph',layout:props.layout==='circular'?'circular':'force',roam:true,draggable:!props.readonly,data:graphNodes,links,categories:[
       {name:'重点',itemStyle:{color:colors.key}},{name:'难点',itemStyle:{color:colors.difficult}},

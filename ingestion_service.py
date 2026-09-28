@@ -6480,32 +6480,65 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
     def approve_nodes_batch(
         self, actor: dict[str, Any], node_ids: list[str]
     ) -> dict[str, Any]:
-        """Atomically approve checked document-tree branches and their leaves."""
+        """Atomically approve checked document or current course-tree branches."""
         unique = list(dict.fromkeys(str(value) for value in node_ids if str(value)))
         if not unique:
             raise ValidationError("至少选择一个知识节点")
         selected = [self._require_node(actor, node_id) for node_id in unique]
         first = selected[0]
-        if first["node_scope"] != "document":
-            raise ValidationError("批量批准仅用于文档独立目录")
+        scope = str(first["node_scope"])
+        if scope not in {"document", "course"}:
+            raise ValidationError("当前目录范围不支持批量批准")
         if any(
-            node["node_scope"] != "document"
-            or node.get("document_id") != first.get("document_id")
+            node["node_scope"] != scope
             or node["course_id"] != first["course_id"]
+            or node.get("document_id") != first.get("document_id")
+            or node.get("generation_id") != first.get("generation_id")
+            or node.get("material_type") != first.get("material_type")
             for node in selected
         ):
-            raise ValidationError("只能批量批准同一文档独立目录中的节点")
+            raise ValidationError("只能批量批准同一课程、资料类型和目录版本中的节点")
+        if scope == "course":
+            generation_id = first.get("generation_id")
+            if generation_id:
+                current = self.db.fetch_one(
+                    """SELECT 1 ok FROM course_outline_generations
+                       WHERE generation_id=? AND course_id=? AND material_type=? AND status='current'""",
+                    (generation_id, first["course_id"], first.get("material_type")),
+                )
+                if not current:
+                    raise ValidationError("只能批量批准当前课程目录版本中的节点，请刷新目录后重试")
+            elif self.db.fetch_one(
+                """SELECT 1 ok FROM course_outline_generations
+                   WHERE course_id=? AND status='current' LIMIT 1""",
+                (first["course_id"],),
+            ):
+                raise ValidationError("课程目录已更新，请刷新后重新选择知识点")
+
+        branch_conditions = ["n.node_scope=?", "n.course_id=?", "n.status!='rejected'"]
+        branch_params: list[Any] = [scope, first["course_id"]]
+        if scope == "document":
+            branch_conditions.append("n.document_id=?")
+            branch_params.append(first["document_id"])
+        else:
+            branch_conditions.append("n.material_type=?")
+            branch_params.append(first.get("material_type"))
+            branch_conditions.append("n.generation_id IS ?")
+            branch_params.append(first.get("generation_id"))
+        branch_filter = " AND ".join(branch_conditions)
         expanded: dict[str, dict[str, Any]] = {}
         for node in selected:
             for row in self.db.fetch_all(
-                """WITH RECURSIVE descendants(node_id) AS (
-                       SELECT node_id FROM knowledge_nodes WHERE node_id=?
+                f"""WITH RECURSIVE descendants(node_id) AS (
+                       SELECT node_id FROM knowledge_nodes
+                       WHERE node_id=? AND node_scope=? AND course_id=? AND status!='rejected'
                        UNION ALL
                        SELECT n.node_id FROM knowledge_nodes n
                        JOIN descendants d ON n.parent_id=d.node_id
+                       WHERE {branch_filter}
                    ) SELECT n.* FROM knowledge_nodes n JOIN descendants d USING(node_id)
-                   WHERE n.node_scope='document'""",
-                (node["node_id"],),
+                   WHERE {branch_filter}""",
+                (node["node_id"], scope, first["course_id"], *branch_params, *branch_params),
             ):
                 expanded[str(row["node_id"])] = row
         if not expanded:
@@ -6548,12 +6581,15 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
         candidate_ids = self._sync_candidates_for_nodes(
             leaf_ids, "approved", str(actor["user_id"]),
         )
-        self._sync_approved_source_blocks(str(first["document_id"]))
-        self._refresh_document_review_state(
-            str(first["document_id"]), str(actor["user_id"])
-        )
+        if scope == "document":
+            self._sync_approved_source_blocks(str(first["document_id"]))
+            self._refresh_document_review_state(
+                str(first["document_id"]), str(actor["user_id"])
+            )
         return {
             "document_id": first["document_id"],
+            "course_id": first["course_id"],
+            "scope": scope,
             "approved_node_ids": all_ids,
             "approved_leaf_count": len(leaf_ids),
             "synced_candidate_ids": candidate_ids,
