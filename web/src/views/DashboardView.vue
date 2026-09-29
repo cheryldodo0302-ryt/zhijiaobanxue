@@ -21,7 +21,7 @@ async function load(){
    return {jobs:j.data.map((x:any)=>({...x,...scope})),questions:q.data.map((x:any)=>({...x,...scope}))}
   }))
   jobs.value=details.flatMap(x=>x.jobs);questions.value=details.flatMap(x=>x.questions);page.value=1
- }catch(e:any){error.value=typeof e.response?.data?.detail==='string'?e.response.data.detail:'暂时无法加载待办，请重试。'}
+ }catch(e:any){const detail=e.response?.data?.detail;error.value=typeof detail==='string'?detail:typeof detail?.message==='string'?detail.message:'暂时无法加载待办，请检查服务连接后重试。'}
  finally{loading.value=false}
 }
 onMounted(load)

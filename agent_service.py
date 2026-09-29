@@ -93,7 +93,7 @@ class CampusAgentService:
         try:
             if req.agent not in {"student_assistant", "teacher_assistant"}:
                 raise ValidationError("Agent 不合法")
-            if req.agent == "teacher_assistant" and not config.TEACHER_PORTAL_ENABLED:
+            if req.agent == "teacher_assistant" and not config.teacher_portal_enabled_for(req.actor):
                 return AgentResponse(req.request_id, "disabled", message="教师端当前已禁用，学生端最小闭环稳定后再开放")
             actions = STUDENT_ACTIONS if req.agent == "student_assistant" else TEACHER_ACTIONS
             expected_role = "student" if req.agent == "student_assistant" else "teacher"

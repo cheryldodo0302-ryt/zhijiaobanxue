@@ -392,7 +392,7 @@ def current_teacher(user: dict = Depends(current_user)) -> dict:
         raise HTTPException(status_code=403, detail="仅教师可以访问该接口")
     if user.get("must_change_password"):
         raise HTTPException(status_code=403, detail="请先修改初始密码")
-    if not config.TEACHER_PORTAL_ENABLED:
+    if not config.teacher_portal_enabled_for(user):
         raise HTTPException(status_code=403, detail={'status':'disabled','message':'教师能力暂未开放'})
     return user
 

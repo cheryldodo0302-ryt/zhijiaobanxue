@@ -13,6 +13,7 @@ import {useTeacherWorkspace} from '../teacher-workspace'
 import {useCoursePreferences} from '../course-preferences'
 import { vCardHover } from '../card-hover'
 import { termLabel } from '../term-label'
+import {parserConnectionDetail,parserConnectionLabel,parserConnectionState} from '../parser-status'
 
 const courses=ref<any[]>([]),jobs=ref<any[]>([]),trash=ref<any[]>([]),courseId=ref(''),selectedDoc=ref<any>(null),analysis=ref<any>(null),readiness=ref<any>(null)
 const {restoreCourse}=useTeacherWorkspace(courses,courseId)
@@ -85,9 +86,9 @@ const hasSavedAiKey=computed(()=>Boolean(aiSettings.value?.has_api_key))
 const ownAiReady=computed(()=>Boolean(aiBaseUrl.value&&aiModel.value&&(aiProvider.value==='ollama'||aiApiKey.value||hasSavedAiKey.value)))
 const aiVerificationType=computed(()=>({connected:'success',failed:'danger',untested:'info'} as Record<string,string>)[String(aiSettings.value?.verification_status||'untested')]||'info')
 const aiVerificationLabel=computed(()=>({connected:'连接成功',failed:'连接失败',untested:'未测试'} as Record<string,string>)[String(aiSettings.value?.verification_status||'untested')]||'未测试')
-const parserConnected=computed(()=>['ok','healthy'].includes(String(parserStatus.value?.mineru?.status||'').toLowerCase())&&['ok','healthy'].includes(String(parserStatus.value?.pix2text?.status||'').toLowerCase()))
-const parserStatusLabel=computed(()=>parserConnected.value?'远程解析已连接':'远程解析未连接')
-const parserStatusDetail=computed(()=>`MinerU ${parserStatus.value?.mineru?.status||'unknown'} · Pix2Text ${parserStatus.value?.pix2text?.status||'unknown'} · 知识树 ${parserStatus.value?.knowledge_extractor?.backend||'unknown'}`)
+const parserState=computed(()=>parserConnectionState(parserStatus.value))
+const parserStatusLabel=computed(()=>parserConnectionLabel(parserState.value))
+const parserStatusDetail=computed(()=>parserConnectionDetail(parserStatus.value))
 const selectedCandidate=computed(()=>candidates.value.find(x=>x.candidate_id===selectedCandidateId.value)||filteredCandidates.value[0]||candidates.value[0]||null)
 const filteredCandidates=computed(()=>candidates.value.filter(candidate=>{
   if(candidateFilter.value==='all')return true
@@ -332,7 +333,7 @@ onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(pars
     <div class="page-title"><h1>知识中心</h1><p class="muted">上传与解析 → 审查 → 批准到知识库 → 发布给学生</p></div>
     <div class="topbar-tools">
     <el-tooltip :content="parserStatusDetail" placement="bottom">
-      <span class="service-indicator" :class="parserConnected?'connected':'disconnected'"><i></i>{{parserStatusLabel}}</span>
+      <span class="service-indicator" :class="parserState"><i></i>{{parserStatusLabel}}</span>
     </el-tooltip>
     <el-popover placement="bottom-end" :width="390" trigger="click">
       <template #reference>
@@ -479,7 +480,9 @@ onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(pars
 .service-indicator{display:inline-flex;align-items:center;gap:8px;min-height:36px;padding:8px 12px;border:1px solid var(--border-subtle);border-radius:8px;background:var(--surface);color:var(--text-secondary);font:400 12px/1.5 var(--campus-font);white-space:nowrap}
 .service-indicator i{width:6px;height:6px;flex-shrink:0;border-radius:50%;background:#68705e}
 .service-indicator.connected i{background:#526747}
-.service-indicator.disconnected i{background:#a16b31}
+.service-indicator.partial i{background:#a16b31}
+.service-indicator.error i{background:#a6473d}
+.service-indicator.unconfigured i{background:#68705e}
 .api-mode-trigger.el-button{height:auto;min-height:54px;width:216px;max-width:100%;padding:9px 13px;border-color:var(--border-subtle);background:var(--surface);color:var(--text-primary);font-family:var(--campus-font)}
 .api-mode-trigger :deep(>span){width:100%;display:flex;align-items:center;justify-content:space-between;gap:20px}
 .api-mode-trigger.el-button:hover{border-color:#8d9c80;background:#edf0e7;color:#294b3c}

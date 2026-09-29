@@ -8,6 +8,7 @@ import pytest
 
 from agent_service import CampusAgentService
 from campus_service import CampusService, NotFound, PermissionDenied, ValidationError
+import config
 from database import LearningDatabase
 from llm_provider import LLMProvider, QwenProvider
 from skills.memory.service import _normalize_judgment_answer, _normalize_question_item
@@ -232,7 +233,7 @@ def test_qwen_provider_uses_real_compatible_endpoint_contract():
     assert mocked.call_args.kwargs["headers"]["Authorization"] == "Bearer sk-server-only"
 
 
-def test_student_memory_minimum_loop_and_teacher_disabled(campus):
+def test_student_memory_minimum_loop_and_teacher_disabled(campus, monkeypatch):
     agent = CampusAgentService(campus)
     course = campus.create_course("背诵课程", "personal_course", "student_1", "student")
     uploaded = campus.upload_document(course["course_id"], "student_1", "student", "material.txt", "text/plain",
@@ -293,6 +294,7 @@ def test_student_memory_minimum_loop_and_teacher_disabled(campus):
             styles_xml = archive.read("word/styles.xml").decode("utf-8")
         assert "宋体" in document_xml
         assert "宋体" in styles_xml
+    monkeypatch.setattr(config, "TEACHER_PORTAL_ENABLED", False)
     teacher_course = campus.create_course("教师共享课程", "shared_course", "teacher_1", "teacher")
     disabled = agent.invoke({"request_id":"t1","agent":"teacher_assistant","action":"teaching_report",
                             "actor":{"user_id":"teacher_1","role":"teacher"},

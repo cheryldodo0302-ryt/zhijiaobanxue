@@ -38,6 +38,7 @@ _AI_NAMES = {
     "ZHIJIAO_AI_MODEL",
     "ZHIJIAO_AI_READ_TIMEOUT",
     "ZHIJIAO_STUDENT_DEFAULT_PASSWORD",
+    "ZHIJIAO_DEMO_TEACHER_ENABLED",
     "ZHIJIAO_MINERU_URL",
     "ZHIJIAO_MINERU_TOKEN",
     "ZHIJIAO_MINERU_VERIFY_TLS",
@@ -321,6 +322,19 @@ TOP_K = 4
 MIN_EVIDENCE_SCORE = 0.12
 MAX_EVIDENCE_CHARS = 800
 TEACHER_PORTAL_ENABLED = get_runtime_setting("ZHIJIAO_TEACHER_AGENT_ENABLED", "0").lower() in {"1", "true", "yes"}
+DEMO_TEACHER_ENABLED = get_runtime_setting("ZHIJIAO_DEMO_TEACHER_ENABLED", "1").lower() in {"1", "true", "yes"}
+
+
+def teacher_portal_enabled_for(actor: dict | None = None) -> bool:
+    """Keep production teachers gated while allowing the bundled local demo account."""
+    if TEACHER_PORTAL_ENABLED:
+        return True
+    actor = actor or {}
+    return (
+        DEMO_TEACHER_ENABLED
+        and str(actor.get("user_id", "")) == "demo_teacher_001"
+        and str(actor.get("role", "")) == "teacher"
+    )
 
 # Compatibility constants for existing imports. Provider construction reads the
 # dynamic settings above on every call.
