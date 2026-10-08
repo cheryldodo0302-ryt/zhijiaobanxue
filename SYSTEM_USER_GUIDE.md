@@ -11,7 +11,9 @@
 
 ## 2. 启动系统（Windows 推荐）
 
-在项目根目录打开 PowerShell：
+直接双击项目根目录中的 `智教伴学.exe`。服务就绪后，默认浏览器会自动打开统一入口；运行期间请保留启动窗口。
+
+也可以在项目根目录打开 PowerShell 手动启动：
 
 ```powershell
 .\start.ps1 -Mode all

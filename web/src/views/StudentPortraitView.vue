@@ -132,10 +132,10 @@ onUnmounted(() => { disposed = true; epoch++; detailEpoch++; window.clearInterva
           <section v-if="portrait && metrics" class="portrait-detail">
             <h2>{{name}} <small class="muted">仅当前课程与班级</small></h2>
             <div class="metric-grid">
-              <el-card shadow="never"><span>到期任务完成率</span><strong>{{percentage(metrics.completion_rate)}}</strong><small>{{metrics.completed_tasks}} / {{metrics.due_tasks}} 项，含完整补交</small></el-card>
+              <el-card shadow="never"><span>所列任务完成率</span><strong>{{percentage(metrics.completion_rate)}}</strong><small>{{metrics.completed_tasks}} / {{metrics.task_count}} 项，完整提交后立即计入</small></el-card>
               <el-card shadow="never"><span>按时完整提交率</span><strong>{{percentage(metrics.on_time_rate)}}</strong><small>按首次完整提交判断</small></el-card>
               <el-card shadow="never"><span>答题完整率</span><strong>{{percentage(metrics.answer_completeness)}}</strong><small>所列任务最近一次提交</small></el-card>
-              <el-card v-for="t in ['homework','exam']" :key="t" shadow="never"><span>{{t==='homework'?'作业':'考试'}}平均分</span><strong>{{metrics[t].average_score ?? '暂无成绩'}}</strong><small>{{metrics[t].count}} 次已评分任务 · 百分制</small></el-card>
+              <el-card v-for="t in ['homework','exam']" :key="t" shadow="never"><span>{{t==='homework'?'作业':'考试'}}平均分</span><strong>{{metrics[t].average_score ?? '暂无成绩'}}</strong><small>{{metrics[t].count}} 次已提交任务 · 百分制</small></el-card>
               <el-card shadow="never"><span>专注参考值</span><strong>{{metrics.study.authorized ? percentage(metrics.study.focus_reference) : '未授权'}}</strong><small>有效采样 {{(metrics.study.valid_sample_seconds/60).toFixed(1)}} 分钟</small></el-card>
             </div>
             <el-card shadow="never"><h3>成绩变化</h3>
@@ -143,9 +143,9 @@ onUnmounted(() => { disposed = true; epoch++; detailEpoch++; window.clearInterva
                 <g v-for="score in [0,50,100]" :key="score"><line x1="40" x2="720" :y1="180-score*1.5" :y2="180-score*1.5" stroke="#dce1d4"/><text x="4" :y="185-score*1.5" fill="#56634d">{{score}}</text></g>
                 <g v-for="s in chartSeries" :key="s.type"><polyline :points="s.points.map((p: {x:number;y:number})=>`${p.x},${p.y}`).join(' ')" fill="none" :stroke="s.color" stroke-width="2"/><circle v-for="(p,i) in s.points" :key="i" :cx="p.x" :cy="p.y" r="4" :fill="s.color"><title>{{p.title}}</title></circle></g>
                 <text x="40" y="205" fill="#294b3c">● 作业</text><text x="130" y="205" fill="#95652f">● 考试</text><text x="480" y="205" fill="#56634d">横轴：任务截止日期 →</text>
-              </svg><el-empty v-else description="暂无已评分任务"/>
+              </svg><el-empty v-else description="暂无已提交任务"/>
               <p v-for="t in ['homework','exam']" :key="t">{{t==='homework'?'作业':'考试'}}：{{portrait.trends[t].change == null ? '样本不足，暂不判断趋势' : `较前一等长时段变化 ${portrait.trends[t].change > 0 ? '+' : ''}${portrait.trends[t].change} 分`}}</p>
-              <p class="muted">两个时段各至少 3 次已评分任务才判断变化；未校正试题难度。</p>
+              <p class="muted">两个时段各至少 3 次已提交任务才判断变化；按提交时间归入时段，未校正试题难度。</p>
             </el-card>
             <el-card shadow="never"><h3>完成质量与知识点</h3><ExpandableList :items="metrics.knowledge_points" label="知识点表现" :reset-key="courseId + ':' + classId + ':' + studentId"><template #default="{items:visibleItems}"><el-table :data="visibleItems" empty-text="暂无知识点作答证据"><el-table-column prop="knowledge_point" label="知识点"/><el-table-column prop="answered" label="已作答题数"/><el-table-column label="正确率"><template #default="{row}">{{percentage(row.accuracy)}}</template></el-table-column><el-table-column label="表现"><template #default="{row}">{{row.accuracy<60?'需巩固':row.accuracy<80?'可继续练习':'掌握较好'}}</template></el-table-column></el-table></template></ExpandableList></el-card>
             <el-card shadow="never"><h3>授权自习表现</h3><p>自习 {{(metrics.study.duration_seconds/60).toFixed(1)}} 分钟 · {{metrics.study.sessions}} 场 · 有效采样覆盖 {{percentage(metrics.study.coverage_percent)}}</p><p class="muted">{{metrics.study.note}}。未观测时长 {{(metrics.study.unobserved_seconds/60).toFixed(1)}} 分钟，不计为低专注；有效采样不足 {{metrics.study.minimum_sample_seconds}} 秒不生成专注参考值。</p></el-card>

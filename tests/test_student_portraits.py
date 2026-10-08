@@ -128,6 +128,20 @@ def test_real_publication_submit_portrait_and_immutable_snapshot(world):
     assert w['tasks'].student_scopes(w['students'][0])[0]['class_id'] == w['classroom']
 
 
+def test_submission_is_counted_before_future_deadline(world):
+    w = world
+    homework = publish(w, kind='homework', days=7)
+    exam = publish(w, kind='exam', days=7)
+    submit(w, homework)
+    submit(w, exam, key='exam-now')
+    portrait = get(w, start='2026-09-01T00:00:00Z', end='2026-09-02T00:00:00Z')
+    assert portrait['metrics']['completed_tasks'] == 2
+    assert portrait['metrics']['completion_rate'] == 100
+    assert portrait['metrics']['on_time_rate'] == 100
+    assert portrait['metrics']['homework'] == {'count': 1, 'average_score': 100.0}
+    assert portrait['metrics']['exam'] == {'count': 1, 'average_score': 100.0}
+
+
 def test_forty_students_ties_first_complete_and_frozen_denominator(world):
     w = world
     with w['db'].connect() as conn:
@@ -168,7 +182,7 @@ def test_partial_latest_grades_late_missing_and_deadline(world):
     submit(w, task, index=1)
     late = get(w,1)
     assert late['tasks'][0]['rank'] is None and late['tasks'][0]['late_score']==100
-    assert late['metrics']['homework']['count']==0 and late['metrics']['completion_rate']==100
+    assert late['metrics']['homework']['count']==1 and late['metrics']['completion_rate']==100
     assert late['metrics']['on_time_rate']==0
 
 
@@ -246,6 +260,31 @@ class EvidenceProvider:
         return {k:[{'text':'依据现有记录，可继续观察学习变化。','evidence_ids':['M1']}] for k in ('overview','strengths','improvements','suggestions','limitations')}
 
 
+class RepairingEvidenceProvider(EvidenceProvider):
+    def __init__(self):
+        self.calls = 0
+
+    def generate_json(self, prompt, payload):
+        self.calls += 1
+        if self.calls == 1:
+            return {'overview': [{'text': '候选格式错误。', 'evidence_ids': 'M1'}]}
+        return super().generate_json(prompt, payload)
+
+
+class DriftingEvidenceProvider(EvidenceProvider):
+    def __init__(self):
+        self.calls = 0
+
+    def generate_json(self, prompt, payload):
+        self.calls += 1
+        result = super().generate_json(prompt, payload)
+        for entries in result.values():
+            entries[0]['evidence_ids'] = '请参见 M1，不要引用 M999'
+            entries[0]['ignored_model_field'] = True
+        result['ignored_top_level_field'] = 'extra'
+        return result
+
+
 def evaluate(w):
     return w['portraits'].evaluate(w['teacher'],w['course'],w['classroom'],w['students'][0]['user_id'],'2026-09-01T00:00:00Z','2026-10-01T00:00:00Z')
 
@@ -255,6 +294,10 @@ def test_ai_failure_evidence_validation_and_invalidation(world):
     assert evaluate(w)['status']=='insufficient_data'
     task=publish(w); submit(w,task)
     assert evaluate(w)['status']=='failed'
+    repair_provider=RepairingEvidenceProvider(); w['campus'].provider_factory=lambda:repair_provider
+    assert evaluate(w)['status']=='draft' and repair_provider.calls==2
+    drifting_provider=DriftingEvidenceProvider(); w['campus'].provider_factory=lambda:drifting_provider
+    assert evaluate(w)['status']=='draft' and drifting_provider.calls==1
     provider=EvidenceProvider(); w['campus'].provider_factory=lambda:provider
     result=evaluate(w)
     assert result['status']=='draft'

@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900" role="img" aria-labelledby="title desc">
+  <title id="title">智教伴学 UI 色彩系统</title>
+  <desc id="desc">森林绿、暖纸白以及成功、警告、危险和信息色板。</desc>
+  <rect width="1200" height="900" fill="#f4f5ed"/>
+  <style>
+    .title{font:700 42px 'Microsoft YaHei UI','PingFang SC',sans-serif;fill:#293c30}
+    .subtitle{font:400 18px 'Microsoft YaHei UI','PingFang SC',sans-serif;fill:#56634d}
+    .section{font:650 22px 'Microsoft YaHei UI','PingFang SC',sans-serif;fill:#293c30}
+    .name{font:600 15px 'Microsoft YaHei UI','PingFang SC',sans-serif;fill:#293c30}
+    .hex{font:400 14px Consolas,monospace;fill:#56634d}
+    .light{fill:#fcfcf8}.dark{fill:#293c30}
+  </style>
+  <text class="title" x="64" y="74">智教伴学 · 森林校园色系</text>
+  <text class="subtitle" x="64" y="108">Forest green · Moss · Warm paper</text>
+
+  <text class="section" x="64" y="166">品牌主色</text>
+  <g transform="translate(64 190)">
+    <rect width="119" height="112" rx="10" fill="#203c30"/><text class="light name" x="14" y="78">900</text><text class="light hex" x="14" y="99">#203C30</text>
+    <g transform="translate(119)"><rect width="119" height="112" fill="#294b3c"/><text class="light name" x="14" y="78">800 · 主色</text><text class="light hex" x="14" y="99">#294B3C</text></g>
+    <g transform="translate(238)"><rect width="119" height="112" fill="#50694b"/><text class="light name" x="14" y="78">700</text><text class="light hex" x="14" y="99">#50694B</text></g>
+    <g transform="translate(357)"><rect width="119" height="112" fill="#5d7350"/><text class="light name" x="14" y="78">600</text><text class="light hex" x="14" y="99">#5D7350</text></g>
+    <g transform="translate(476)"><rect width="119" height="112" fill="#8d9c80"/><text class="dark name" x="14" y="78">500</text><text class="dark hex" x="14" y="99">#8D9C80</text></g>
+    <g transform="translate(595)"><rect width="119" height="112" fill="#c3cdb7"/><text class="dark name" x="14" y="78">300</text><text class="dark hex" x="14" y="99">#C3CDB7</text></g>
+    <g transform="translate(714)"><rect width="119" height="112" fill="#dce3d3"/><text class="dark name" x="14" y="78">200</text><text class="dark hex" x="14" y="99">#DCE3D3</text></g>
+    <g transform="translate(833)"><rect width="119" height="112" fill="#e4e9da"/><text class="dark name" x="14" y="78">100</text><text class="dark hex" x="14" y="99">#E4E9DA</text></g>
+    <g transform="translate(952)"><rect width="119" height="112" rx="10" fill="#edf0e7"/><text class="dark name" x="14" y="78">50</text><text class="dark hex" x="14" y="99">#EDF0E7</text></g>
+  </g>
+
+  <text class="section" x="64" y="360">文字与边界</text>
+  <g transform="translate(64 384)">
+    <g><rect width="190" height="94" rx="10" fill="#293c30"/><text class="light name" x="16" y="60">主文字</text><text class="light hex" x="16" y="81">#293C30</text></g>
+    <g transform="translate(206)"><rect width="190" height="94" rx="10" fill="#495741"/><text class="light name" x="16" y="60">常规文字</text><text class="light hex" x="16" y="81">#495741</text></g>
+    <g transform="translate(412)"><rect width="190" height="94" rx="10" fill="#56634d"/><text class="light name" x="16" y="60">辅助文字</text><text class="light hex" x="16" y="81">#56634D</text></g>
+    <g transform="translate(618)"><rect width="190" height="94" rx="10" fill="#68705e"/><text class="light name" x="16" y="60">占位文字</text><text class="light hex" x="16" y="81">#68705E</text></g>
+    <g transform="translate(824)"><rect width="118" height="94" rx="10" fill="#cbd2c2"/><text class="dark name" x="12" y="60">强边界</text><text class="dark hex" x="12" y="81">#CBD2C2</text></g>
+    <g transform="translate(958)"><rect width="113" height="94" rx="10" fill="#dce1d4"/><text class="dark name" x="12" y="60">弱边界</text><text class="dark hex" x="12" y="81">#DCE1D4</text></g>
+  </g>
+
+  <text class="section" x="64" y="536">界面层级</text>
+  <g transform="translate(64 560)">
+    <g><rect width="203" height="96" rx="10" fill="#dfe3d5"/><text class="dark name" x="16" y="62">底层背景</text><text class="dark hex" x="16" y="83">#DFE3D5</text></g>
+    <g transform="translate(217)"><rect width="203" height="96" rx="10" fill="#f4f5ed" stroke="#d2d8c7"/><text class="dark name" x="16" y="62">页面画布</text><text class="dark hex" x="16" y="83">#F4F5ED</text></g>
+    <g transform="translate(434)"><rect width="203" height="96" rx="10" fill="#edf0e7"/><text class="dark name" x="16" y="62">浅色填充</text><text class="dark hex" x="16" y="83">#EDF0E7</text></g>
+    <g transform="translate(651)"><rect width="203" height="96" rx="10" fill="#f6f6ed" stroke="#d2d8c7"/><text class="dark name" x="16" y="62">标题纸面</text><text class="dark hex" x="16" y="83">#F6F6ED</text></g>
+    <g transform="translate(868)"><rect width="203" height="96" rx="10" fill="#fcfcf8" stroke="#d2d8c7"/><text class="dark name" x="16" y="62">主要纸面</text><text class="dark hex" x="16" y="83">#FCFCF8</text></g>
+  </g>
+
+  <text class="section" x="64" y="716">语义状态</text>
+  <g transform="translate(64 740)">
+    <g><rect width="248" height="100" rx="10" fill="#edf0e7" stroke="#526747"/><circle cx="38" cy="38" r="14" fill="#526747"/><text class="dark name" x="64" y="43">成功</text><text class="dark hex" x="20" y="80">#526747 · #EDF0E7</text></g>
+    <g transform="translate(274)"><rect width="248" height="100" rx="10" fill="#faf1e4" stroke="#8b5b28"/><circle cx="38" cy="38" r="14" fill="#8b5b28"/><text class="dark name" x="64" y="43">警告</text><text class="dark hex" x="20" y="80">#8B5B28 · #FAF1E4</text></g>
+    <g transform="translate(548)"><rect width="248" height="100" rx="10" fill="#f8eee6" stroke="#a34f28"/><circle cx="38" cy="38" r="14" fill="#a34f28"/><text class="dark name" x="64" y="43">危险</text><text class="dark hex" x="20" y="80">#A34F28 · #F8EEE6</text></g>
+    <g transform="translate(822)"><rect width="249" height="100" rx="10" fill="#f2efe7" stroke="#665d4d"/><circle cx="38" cy="38" r="14" fill="#665d4d"/><text class="dark name" x="64" y="43">信息</text><text class="dark hex" x="20" y="80">#665D4D · #F2EFE7</text></g>
+  </g>
+</svg>

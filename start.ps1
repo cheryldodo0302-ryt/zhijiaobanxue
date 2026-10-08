@@ -1,6 +1,8 @@
 ﻿param(
     [ValidateSet("all", "api", "worker", "web-dev", "web-build", "test", "ai-check")]
-    [string]$Mode = "all"
+    [string]$Mode = "all",
+    [ValidateRange(0, 65535)]
+    [int]$ApiPort = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -142,6 +144,43 @@ function Ensure-WebEnvironment {
     return $npm.Source
 }
 
+function Test-PortBindable([int]$Port) {
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new(
+            [System.Net.IPAddress]::Loopback,
+            $Port
+        )
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $listener) { $listener.Stop() }
+    }
+}
+
+function Resolve-ApiPort {
+    if ($ApiPort -gt 0) { return $ApiPort }
+    if ($env:ZHIJIAO_API_PORT) {
+        $parsedPort = 0
+        if (-not [int]::TryParse($env:ZHIJIAO_API_PORT, [ref]$parsedPort) -or
+            $parsedPort -lt 1 -or $parsedPort -gt 65535) {
+            throw "ZHIJIAO_API_PORT 必须是 1 到 65535 的整数。"
+        }
+        return $parsedPort
+    }
+    foreach ($candidate in @(8000) + (18001..18020)) {
+        if (Test-PortBindable $candidate) {
+            if ($candidate -ne 8000) {
+                Write-Host "[API] 端口 8000 不可绑定，自动改用 $candidate。"
+            }
+            return $candidate
+        }
+    }
+    throw "未找到可用的 API 端口（已尝试 8000 和 18001-18020）。"
+}
+
 if ($Mode -in @("web-dev", "web-build")) {
     $npm = Ensure-WebEnvironment
     Push-Location (Join-Path $project "web")
@@ -154,6 +193,13 @@ if ($Mode -in @("web-dev", "web-build")) {
 
 $pythonExe = Ensure-PythonEnvironment
 if ($Mode -eq "all") { [void](Ensure-WebEnvironment) }
+$selectedApiPort = $null
+if ($Mode -eq "all" -and $ApiPort -gt 0) {
+    $env:ZHIJIAO_API_PORT = $ApiPort.ToString()
+}
+if ($Mode -eq "api") {
+    $selectedApiPort = Resolve-ApiPort
+}
 $version = & $pythonExe -c "import platform; print(platform.python_version())"
 Write-Host "使用项目 Python：$pythonExe（$version）"
 if ($Mode -in @("all", "api")) {
@@ -163,7 +209,7 @@ if ($Mode -in @("all", "api")) {
 
 switch ($Mode) {
     "all" { & $pythonExe scripts/run_all.py }
-    "api" { & $pythonExe -m uvicorn api:app --host 127.0.0.1 --port 8000 }
+    "api" { & $pythonExe -m uvicorn api:app --host 127.0.0.1 --port $selectedApiPort }
     "worker" { & $pythonExe scripts/run_ingestion_worker.py }
     "test" { & $pythonExe -m pytest -q }
     "ai-check" { & $pythonExe qwen_check.py }

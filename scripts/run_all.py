@@ -21,6 +21,8 @@ from runtime_contract import source_fingerprint
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 WEB_DIR = PROJECT_DIR / "web"
 WORKER_LOCK_PORT = 17654
+DEFAULT_API_PORT = 8000
+FALLBACK_API_PORTS = range(18001, 18021)
 
 
 @dataclass
@@ -57,17 +59,17 @@ def worker_supports_current_contract() -> bool:
         return False
 
 
-def api_supports_current_contract() -> bool:
+def api_supports_current_contract(api_port: int) -> bool:
     """Reject a stale API instead of pairing it with the current Vue app."""
     try:
         # Local readiness checks must never be sent through a machine proxy.
         # A proxy may return 502 for 127.0.0.1 even when the local API is healthy.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open("http://127.0.0.1:8000/health", timeout=3) as response:
+        with opener.open(f"http://127.0.0.1:{api_port}/health", timeout=3) as response:
             health = json.load(response)
         if health.get("runtime_source_fingerprint") != source_fingerprint():
             return False
-        with opener.open("http://127.0.0.1:8000/openapi.json", timeout=3) as response:
+        with opener.open(f"http://127.0.0.1:{api_port}/openapi.json", timeout=3) as response:
             spec = json.load(response)
         paths = spec.get("paths") or {}
         folders = paths.get(
@@ -79,6 +81,30 @@ def api_supports_current_contract() -> bool:
         return bool(folders and (semantic.get("post") or {}).get("requestBody"))
     except Exception:
         return False
+
+
+def select_api_port() -> int:
+    """Select a usable API port, including around Windows excluded ranges."""
+    configured = os.environ.get("ZHIJIAO_API_PORT")
+    if configured:
+        try:
+            port = int(configured)
+        except ValueError as exc:
+            raise RuntimeError("ZHIJIAO_API_PORT 必须是 1 到 65535 的整数。") from exc
+        if not 1 <= port <= 65535:
+            raise RuntimeError("ZHIJIAO_API_PORT 必须是 1 到 65535 的整数。")
+        return port
+
+    if port_is_open(DEFAULT_API_PORT) or not port_is_bound(DEFAULT_API_PORT):
+        return DEFAULT_API_PORT
+    for port in FALLBACK_API_PORTS:
+        if not port_is_bound(port):
+            print(
+                f"[API] 端口 {DEFAULT_API_PORT} 不可绑定，自动改用 {port}。",
+                flush=True,
+            )
+            return port
+    raise RuntimeError("未找到可用的 API 端口（已尝试 8000 和 18001-18020）。")
 
 
 def stream_output(name: str, process: subprocess.Popen[str]) -> None:
@@ -195,12 +221,19 @@ def main() -> int:
 
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    try:
+        api_port = select_api_port()
+    except RuntimeError as exc:
+        print(f"[API] {exc}", file=sys.stderr, flush=True)
+        return 2
+    env["ZHIJIAO_API_PORT"] = str(api_port)
+    env["VITE_API_PROXY_TARGET"] = f"http://127.0.0.1:{api_port}"
     managed: list[ManagedProcess] = []
     reused: list[str] = []
     try:
-        if port_is_open(8000) and not api_supports_current_contract():
+        if port_is_open(api_port) and not api_supports_current_contract(api_port):
             print(
-                "[API] 端口 8000 正在运行旧版或非本项目 API，不能与当前教师端混用。",
+                f"[API] 端口 {api_port} 正在运行旧版或非本项目 API，不能与当前教师端混用。",
                 file=sys.stderr,
                 flush=True,
             )
@@ -210,9 +243,9 @@ def main() -> int:
                 flush=True,
             )
             return 3
-        if port_is_open(8000):
-            reused.append("API(8000)")
-            print("[API] 端口 8000 已有服务，直接复用。", flush=True)
+        if port_is_open(api_port):
+            reused.append(f"API({api_port})")
+            print(f"[API] 端口 {api_port} 已有服务，直接复用。", flush=True)
         else:
             managed.append(
                 start_process(
@@ -225,7 +258,7 @@ def main() -> int:
                         "--host",
                         "127.0.0.1",
                         "--port",
-                        "8000",
+                        str(api_port),
                     ],
                     PROJECT_DIR,
                     env,
@@ -236,7 +269,7 @@ def main() -> int:
         # Wait until API startup has completed so they never race for the
         # database write lock during bootstrap.
         api_deadline = time.monotonic() + 60
-        while not port_is_open(8000):
+        while not port_is_open(api_port):
             api_process = next((item for item in managed if item.name == "API"), None)
             if api_process and api_process.process.poll() is not None:
                 print("[API] 启动失败，无法继续启动 Worker。", file=sys.stderr, flush=True)
@@ -280,7 +313,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return failed.process.returncode or 1
-            if port_is_open(8000) and port_is_open(5173):
+            if port_is_open(api_port) and port_is_open(5173):
                 break
             time.sleep(0.5)
         else:
@@ -289,7 +322,7 @@ def main() -> int:
 
         print("\n系统已就绪：", flush=True)
         print("  统一入口：http://127.0.0.1:5173", flush=True)
-        print("  API 文档：http://127.0.0.1:8000/docs", flush=True)
+        print(f"  API 文档：http://127.0.0.1:{api_port}/docs", flush=True)
         if reused:
             print(f"  已复用外部进程：{', '.join(reused)}", flush=True)
         print("按 Ctrl+C 一次即可停止本启动器拉起的全部服务。\n", flush=True)

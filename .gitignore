@@ -14,6 +14,7 @@ htmlcov/
 .venv/
 .venv-windows/
 .venv-posix/
+.venv-backup-*/
 venv/
 env/
 build/
@@ -31,6 +32,14 @@ web/.npm-cache/
 *.tsbuildinfo
 vendor/
 docker/mineru.Dockerfile
+
+# Local Codex workspaces and generated review artifacts
+.codex-build/
+.codex-docx-work/
+.codex_work/
+output/
+outputs/
+/*.exe
 
 # Runtime data and local logs
 data/
