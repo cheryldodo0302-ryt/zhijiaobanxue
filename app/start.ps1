@@ -1,5 +1,5 @@
 ﻿param(
-    [ValidateSet("all", "api", "worker", "web-dev", "web-build", "test", "ai-check")]
+    [ValidateSet("all", "api", "worker", "web-dev", "web-build", "test", "ai-check", "setup")]
     [string]$Mode = "all",
     [ValidateRange(0, 65535)]
     [int]$ApiPort = 0
@@ -202,7 +202,7 @@ if ($Mode -eq "api") {
 }
 $version = & $pythonExe -c "import platform; print(platform.python_version())"
 Write-Host "使用项目 Python：$pythonExe（$version）"
-if ($Mode -in @("all", "api")) {
+if ($Mode -in @("all", "api", "setup")) {
     & $pythonExe scripts/bootstrap_demo.py --if-empty
     if ($LASTEXITCODE -ne 0) { throw "初始化演示账号失败。" }
 }
@@ -213,5 +213,6 @@ switch ($Mode) {
     "worker" { & $pythonExe scripts/run_ingestion_worker.py }
     "test" { & $pythonExe -m pytest -q }
     "ai-check" { & $pythonExe qwen_check.py }
+    "setup" { Write-Host "智教伴学运行环境已准备完成。" }
 }
 exit $LASTEXITCODE

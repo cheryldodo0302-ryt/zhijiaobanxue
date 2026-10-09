@@ -11,12 +11,12 @@
 
 ## 2. 启动系统（Windows 推荐）
 
-直接双击项目根目录中的 `智教伴学.exe`。服务就绪后，默认浏览器会自动打开统一入口；运行期间请保留启动窗口。
+直接双击仓库根目录中的 `智教伴学.exe`。服务就绪后，默认浏览器会自动打开统一入口；运行期间请保留启动窗口。
 
-也可以在项目根目录打开 PowerShell 手动启动：
+也可以在仓库根目录打开 PowerShell 手动启动：
 
 ```powershell
-.\start.ps1 -Mode all
+.\app\start.ps1 -Mode all
 ```
 
 启动后访问：
@@ -28,11 +28,11 @@
 常用模式：
 
 ```powershell
-.\start.ps1 -Mode api        # 只启动 API
-.\start.ps1 -Mode worker     # 只启动解析 Worker
-.\start.ps1 -Mode web-dev    # 只启动 Vue 开发服务器
-.\start.ps1 -Mode web-build  # 构建 Vue 生产文件
-.\start.ps1 -Mode ai-check   # 检查当前 AI 配置
+.\app\start.ps1 -Mode api        # 只启动 API
+.\app\start.ps1 -Mode worker     # 只启动解析 Worker
+.\app\start.ps1 -Mode web-dev    # 只启动 Vue 开发服务器
+.\app\start.ps1 -Mode web-build  # 构建 Vue 生产文件
+.\app\start.ps1 -Mode ai-check   # 检查当前 AI 配置
 .\start.ps1 -Mode test       # 运行 Python 测试
 ```
 

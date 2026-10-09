@@ -5,7 +5,8 @@ param(
 $ErrorActionPreference = "Stop"
 $launcherName = [string][char]0x667A + [char]0x6559 + [char]0x4F34 + [char]0x5B66 + ".exe"
 if (-not $OutputPath) {
-    $OutputPath = Join-Path (Split-Path -Parent $PSScriptRoot) $launcherName
+    $repositoryRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $OutputPath = Join-Path $repositoryRoot $launcherName
 }
 $source = Join-Path $PSScriptRoot "ZhijiaoLauncher.cs"
 $icon = Join-Path $PSScriptRoot "app-icon.ico"

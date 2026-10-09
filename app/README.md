@@ -128,23 +128,23 @@
 
 支持 Python 3.10、3.11 和 3.12；前端推荐 Node.js 22.12+ 或 24。首次启动需要联网安装 Python 和 npm 依赖。启动器会在项目目录创建虚拟环境，不会替换系统 Python 或 Anaconda。
 
-Windows 用户可以直接双击项目根目录中的 `智教伴学.exe`；服务就绪后会自动打开浏览器。运行期间保留启动窗口，在窗口中按 `Ctrl+C` 可停止本次启动的服务。
+Windows 用户可以直接双击仓库根目录中的 `智教伴学.exe`；服务就绪后会自动打开浏览器。运行期间保留启动窗口，在窗口中按 `Ctrl+C` 可停止本次启动的服务。需要连接 OpenClaw 时，双击同级的 `启动OpenClaw.cmd`。
 
 ```powershell
 git clone --branch main https://github.com/cheryldodo0302-ryt/zhijiaobanxue.git
 cd zhijiaobanxue
-.\start.cmd
+.\app\start.cmd
 ```
 
-也可以在 GitHub 选择 **Code → Download ZIP**，解压后进入包含 `start.cmd` 的项目根目录，再运行 `start.cmd`。
-macOS/Linux 用户在仓库根目录运行 `./start.sh`。
+也可以在 GitHub 选择 **Code → Download ZIP**，解压后直接双击 `智教伴学.exe`。
+macOS/Linux 用户在仓库根目录运行 `./app/start.sh`。
 
 也可以按模块启动：
 
 ```powershell
-.\start.ps1 -Mode all       # FastAPI + Worker + Vue 学生/教师端
-.\start.ps1 -Mode test      # 后端测试
-.\start.ps1 -Mode web-build # 前端生产构建
+.\app\start.ps1 -Mode all       # FastAPI + Worker + Vue 学生/教师端
+.\app\start.ps1 -Mode test      # 后端测试
+.\app\start.ps1 -Mode web-build # 前端生产构建
 ```
 
 启动成功后，统一入口为 `http://127.0.0.1:5173`，API 文档为 `http://127.0.0.1:8000/docs`。旧的 `ui` 启动模式已移除。

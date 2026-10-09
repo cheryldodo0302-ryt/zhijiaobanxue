@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent $MyInvocation.MyCommand.Path
 $python = Join-Path $project ".venv\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) {
-    throw "未找到项目 Python：$python。请先运行 .\start.ps1 -Mode api。"
+    throw "未找到项目 Python：$python。请先运行 .\start.ps1 -Mode setup。"
 }
 $openclaw = Get-Command openclaw -ErrorAction SilentlyContinue
 if (-not $openclaw) {

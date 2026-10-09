@@ -31,12 +31,13 @@ internal static class ZhijiaoLauncher
         Console.Title = "智教伴学";
 
         string launcherDirectory = AppDomain.CurrentDomain.BaseDirectory;
-        string startScript = Path.Combine(launcherDirectory, "start.ps1");
+        string projectDirectory = Path.Combine(launcherDirectory, "app");
+        string startScript = Path.Combine(projectDirectory, "start.ps1");
 
         if (!File.Exists(startScript))
         {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("启动失败：未在 EXE 所在目录找到 start.ps1。");
+            Console.WriteLine("启动失败：未找到 app\\start.ps1。");
             Console.ResetColor();
             Console.WriteLine("请把“智教伴学.exe”放回项目根目录后再双击运行。");
             PauseBeforeExit();
@@ -60,7 +61,7 @@ internal static class ZhijiaoLauncher
         startInfo.FileName = "powershell.exe";
         startInfo.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File "
             + QuoteArgument(startScript) + " -Mode all";
-        startInfo.WorkingDirectory = launcherDirectory;
+        startInfo.WorkingDirectory = projectDirectory;
         startInfo.UseShellExecute = false;
         startInfo.CreateNoWindow = false;
 

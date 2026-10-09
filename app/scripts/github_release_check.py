@@ -13,8 +13,8 @@ from pathlib import Path
 
 
 PROJECT = Path(__file__).resolve().parents[1]
-REPOSITORY = PROJECT
-PROJECT_PREFIX = ""
+REPOSITORY = PROJECT.parent
+PROJECT_PREFIX = f"{PROJECT.name}/"
 FORBIDDEN_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".pem", ".key"}
 FORBIDDEN_NAMES = {"server.env", "user_ai.env", "relay_client.env", "demo_credentials.txt"}
 SECRET_PATTERNS = (
@@ -102,7 +102,7 @@ def main() -> int:
         print("GitHub 发布检查失败（为安全起见不显示密钥内容）：", file=sys.stderr)
         for finding in sorted(findings):
             print(f"- {finding}", file=sys.stderr)
-        print("请先撤销泄露令牌并按 GITHUB_RELEASE_SECURITY.md 清理历史。", file=sys.stderr)
+        print("请先撤销泄露令牌并按 app/GITHUB_RELEASE_SECURITY.md 清理历史。", file=sys.stderr)
         return 1
     print("GitHub 发布检查通过：未追踪运行数据库、上传资料或疑似真实密钥。")
     return 0
