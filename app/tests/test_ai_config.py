@@ -72,7 +72,7 @@ def test_existing_quoted_gemini_endpoint_is_cleaned(monkeypatch, tmp_path):
     assert settings["base_url"].endswith(":generateContent")
 
 
-def test_legacy_server_key_overrides_bundled_relay(monkeypatch, tmp_path):
+def test_bundled_relay_wins_over_inherited_server_key(monkeypatch, tmp_path):
     _isolate_settings(monkeypatch, tmp_path)
     config.BUNDLED_RELAY_ENV.write_text(
         "ZHIJIAO_AI_MODE=relay\n"
@@ -81,6 +81,28 @@ def test_legacy_server_key_overrides_bundled_relay(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     config.SERVER_ENV.write_text(
+        "DASHSCOPE_API_KEY=server-secret\n"
+        "ZHIJIAO_AI_BASE_URL=https://qwen.example.com/v1\n"
+        "ZHIJIAO_AI_MODEL=qwen-plus\n",
+        encoding="utf-8",
+    )
+    settings = config.get_ai_settings()
+    assert settings["mode"] == "relay"
+    assert settings["provider"] == "relay"
+    assert settings["api_key"] == "client-token"
+    assert settings["model"] == "server-managed"
+
+
+def test_explicit_server_mode_can_select_direct_qwen(monkeypatch, tmp_path):
+    _isolate_settings(monkeypatch, tmp_path)
+    config.BUNDLED_RELAY_ENV.write_text(
+        "ZHIJIAO_AI_MODE=relay\n"
+        "ZHIJIAO_RELAY_URL=https://relay.example.com/compatible-mode/v1\n"
+        "ZHIJIAO_RELAY_TOKEN=client-token\n",
+        encoding="utf-8",
+    )
+    config.SERVER_ENV.write_text(
+        "ZHIJIAO_AI_MODE=qwen\n"
         "DASHSCOPE_API_KEY=server-secret\n"
         "ZHIJIAO_AI_BASE_URL=https://qwen.example.com/v1\n"
         "ZHIJIAO_AI_MODEL=qwen-plus\n",
@@ -103,3 +125,4 @@ def test_public_ai_settings_never_exposes_secret(monkeypatch, tmp_path):
     assert public["has_api_key"] is True
     assert "api_key" not in public
     assert "never-return-this-secret" not in repr(public)
+
