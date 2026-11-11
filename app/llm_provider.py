@@ -84,6 +84,36 @@ class OpenAICompatibleProvider(LLMProvider):
                         allowed_methods=frozenset({"POST"}))
         self.session.mount("https://", TLS12Adapter(max_retries=retries))
 
+    @staticmethod
+    def _upstream_error_detail(data: Any, response: requests.Response) -> str:
+        """Extract a short, non-secret diagnostic from an upstream error."""
+        candidates: list[Any] = []
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                structured = " ".join(
+                    str(error.get(key) or "").strip()
+                    for key in ("code", "type", "message")
+                    if str(error.get(key) or "").strip()
+                )
+                candidates.append(structured)
+            elif error:
+                candidates.append(error)
+            candidates.extend(data.get(key) for key in ("detail", "message"))
+        candidates.append(getattr(response, "text", ""))
+        for value in candidates:
+            detail = re.sub(r"\s+", " ", str(value or "")).strip()
+            if detail and detail not in {"{}", "None"}:
+                # Provider errors occasionally echo request metadata. Keep the
+                # useful reason while preventing an accidental credential echo.
+                detail = re.sub(
+                    r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*)[^,; ]+",
+                    r"\1[redacted]",
+                    detail,
+                )
+                return detail[:360]
+        return "上游未提供具体错误信息"
+
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.base_url:
             raise RuntimeError("尚未配置智能服务 Base URL")
@@ -119,7 +149,11 @@ class OpenAICompatibleProvider(LLMProvider):
             raise RuntimeError(f"智能服务返回格式异常（HTTP {response.status_code}）") from exc
         if response.status_code >= 400:
             logger.warning("LLM upstream error, status=%s", response.status_code)
-            raise RuntimeError(f"智能服务暂时不可用（HTTP {response.status_code}）")
+            detail = self._upstream_error_detail(data, response)
+            raise RuntimeError(
+                f"智能服务暂时不可用（HTTP {response.status_code}，模型 {self.model}）；"
+                f"上游信息：{detail}"
+            )
         return data
 
     @staticmethod
@@ -355,3 +389,4 @@ def backend_provider_status() -> dict[str, str | bool]:
         "base_url": str(settings["base_url"]),
         "configured": bool(settings["configured"]),
     }
+
