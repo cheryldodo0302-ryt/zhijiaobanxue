@@ -62,8 +62,7 @@ server.env
 server.env.*
 !server.env.example
 user_ai.env
-# relay_client.env is intentionally tracked: it contains only the public
-# relay endpoint and client token, never the cloud provider's real API key.
+relay_client.env
 *.pem
 *.key
 
