@@ -103,22 +103,22 @@ def get_ai_settings(*, use_request: bool = True, mode_override: str | None = Non
         if name in os.environ:
             values[name] = os.environ[name].strip()
 
-    mode = os.environ.get("ZHIJIAO_AI_MODE", "").strip().lower()
-    if not mode:
-        mode = user_values.get("ZHIJIAO_AI_MODE", "").lower()
-    if not mode and (
-        os.environ.get("DASHSCOPE_API_KEY") or server_values.get("DASHSCOPE_API_KEY")
-    ):
+    # An explicit relay bundle is the public-client deployment contract. It
+    # must win over an accidentally inherited local DASHSCOPE_API_KEY; the
+    # client should follow the cloud function's model/key configuration and
+    # never silently fall back to direct provider access.
+    mode = ""
+    for source in (os.environ, user_values, server_values, bundled_values):
+        candidate = str(source.get("ZHIJIAO_AI_MODE", "")).strip().lower()
+        if candidate:
+            mode = candidate
+            break
+    if not mode and values.get("ZHIJIAO_RELAY_URL"):
+        mode = "relay"
+    if not mode and values.get("DASHSCOPE_API_KEY"):
         mode = "qwen"
     if not mode:
-        mode = bundled_values.get("ZHIJIAO_AI_MODE", "").lower()
-    if not mode:
-        if values.get("ZHIJIAO_RELAY_URL"):
-            mode = "relay"
-        elif values.get("DASHSCOPE_API_KEY"):
-            mode = "qwen"
-        else:
-            mode = "mock"
+        mode = "mock"
 
     mode = mode_override or mode
     if mode == "mock":
@@ -343,3 +343,4 @@ AI_PROVIDER = str(_INITIAL_AI["provider"])
 AI_API_KEY = str(_INITIAL_AI["api_key"])
 AI_BASE_URL = str(_INITIAL_AI["base_url"])
 AI_MODEL = str(_INITIAL_AI["model"])
+
