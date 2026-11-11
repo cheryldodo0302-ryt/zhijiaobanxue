@@ -31,6 +31,23 @@ def test_openai_json_generation_requests_structured_output_and_accepts_trailing_
     assert payload["max_tokens"] == 6000
 
 
+def test_openai_error_preserves_upstream_reason_without_echoing_key():
+    provider = OpenAICompatibleProvider("secret-key", "https://example.com/v1", "qwen-plus")
+    provider.session.post = Mock(return_value=_response({
+        "error": {
+            "code": "Model.AccessDenied",
+            "message": "model qwen-plus is not authorized for this API key",
+        }
+    }, status_code=403))
+    with pytest.raises(RuntimeError) as exc_info:
+        provider.generate("system", "user")
+    message = str(exc_info.value)
+    assert "HTTP 403" in message
+    assert "qwen-plus" in message
+    assert "Model.AccessDenied" in message
+    assert "secret-key" not in message
+
+
 def test_gemini_root_url_uses_native_payload_and_header():
     provider = GeminiProvider("gemini-key", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash")
     provider.session.post = Mock(return_value=_response({
@@ -79,3 +96,4 @@ def test_gemini_invalid_key_error_explains_provider_mismatch():
     }, status_code=400))
     with pytest.raises(RuntimeError, match="千问、OpenAI 或其他平台"):
         provider.generate("system", "user")
+
