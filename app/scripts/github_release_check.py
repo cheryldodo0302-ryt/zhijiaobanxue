@@ -16,7 +16,7 @@ PROJECT = Path(__file__).resolve().parents[1]
 REPOSITORY = PROJECT.parent
 PROJECT_PREFIX = f"{PROJECT.name}/"
 FORBIDDEN_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".pem", ".key"}
-FORBIDDEN_NAMES = {"server.env", "user_ai.env", "relay_client.env", "demo_credentials.txt"}
+FORBIDDEN_NAMES = {"server.env", "user_ai.env", "demo_credentials.txt"}
 SECRET_PATTERNS = (
     # Require a long contiguous key body and token boundaries. This avoids
     # treating CSS classes such as ``task-selection-heading`` as ``sk-*`` keys.
@@ -51,7 +51,16 @@ def forbidden_path(path: str) -> bool:
     )
 
 
-def contains_secret(content: bytes) -> bool:
+def contains_secret(content: bytes, path: str = "") -> bool:
+    # The relay client token is intentionally shipped to clients: the browser
+    # and local worker must be able to call the public relay. It is not the
+    # upstream DashScope credential and must be protected by relay rate limits.
+    # Allow that one field only in the dedicated client config file; all other
+    # credentials remain forbidden.
+    if Path(path).name == "relay_client.env":
+        if re.search(rb"(?im)^\s*DASHSCOPE_API_KEY\s*=", content):
+            return True
+        content = re.sub(rb"(?im)^\s*ZHIJIAO_RELAY_TOKEN\s*=.*$", b"", content)
     return any(pattern.search(content) for pattern in SECRET_PATTERNS)
 
 
@@ -64,7 +73,7 @@ def current_index_findings() -> set[str]:
             continue
         disk_path = REPOSITORY / path
         try:
-            if disk_path.is_file() and disk_path.stat().st_size <= 2_000_000 and contains_secret(disk_path.read_bytes()):
+            if disk_path.is_file() and disk_path.stat().st_size <= 2_000_000 and contains_secret(disk_path.read_bytes(), path):
                 findings.add(f"当前索引疑似包含真实密钥：{path}")
         except OSError:
             continue
@@ -91,7 +100,7 @@ def history_findings() -> set[str]:
         if not size_text.isdigit() or int(size_text) > 2_000_000:
             continue
         content = git("cat-file", "blob", object_id, check=False)
-        if contains_secret(content):
+        if contains_secret(content, path):
             findings.add(f"历史对象 {object_id[:12]} 疑似包含真实密钥：{path}")
     return findings
 
@@ -110,3 +119,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
