@@ -42,6 +42,12 @@ const serviceStatusLabel = (service?: ParserServiceStatus) => ({
   disabled: '未配置',
   not_configured: '未配置',
   unreachable: '不可达',
+  authentication: '认证失败，请核对令牌和访问权限',
+  connection: '连接失败，请核对域名和端口',
+  tls: 'TLS 验证失败，请检查证书',
+  timeout: '检查超时，请稍后重试',
+  service_error: '服务异常，请检查服务状态',
+  parse_error: '返回结果异常，请检查服务配置',
   unknown: '未知',
 }[normalizedStatus(service)] || normalizedStatus(service) || '未知')
 

@@ -20,7 +20,6 @@ from test_reviewed_question_bank import question_workbook, XLSX_MIME
 
 @pytest.fixture
 def world(tmp_path, monkeypatch):
-    monkeypatch.setenv('ZHIJIAO_STUDENT_DEFAULT_PASSWORD', 'initial-password-123')
     db = LearningDatabase(tmp_path / 'test.db')
     campus = CampusService(db, tmp_path / 'uploads', provider_factory=lambda: None)
     auth = AuthService(db, tmp_path / 'secret')
@@ -87,6 +86,49 @@ def test_submission_limits_and_first_exam_score(world):
     assert get(w)['metrics']['exam']['average_score'] == 0
     with pytest.raises(ValidationError, match='次数'):
         submit(w, exam, key='exam-3')
+
+
+def test_publish_119_questions_through_http_and_submit(world):
+    from io import BytesIO
+    from openpyxl import Workbook
+    from portrait_api import portrait_router, TaskPublish
+    from pydantic import ValidationError as PayloadError
+    w = world
+    book = Workbook(); sheet = book.active
+    sheet.append(['题目类型', '答案类型', '题干内容', '答案', '知识点', '选项A', '选项B'])
+    for index in range(119):
+        sheet.append(['选择题', '单选题', f'第 {index + 1} 道测试题', 'A', 'SQL', '正确选项', '错误选项'])
+    stream = BytesIO(); book.save(stream); book.close()
+    bank = QuestionBankService(w['db'], w['campus'])
+    bank.import_template(w['teacher'], w['course'], '119题.xlsx', XLSX_MIME, stream.getvalue(), ai_mode='local')
+    ingestion = IngestionService(w['db'], w['campus'])
+    for item in ingestion.list_question_bank(w['teacher'], w['course']):
+        if item['answer_markdown']:
+            ingestion.review_question(w['teacher'], item['item_id'], {'status': 'approved'})
+    version = ingestion.publish_question_bank(w['teacher'], w['course'])
+    questions = next(v for v in w['tasks'].sources(w['teacher'], w['course'], w['classroom'])
+                     if v['version_id'] == version['version_id'])['items'][:119]
+    assert len(questions) == 119
+    app = FastAPI()
+    app.include_router(portrait_router(w['campus'], w['study'], lambda: w['teacher'], lambda: w['students'][0]))
+    client = TestClient(app)
+    payload = dict(title='119题演示作业', kind='homework', version_id=version['version_id'],
+                   due_at=stamp(datetime.now(timezone.utc) + timedelta(days=1)),
+                   max_submissions=1, items=[{'item_id': q['item_id'], 'points': 1} for q in questions])
+    response = client.post(f"/api/v1/teacher/courses/{w['course']}/classes/{w['classroom']}/tasks", json=payload)
+    assert response.status_code == 200, response.text
+    task = response.json()
+    assert len(task['items']) == 119
+    answers = {q['item_id']: json.loads(q['correct_answer_json']) for q in questions}
+    submitted = client.post(f"/api/v1/student/tasks/{task['task_id']}/submissions",
+                            json={'request_id': '119-questions', 'responses': answers})
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()['score'] == 100
+    with pytest.raises(PayloadError):
+        TaskPublish(**{**payload, 'items': payload['items'][:1] * 1001})
+    with pytest.raises(ValidationError, match='1000'):
+        w['tasks'].publish(w['teacher'], w['course'], w['classroom'], 'too many', 'homework',
+                           version['version_id'], payload['due_at'], payload['items'][:1] * 1001)
 
 
 def test_private_todos_and_class_task_projection(world):

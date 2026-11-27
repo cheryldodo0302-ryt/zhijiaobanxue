@@ -10,6 +10,8 @@ from .adapter import OpenClawAdapter, OpenClawToolError
 
 
 SERVER_INFO = {"name": "zhijiao-database", "version": "1.0.0"}
+SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
+DEFAULT_PROTOCOL_VERSION = "2025-06-18"
 
 
 class StdioMcpServer:
@@ -28,9 +30,11 @@ class StdioMcpServer:
             try:
                 request = json.loads(raw_line)
                 response = self.handle(request)
-            except Exception as exc:  # keep the process alive after one bad request
+            except json.JSONDecodeError:
+                response = self._error(None, -32700, "无效的 JSON")
+            except Exception:  # keep the process alive after one bad request
                 response = self._error(request.get("id") if isinstance(request, dict) else None,
-                                       -32603, "MCP 服务内部错误", str(exc))
+                                       -32603, "MCP 服务内部错误，请查看服务日志")
                 traceback.print_exc(file=sys.stderr)
             if response is not None:
                 self.stdout.write(json.dumps(response, ensure_ascii=False, default=str) + "\n")
@@ -41,13 +45,17 @@ class StdioMcpServer:
             return self._error(None, -32600, "无效的 JSON-RPC 请求")
         request_id = request.get("id")
         method = request.get("method")
-        params = request.get("params") or {}
+        params = request.get("params", {})
         if request_id is None:  # MCP notifications intentionally have no response
             return None
+        if not isinstance(params, dict):
+            return self._error(request_id, -32602, "请求参数必须是对象")
         if method == "initialize":
             requested_version = params.get("protocolVersion") if isinstance(params, dict) else None
             return self._result(request_id, {
-                "protocolVersion": requested_version or "2025-06-18",
+                "protocolVersion": (requested_version if isinstance(requested_version, str)
+                                    and requested_version in SUPPORTED_PROTOCOL_VERSIONS
+                                    else DEFAULT_PROTOCOL_VERSION),
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": SERVER_INFO,
                 "instructions": "先列出课程，再使用 course_id 调用智教伴学数据库工具。",
@@ -69,6 +77,11 @@ class StdioMcpServer:
             except OpenClawToolError as exc:
                 return self._result(request_id, {
                     "content": [{"type": "text", "text": str(exc)}], "isError": True,
+                })
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                return self._result(request_id, {
+                    "content": [{"type": "text", "text": "工具调用失败，请查看服务日志"}], "isError": True,
                 })
         return self._error(request_id, -32601, f"不支持的方法：{method}")
 
@@ -92,9 +105,21 @@ def main() -> int:
             reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="智教伴学 OpenClaw MCP stdio 服务")
     parser.add_argument("--check", action="store_true", help="只检查数据库与绑定账号")
+    parser.add_argument("--probe", action="store_true", help="启动独立 MCP 进程并验证握手和工具调用")
+    parser.add_argument("--user-id", help="显式绑定本机账号，优先于继承的认证环境变量")
+    parser.add_argument("--database", help="数据库文件路径；相对路径以 app 目录为基准")
     args = parser.parse_args()
+    if args.probe:
+        from .probe import probe
+
+        try:
+            print(json.dumps(probe(user_id=args.user_id, database=args.database), ensure_ascii=False))
+            return 0
+        except Exception as exc:
+            print(f"OpenClaw MCP 探测失败：{exc}", file=sys.stderr)
+            return 2
     try:
-        adapter = OpenClawAdapter.from_environment()
+        adapter = OpenClawAdapter.from_environment(user_id=args.user_id, db_path=args.database)
     except Exception as exc:
         print(f"OpenClaw MCP 启动失败：{exc}", file=sys.stderr)
         return 2

@@ -42,6 +42,7 @@ outputs/
 /*.exe
 
 # Runtime data and local logs
+.runtime/
 data/
 exports/
 tmp/
@@ -62,6 +63,7 @@ server.env
 server.env.*
 !server.env.example
 user_ai.env
+openclaw.binding.json
 relay_client.env
 *.pem
 *.key
@@ -77,4 +79,3 @@ relay_client.env
 .DS_Store
 Thumbs.db
 Desktop.ini
-

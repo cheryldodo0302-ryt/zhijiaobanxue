@@ -5,6 +5,7 @@ import re
 import ssl
 from abc import ABC, abstractmethod
 from typing import Any
+from urllib.parse import urlsplit
 
 import certifi
 import requests
@@ -14,6 +15,10 @@ from urllib3.util.retry import Retry
 from config import get_ai_settings
 
 logger = logging.getLogger(__name__)
+
+# This deployment's relay is reachable directly. The inherited localhost
+# proxy can fail its TLS handshake; keep the bypass limited to this hostname.
+DIRECT_RELAY_HOST = "zhijiao-relay-fqvnmaclgo.cn-beijing.fcapp.run"
 
 
 class TLS12Adapter(HTTPAdapter):
@@ -122,6 +127,11 @@ class OpenAICompatibleProvider(LLMProvider):
         response = None
         for base_url in base_urls:
             endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+            request_options = {}
+            if urlsplit(endpoint).hostname == DIRECT_RELAY_HOST:
+                # None removes the proxy inherited from requests' environment
+                # merge, including ALL_PROXY. Certificate verification stays on.
+                request_options["proxies"] = {"http": None, "https": None, "all": None}
             try:
                 response = self.session.post(
                     endpoint,
@@ -133,6 +143,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     json=payload,
                     timeout=(10, self.timeout),
                     verify=certifi.where(),
+                    **request_options,
                 )
                 self.last_endpoint = endpoint
                 break
@@ -389,4 +400,3 @@ def backend_provider_status() -> dict[str, str | bool]:
         "base_url": str(settings["base_url"]),
         "configured": bool(settings["configured"]),
     }
-

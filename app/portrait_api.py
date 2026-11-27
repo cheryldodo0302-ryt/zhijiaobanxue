@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from campus_service import CampusError, PermissionDenied, NotFound
-from class_task_service import ClassTaskService
+from class_task_service import ClassTaskService, MAX_TASK_ITEMS
 from student_portrait_service import StudentPortraitService
 from student_todo_service import StudentTodoService
 
@@ -18,7 +18,7 @@ class TaskPublish(BaseModel):
     kind: str
     version_id: str
     due_at: str
-    items: list[TaskItem] = Field(min_length=1, max_length=100)
+    items: list[TaskItem] = Field(min_length=1, max_length=MAX_TASK_ITEMS)
     max_submissions: int | None = 1
 
 

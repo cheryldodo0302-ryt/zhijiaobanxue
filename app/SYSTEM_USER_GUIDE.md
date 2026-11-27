@@ -38,6 +38,23 @@
 
 启动脚本会自动探测 Python 3.10、3.11、3.12、Conda/Anaconda 和 `ZHIJIAO_PYTHON`。也支持 `start.cmd` 和 Linux/macOS 的 `start.sh`。
 
+首次安装依赖时，Windows 启动器默认使用阿里云 PyPI 镜像和 npmmirror；如果当前 PowerShell 已设置 `PIP_INDEX_URL` 或 `NPM_CONFIG_REGISTRY`，或者 npm 已配置自定义 registry，则沿用现有设置。需要临时指定源时，可在启动前设置对应环境变量。
+
+### 把完整系统复制到另一台 Windows 电脑
+
+1. 在旧电脑先正常退出系统，确保 API、Worker 和前端都已停止。
+2. 复制整个项目文件夹。确认新副本里保留 `app/data/`（数据库、上传原文件和解析产物）及 `app/server.env`（远程解析 API 地址和令牌）；仅下载 Git 仓库或源码压缩包时，这些本地文件可能不会包含在内。
+3. 在新电脑安装 Python 3.10–3.12 和 Node.js 20 或更高版本，然后从项目根目录运行 `智教伴学.exe`，或执行 `powershell -ExecutionPolicy Bypass -File .\app\start.ps1 -Mode all`。
+4. 启动器会在新电脑创建本机虚拟环境；复制过来的旧虚拟环境不作为可移植环境使用。应用启动时会把数据库中指向旧目录的 `data` 文件路径自动映射到新目录，前提是对应文件也已复制。
+
+模型与 API Key 的迁移：账号的模型选择、接口地址和加密 API Key 存在 `app/data/learning.db`，解密文件是 `app/data/.job-secret.key`。必须复制整个 `app/data`，包括点开头的文件；在新电脑登录原账号即可使用该账号的设置。教师内容分析配置也存放在同一数据库中。部署默认配置文件 `app/user_ai.env`、`app/relay_client.env`、`app/server.env` 若存在，应一并复制。启动时会检查数据库与密钥是否匹配；缺失时会提示补齐，不会生成新密钥覆盖旧配置。仅保存在旧电脑系统环境变量中的值不会随文件夹转移，应提前保存到对应的项目配置文件。`ZHIJIAO_DATA_DIR` 可以在 `server.env` 使用相对路径，路径以 `app` 目录为基准；自定义外部数据目录需要另外复制。
+
+依赖缓存保存在 `app/.runtime/pip-cache` 和 `app/.runtime/npm-cache`，复制时保留可减少重复下载。新电脑仍需要兼容的 Python 和 Node.js；不能保证不同系统架构的依赖全部复用。已有账号不会因密码说明文件缺失而被重建。
+
+健康检查会对偶发连接中断进行最多两次重试；文件上传后的读取失败不会自动重复提交解析任务。持续的 10054 仍需要检查新电脑网络和服务器连接，不能通过重试保证恢复。
+
+`app/server.env` 含有解析服务令牌。传输和保存项目副本时请使用可信渠道；不要把该文件上传到公开仓库或发到公开群聊。AI 设置文件若在项目中使用，也应一并保留并按密钥文件保护。
+
 教师功能需要在真实 `server.env` 中设置 `ZHIJIAO_TEACHER_AGENT_ENABLED=1` 后启动。默认值为 `0`，同时控制教师网页调用的接口和教师 Agent；只修改 `server.env.example` 不会生效。
 
 2026-09-11 已在本机后台启动 API、解析 Worker 和 Vue，统一入口保持不变。该入口只监听本机地址；电脑重启后按上面的命令重新启动。此次启动日志和进程信息在 `data/logs/review-deployment.json`，数据库升级前备份保存在 `data/backups/review-20260911/`。

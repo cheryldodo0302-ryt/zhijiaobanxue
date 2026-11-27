@@ -1,9 +1,7 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.IO;
-using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Threading;
 
 [assembly: System.Reflection.AssemblyTitle("智教伴学启动器")]
 [assembly: System.Reflection.AssemblyDescription("一键启动智教伴学本地服务")]
@@ -21,8 +19,6 @@ internal static class ZhijiaoLauncher
     private static extern bool SetConsoleOutputCP(uint codePageId);
 
     private const int Utf8CodePage = 65001;
-    private const int WebPort = 5173;
-    private const string WebUrl = "http://127.0.0.1:5173";
 
     private static int Main(string[] args)
     {
@@ -50,17 +46,36 @@ internal static class ZhijiaoLauncher
             return 0;
         }
 
-        Console.WriteLine("正在启动智教伴学，请勿关闭此窗口……");
-        Console.WriteLine("服务就绪后将自动打开浏览器。\n");
+        if (args.Length > 0 && string.Equals(args[0], "--help", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("智教伴学启动器");
+            Console.WriteLine("  直接运行       自动准备环境并启动桌面版");
+            Console.WriteLine("  --setup        仅安装/修复运行环境，不启动服务");
+            Console.WriteLine("  --check        检查启动器与项目目录是否匹配");
+            return 0;
+        }
 
-        Thread browserThread = new Thread(OpenBrowserWhenReady);
-        browserThread.IsBackground = true;
-        browserThread.Start();
+        bool setupOnly = args.Length > 0 && string.Equals(args[0], "--setup", StringComparison.OrdinalIgnoreCase);
+        if (setupOnly)
+        {
+            Console.WriteLine("正在安装/修复智教伴学运行环境，请勿关闭此窗口……\n");
+        }
+        else
+        {
+            Console.WriteLine("正在启动智教伴学，请勿关闭此窗口……");
+            Console.WriteLine("服务就绪后将自动打开浏览器。\n");
+        }
+
+        // The Python supervisor opens the browser only after verifying this
+        // installation's API and worker. A listening port may belong to an old copy.
 
         ProcessStartInfo startInfo = new ProcessStartInfo();
         startInfo.FileName = "powershell.exe";
+        string mode = setupOnly
+            ? "setup"
+            : "desktop";
         startInfo.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File "
-            + QuoteArgument(startScript) + " -Mode all";
+            + QuoteArgument(startScript) + " -Mode " + mode;
         startInfo.WorkingDirectory = projectDirectory;
         startInfo.UseShellExecute = false;
         startInfo.CreateNoWindow = false;
@@ -87,35 +102,6 @@ internal static class ZhijiaoLauncher
             Console.ResetColor();
             PauseBeforeExit();
             return 1;
-        }
-    }
-
-    private static void OpenBrowserWhenReady()
-    {
-        DateTime deadline = DateTime.UtcNow.AddMinutes(3);
-        while (DateTime.UtcNow < deadline)
-        {
-            try
-            {
-                using (TcpClient client = new TcpClient())
-                {
-                    IAsyncResult result = client.BeginConnect("127.0.0.1", WebPort, null, null);
-                    if (result.AsyncWaitHandle.WaitOne(500) && client.Connected)
-                    {
-                        client.EndConnect(result);
-                        ProcessStartInfo browser = new ProcessStartInfo();
-                        browser.FileName = WebUrl;
-                        browser.UseShellExecute = true;
-                        Process.Start(browser);
-                        return;
-                    }
-                }
-            }
-            catch
-            {
-                // The local web server is still starting; retry quietly.
-            }
-            Thread.Sleep(750);
         }
     }
 

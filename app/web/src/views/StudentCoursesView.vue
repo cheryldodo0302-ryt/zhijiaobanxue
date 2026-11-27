@@ -172,6 +172,8 @@ const memoryResponses = ref<any[]>([]);
 const memoryGrade = ref<any>(null);
 const questionCount = ref(6);
 const publishedFolders = ref<any[]>([]);
+const folderState = ref<'idle' | 'loading' | 'ready' | 'error'>('idle');
+let folderRequest = 0;
 const publishedFolderId = ref("");
 const publishedBank = ref<any>(null);
 const publishedPaperTitle = ref("课程试卷");
@@ -424,6 +426,11 @@ async function courseChanged() {
   messages.value = [];
   quiz.value = null;
   grade.value = null;
+  folderRequest++;
+  publishedFolders.value = [];
+  publishedFolderId.value = "";
+  folderState.value = "idle";
+  publishedResponses.value = [];
   publishedBank.value = null;
   publishedGrade.value = null;
   trainingBlockId.value = undefined;
@@ -435,6 +442,8 @@ async function courseChanged() {
     selectedCourse.value?.course_type === "shared_course",
   );
   restoreCurrentDraft();
+  if (activeTab.value === 'practice' && selectedCourse.value?.course_type === 'shared_course')
+    void loadPublishedFolders();
   await loadCourseData();
   await loadPublishedGraph();
 }
@@ -1130,32 +1139,47 @@ async function submitMemoryQuestions() {
   }
 }
 
+watch(activeTab, tab => {
+  if (tab === 'practice' && loadedCourseId === courseId.value && folderState.value !== 'loading' && selectedCourse.value?.course_type === 'shared_course') void loadPublishedFolders();
+});
 async function loadPublishedFolders() {
-  loading.value = true;
+  const request = ++folderRequest;
+  folderState.value = 'loading';
   try {
-    publishedFolders.value =
+    const folders =
       (await invoke("quiz_generate", {
         source: "published_question_folders",
       })) || [];
-    if (!publishedFolderId.value && publishedFolders.value.length)
-      publishedFolderId.value = publishedFolders.value[0].folder_id;
+    if (request !== folderRequest) return;
+    publishedFolders.value = folders;
+    folderState.value = 'ready';
+    if (!folders.some((row:any) => row.folder_id === publishedFolderId.value))
+      publishedFolderId.value = folders[0]?.folder_id || '';
   } catch (error) {
+    if (request !== folderRequest) return;
+    folderState.value = 'error';
     showError(error, "已发布题库加载失败");
-  } finally {
-    loading.value = false;
   }
 }
 
+watch(publishedFolderId, () => {
+  publishedBank.value = null;
+  publishedGrade.value = null;
+  publishedResponses.value = [];
+});
 async function loadPublishedBank() {
+  const folder = publishedFolderId.value;
   if (!publishedFolderId.value)
     return ElMessage.warning("请先选择教师发布的试卷");
   loading.value = true;
   try {
-    publishedBank.value = await invoke("quiz_generate", {
+    const bank = await invoke("quiz_generate", {
       source: "published_question_bank",
       count: 100,
       folder_id: publishedFolderId.value,
     });
+    if (publishedFolderId.value !== folder) return;
+    publishedBank.value = bank;
     publishedPaperTitle.value = publishedFolders.value.find((folder:any)=>folder.folder_id===publishedFolderId.value)?.folder_name || "课程试卷";
     publishedResponses.value = initQuestionResponses(
       publishedBank.value?.items || [],
@@ -2103,7 +2127,7 @@ onUnmounted(async () => {
               >
             </div></template
           >
-          <p class="muted">这里只展示教师审核并发布的题目。</p>
+          <p class="muted">{{ folderState === 'loading' ? '正在加载试卷…' : folderState === 'error' ? '试卷列表加载失败，请点击刷新重试。' : folderState === 'ready' && !publishedFolders.length ? '当前课程尚未发布试卷。' : '这里只展示教师审核并发布的题目。' }}</p>
           <el-select
             v-model="publishedFolderId"
             placeholder="选择教师发布的试卷"
@@ -2140,7 +2164,7 @@ onUnmounted(async () => {
                   根据知识卡片生成，也可以导入 PDF、Word、TXT 或 XLSX 题库。
                 </p>
               </div>
-              <el-button @click="exportWorkbook">导出 Word 练习册</el-button>
+              <el-button @click="exportWorkbook">导出本组专项练习</el-button>
             </div></template
           >
           <div class="practice-toolbar">

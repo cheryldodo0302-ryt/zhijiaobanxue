@@ -26,7 +26,6 @@ services:
     environment:
       <<: *zhijiao-environment
       ZHIJIAO_ALLOWED_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
-      ZHIJIAO_STUDENT_DEFAULT_PASSWORD: ${ZHIJIAO_STUDENT_DEFAULT_PASSWORD:-}
     volumes:
       - zhijiao_data:/app/data
     ports:

@@ -125,4 +125,3 @@ def test_public_ai_settings_never_exposes_secret(monkeypatch, tmp_path):
     assert public["has_api_key"] is True
     assert "api_key" not in public
     assert "never-return-this-secret" not in repr(public)
-

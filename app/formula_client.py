@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
-import requests
+from parser_transport import create_parser_session
 
 from config import get_runtime_setting
 
@@ -17,9 +15,7 @@ class Pix2TextClient:
         self.verify_tls = get_runtime_setting("ZHIJIAO_FORMULA_VERIFY_TLS", "1").lower() not in {
             "0", "false", "no", "off",
         }
-        self.session = requests.Session()
-        if urlparse(self.base_url).hostname in {"127.0.0.1", "localhost", "::1"}:
-            self.session.trust_env = False
+        self.session = create_parser_session(self.base_url)
 
     @property
     def headers(self) -> dict[str, str]:

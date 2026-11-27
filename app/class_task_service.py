@@ -32,6 +32,9 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+MAX_TASK_ITEMS = 1000
+
+
 class ClassTaskService:
     def __init__(self, campus, clock=utc_now):
         self.campus, self.db, self.clock = campus, campus.db, clock
@@ -98,8 +101,8 @@ class ClassTaskService:
             raise ValidationError("提交次数必须为 1 至 100")
         if due <= now:
             raise ValidationError("截止时间必须晚于发布时间")
-        if not isinstance(items, list) or not 1 <= len(items) <= 100:
-            raise ValidationError("任务需包含 1 至 100 道客观题")
+        if not isinstance(items, list) or not 1 <= len(items) <= MAX_TASK_ITEMS:
+            raise ValidationError(f"任务需包含 1 至 {MAX_TASK_ITEMS} 道客观题")
         # One SQLite transaction captures the publication and class membership together.
         with self.db.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")

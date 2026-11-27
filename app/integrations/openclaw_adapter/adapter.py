@@ -57,21 +57,31 @@ class OpenClawAdapter:
         }
 
     @classmethod
-    def from_environment(cls) -> "OpenClawAdapter":
+    def from_environment(cls, *, user_id: str | None = None,
+                         db_path: str | Path | None = None) -> "OpenClawAdapter":
         """Create the stdio adapter from settings supplied by OpenClaw."""
-        db_path = Path(os.environ.get("ZHIJIAO_OPENCLAW_DB_PATH", "").strip() or config.DB_PATH)
-        db = LearningDatabase(db_path)
+        database_path = Path(db_path or os.environ.get("ZHIJIAO_OPENCLAW_DB_PATH", "").strip()
+                             or config.DB_PATH).expanduser()
+        if not database_path.is_absolute():
+            database_path = config.BASE_DIR / database_path
+        if not database_path.is_file():
+            raise ValidationError("数据库不存在，请先启动智教伴学，或检查 ZHIJIAO_OPENCLAW_DB_PATH")
+        db = LearningDatabase(database_path)
         auth = AuthService(db)
         token = os.environ.get("ZHIJIAO_OPENCLAW_ACCESS_TOKEN", "").strip()
         username = os.environ.get("ZHIJIAO_OPENCLAW_USERNAME", "").strip()
         password = os.environ.get("ZHIJIAO_OPENCLAW_PASSWORD", "")
-        user_id = os.environ.get("ZHIJIAO_OPENCLAW_USER_ID", "").strip()
-        if token:
+        configured_user_id = os.environ.get("ZHIJIAO_OPENCLAW_USER_ID", "").strip()
+        if user_id is not None:
+            # An explicit local stdio binding must not be overridden by stale
+            # login variables inherited from the launching shell.
+            actor = auth.get_user(user_id)
+        elif token:
             actor = auth.authenticate(token)
         elif username and password:
             actor, _, _ = auth.login(username, password, client_id="openclaw-mcp")
-        elif user_id:
-            actor = auth.get_user(user_id)
+        elif configured_user_id:
+            actor = auth.get_user(configured_user_id)
         else:
             raise PermissionDenied(
                 "未配置 OpenClaw 账号；请设置 ZHIJIAO_OPENCLAW_USER_ID，"
@@ -150,12 +160,24 @@ class OpenClawAdapter:
 
     def invoke(self, mapped_request: dict[str, Any]) -> Any:
         name = mapped_request.get("name")
-        arguments = mapped_request.get("arguments") or {}
+        arguments = mapped_request.get("arguments", {})
         if not isinstance(name, str) or name not in self._handlers:
             raise OpenClawToolError(f"未知工具：{name!r}")
         if not isinstance(arguments, dict):
             raise OpenClawToolError("工具参数必须是 JSON 对象")
+        schema = next(tool["inputSchema"] for tool in self.tool_definitions() if tool["name"] == name)
+        if set(arguments) - set(schema["properties"]):
+            raise OpenClawToolError("工具包含不支持的参数")
         try:
+            # MCP processes can stay alive across many turns. Recheck the bound
+            # account so disabling it also revokes an existing connection.
+            current = self.db.fetch_one(
+                "SELECT status,must_change_password,role FROM users WHERE user_id=?",
+                (self.actor["user_id"],),
+            )
+            if (not current or current["status"] != "active" or current["must_change_password"]
+                    or current["role"] != self.actor["role"]):
+                raise PermissionDenied("OpenClaw 绑定账号已失效，请重新连接")
             return self._handlers[name](arguments)
         except OpenClawToolError:
             raise
@@ -183,9 +205,21 @@ class OpenClawAdapter:
                                             self.actor["user_id"], self.actor["role"])
 
     def _ask_course(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self.campus.ask(_string(arguments, "course_id", max_length=80),
-                               self.actor["user_id"], self.actor["role"],
-                               _string(arguments, "question", max_length=2000))
+        from account_ai_service import AccountAiService
+        from openclaw_settings import load_shared_ai_settings
+
+        knowledge_config = self.actor["role"] == "teacher" and self.db.fetch_one(
+            "SELECT 1 FROM teacher_ai_settings WHERE teacher_id=?", (self.actor["user_id"],)
+        )
+        if knowledge_config:
+            settings = {**load_shared_ai_settings(self.actor["user_id"], self.db.db_path),
+                        "mode": "custom", "configured": True}
+        else:
+            settings = AccountAiService(self.db).resolve(self.actor["user_id"])
+        with config.use_request_ai_settings(settings):
+            return self.campus.ask(_string(arguments, "course_id", max_length=80),
+                                   self.actor["user_id"], self.actor["role"],
+                                   _string(arguments, "question", max_length=2000))
 
     def _learning_profile(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.campus.profile(_string(arguments, "course_id", max_length=80),
@@ -194,9 +228,13 @@ class OpenClawAdapter:
     def _class_analysis(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.actor["role"] != "teacher":
             raise ValidationError("班级分析仅供教师查看")
+        if not config.teacher_portal_enabled_for(self.actor):
+            raise PermissionDenied("教师 Agent 当前已禁用，请先启用 ZHIJIAO_TEACHER_AGENT_ENABLED")
         class_id = arguments.get("class_id")
         if class_id is not None and not isinstance(class_id, str):
             raise OpenClawToolError("class_id 必须是字符串")
+        if class_id and len(class_id) > 80:
+            raise OpenClawToolError("class_id 不能超过 80 个字符")
         return self.campus.class_analysis(_string(arguments, "course_id", max_length=80),
                                           self.actor["user_id"],
                                           class_id.strip() if class_id and class_id.strip() else None)

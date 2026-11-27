@@ -13,7 +13,7 @@ from campus_service import CampusService
 from config import DB_PATH
 from database import LearningDatabase
 from ingestion_service import IngestionService
-from runtime_contract import RUNTIME_SOURCE_FINGERPRINT
+from runtime_contract import RUNTIME_SOURCE_FINGERPRINT, runtime_instance_id
 
 
 def acquire_single_worker_lock():
@@ -37,7 +37,7 @@ def serve_runtime_contract(handle: socket.socket) -> None:
         try:
             connection, _address = handle.accept()
             with connection:
-                connection.sendall(RUNTIME_SOURCE_FINGERPRINT.encode("ascii"))
+                connection.sendall((RUNTIME_SOURCE_FINGERPRINT + ":" + runtime_instance_id()).encode("ascii"))
         except OSError:
             return
 

@@ -104,6 +104,55 @@ def test_cancel_retry_and_health_report(setup):
     assert health["cloud_model_calls"] == health["cloud_tokens"] == 0
 
 
+def test_pdf_block_ids_are_unique_across_documents_and_cached_retries(setup, monkeypatch):
+    from adaptive_ingestion import BatchParser, DocumentInspection, PageInspection
+
+    db, _, ingestion, teacher, course = setup
+
+    class NativeOnlyMinerU:
+        enabled = True
+
+        def parse(self, *_args, **_kwargs):
+            raise AssertionError("FAST pages must use the native text channel")
+
+    ingestion.mineru = NativeOnlyMinerU()
+
+    def parse_cached_pdf(job, path):
+        page = PageInspection(
+            page_index=0, native_text="关系模型由关系、属性和元组构成。", native_text_chars=18,
+            page_type="CONTENT", parse_level="FAST", include_as_knowledge=True,
+        )
+        return BatchParser(ingestion.mineru).run(
+            path, job["document_id"], DocumentInspection(1, "native", [page]),
+            ingestion._adaptive_output_root(job),
+        )
+
+    monkeypatch.setattr(ingestion, "_process_pdf_adaptive", parse_cached_pdf)
+    jobs = [ingestion.queue_document(
+        teacher, course["course_id"], f"lesson-{index}.pdf", "application/pdf",
+        f"%PDF-1.4 fixture {index}".encode(), analysis_mode="local",
+    ) for index in range(2)]
+    saved_ids = []
+    for job in jobs:
+        ingestion.process_job(job["job_id"])
+        result = ingestion.get_job(teacher, job["job_id"])
+        assert result["status"] == "review_required", result.get("error_message")
+        blocks = ingestion.list_blocks(teacher, job["document_id"])
+        assert len(blocks) == 1
+        assert blocks[0]["block_id"] == f"{job['document_id']}_p0001_b001"
+        saved_ids.append(blocks[0]["block_id"])
+    assert len(set(saved_ids)) == 2
+
+    # The resumable batch file still contains the legacy page-local ID.
+    db.execute("UPDATE ingestion_jobs SET status='failed' WHERE job_id=?", (jobs[1]["job_id"],))
+    ingestion.retry_job(teacher, jobs[1]["job_id"])
+    ingestion.process_job(jobs[1]["job_id"])
+    assert ingestion.get_job(teacher, jobs[1]["job_id"])["status"] == "review_required"
+    assert ingestion.list_blocks(teacher, jobs[1]["document_id"])[0]["block_id"] == saved_ids[1]
+    assert ingestion.list_blocks(teacher, jobs[0]["document_id"])[0]["block_id"] == saved_ids[0]
+    assert db.fetch_one("SELECT COUNT(*) n FROM document_blocks")["n"] == 2
+
+
 def test_teaching_overview_loads_without_learning_events(setup):
     _, _, ingestion, teacher, course = setup
 

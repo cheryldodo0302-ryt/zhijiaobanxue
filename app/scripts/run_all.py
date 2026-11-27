@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from runtime_contract import source_fingerprint
+from runtime_contract import source_fingerprint, runtime_instance_id
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -54,7 +54,7 @@ def worker_supports_current_contract() -> bool:
         with socket.create_connection(("127.0.0.1", WORKER_LOCK_PORT), timeout=1) as connection:
             connection.settimeout(1)
             loaded_fingerprint = connection.recv(128).decode("ascii").strip()
-        return loaded_fingerprint == source_fingerprint()
+        return loaded_fingerprint == source_fingerprint() + ":" + runtime_instance_id()
     except (OSError, UnicodeDecodeError):
         return False
 
@@ -176,7 +176,7 @@ def start_worker_or_reuse(
     while time.monotonic() < deadline:
         return_code = worker.process.poll()
         if return_code is not None:
-            if port_is_bound(WORKER_LOCK_PORT):
+            if port_is_bound(WORKER_LOCK_PORT) and worker_supports_current_contract():
                 managed.remove(worker)
                 reused.append(f"WORKER({WORKER_LOCK_PORT})")
                 print(
@@ -238,7 +238,7 @@ def main() -> int:
                 flush=True,
             )
             print(
-                "[API] 请先关闭旧的启动窗口/进程，再重新执行 .\\start.ps1 -Mode all。",
+                "[API] 请先关闭旧的启动窗口，再重新双击智教伴学.exe。",
                 file=sys.stderr,
                 flush=True,
             )

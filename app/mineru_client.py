@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import io
 import json
-import os
 import zipfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import requests
+
+from parser_transport import PARSER_FAILURES, create_parser_session, parser_failure
 
 from config import get_runtime_setting
 
@@ -27,11 +27,7 @@ class MinerUClient:
         self.verify_tls = get_runtime_setting("ZHIJIAO_MINERU_VERIFY_TLS", "1").lower() not in {
             "0", "false", "no", "off",
         }
-        self.session = requests.Session()
-        if urlparse(self.base_url).hostname in {"127.0.0.1", "localhost", "::1"}:
-            # Codex/VS Code commonly inject system proxy variables. Loopback
-            # parser traffic must never be sent through that proxy.
-            self.session.trust_env = False
+        self.session = create_parser_session(self.base_url)
 
     @property
     def headers(self) -> dict[str, str]:
@@ -56,33 +52,35 @@ class MinerUClient:
               table_enable: bool = True) -> dict[str, Any]:
         if not self.enabled:
             raise MinerUError("MinerU worker is not configured")
-        with path.open("rb") as stream:
-            response = self.session.post(
-                f"{self.base_url}/file_parse",
-                files={"files": (path.name, stream, "application/octet-stream")},
-                data={
-                    "backend": get_runtime_setting("ZHIJIAO_MINERU_BACKEND", "pipeline"),
-                    "parse_method": method,
-                    "lang_list": get_runtime_setting("ZHIJIAO_MINERU_LANG", "ch"),
-                    "formula_enable": str(bool(formula_enable)).lower(),
-                    "table_enable": str(bool(table_enable)).lower(),
-                    "return_md": "true",
-                    "return_middle_json": "true",
-                    "return_content_list": "true",
-                    "return_images": "true",
-                    "response_format_zip": "true",
-                    "return_original_file": "false",
-                },
-                headers=self.headers,
-                timeout=(30, self.timeout),
-                verify=self.verify_tls,
-            )
-        if response.status_code >= 400:
-            raise MinerUError(f"MinerU {response.status_code}: {response.text[:500]}")
+        try:
+            with path.open("rb") as stream:
+                response = self.session.post(
+                    f"{self.base_url}/file_parse",
+                    files={"files": (path.name, stream, "application/octet-stream")},
+                    data={
+                        "backend": get_runtime_setting("ZHIJIAO_MINERU_BACKEND", "pipeline"),
+                        "parse_method": method,
+                        "lang_list": get_runtime_setting("ZHIJIAO_MINERU_LANG", "ch"),
+                        "formula_enable": str(bool(formula_enable)).lower(),
+                        "table_enable": str(bool(table_enable)).lower(),
+                        "return_md": "true",
+                        "return_middle_json": "true",
+                        "return_content_list": "true",
+                        "return_images": "true",
+                        "response_format_zip": "true",
+                        "return_original_file": "false",
+                    },
+                    headers=self.headers,
+                    timeout=(30, self.timeout),
+                    verify=self.verify_tls,
+                )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise MinerUError(PARSER_FAILURES[parser_failure(exc)]) from exc
         try:
             archive = zipfile.ZipFile(io.BytesIO(response.content))
         except zipfile.BadZipFile as exc:
-            raise MinerUError("MinerU did not return a ZIP result") from exc
+            raise MinerUError("解析服务返回了无效的 ZIP 结果，请检查服务配置。") from exc
         names = archive.namelist()
         if raw_dir is not None:
             raw_dir.mkdir(parents=True, exist_ok=True)
@@ -95,7 +93,7 @@ class MinerUClient:
                 destination.write_bytes(archive.read(name))
         middle = next((name for name in names if name.endswith("_middle.json") or name.endswith("middle.json")), None)
         if not middle:
-            raise MinerUError(f"MinerU result has no middle.json: {names[:20]}")
+            raise MinerUError("解析结果缺少 middle.json，请检查解析服务版本。")
         payload = json.loads(archive.read(middle).decode("utf-8"))
         payload["_archive_files"] = names
         markdown_name = next(

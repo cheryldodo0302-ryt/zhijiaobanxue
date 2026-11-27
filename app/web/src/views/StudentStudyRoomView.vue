@@ -8,7 +8,7 @@ import { BrowserStudyAnalyzer, type StudyAiResult } from '../studyRoomAi'
 const route = useRoute()
 const router = useRouter()
 const loading = ref(false)
-const status = ref<any>({ status: '等待开始', learning: false, score: 0, focus: 0, study_time: 0 })
+const status = ref<any>({ status: '等待开始', learning: false, score: null, focus: null, study_time: 0 })
 const records = ref<any[]>([])
 const todos = ref<any[]>([])
 const todoTitle = ref('')
@@ -79,7 +79,7 @@ async function saveSharingGrant() {
     ElMessage.error(error.response?.data?.detail || '保存授权失败，请重试')
   } finally { sharingBusy.value = false }
 }
-const statistics = ref<any>({ total_sessions: 0, total_study_time: 0, average_score: 0, average_focus: 0, best_score: 0 })
+const statistics = ref<any>({ total_sessions: 0, total_study_time: 0, average_score: null, average_focus: null, best_score: null })
 const videoRef = ref<HTMLVideoElement | null>(null)
 const cameraReady = ref(false)
 const cameraMessage = ref('摄像头画面只在本浏览器显示，仅上传识别后的统计信号。')
@@ -96,8 +96,11 @@ let telemetryTimer: number | undefined
 let telemetryPromise: Promise<void> | null = null
 
 const isLearning = computed(() => Boolean(status.value.learning))
-const minutes = computed(() => Math.floor(Number(status.value.study_time || 0) / 60))
-const seconds = computed(() => Math.floor(Number(status.value.study_time || 0) % 60).toString().padStart(2, '0'))
+const minutes = computed(() => Math.floor(Number(status.value.elapsed_seconds || 0) / 60))
+const seconds = computed(() => Math.floor(Number(status.value.elapsed_seconds || 0) % 60).toString().padStart(2, '0'))
+function assessment(value: number | null, unit = '') {
+  return value == null ? '未评估' : value.toFixed(1) + unit
+}
 const scoreClass = computed(() => {
   const score = Number(status.value.score || 0)
   return score >= 80 ? 'good' : score >= 60 ? 'normal' : 'low'
@@ -113,7 +116,7 @@ async function loadData() {
     status.value = current.data
     records.value = history.data
     statistics.value = summary.data
-    if (!status.value.learning) stopStudyCamera()
+    if (!loading.value && !status.value.learning) stopStudyCamera()
   } catch (error: any) {
     ElMessage.error(error.response?.data?.detail || '自习室状态加载失败')
   }
@@ -222,6 +225,15 @@ function startPolling() {
 async function startStudy() {
   loading.value = true
   try {
+    let useCamera = true
+    try {
+      await ElMessageBox.confirm('摄像头用于在本机识别学习状态，只上传统计信号。累计有效样本达到 60 秒后才评分。你也可以选择只记录时长。', '摄像头使用授权', {
+        confirmButtonText: '同意并启用摄像头', cancelButtonText: '仅计时', distinguishCancelAndClose: true,
+      })
+    } catch (choice) {
+      if (choice !== 'cancel') return
+      useCamera = false
+    }
     let sharing = {}
     if (sharingEnabled.value) {
       const scope = sharingScopes.value.find(s => s.class_id === sharingClass.value)
@@ -235,7 +247,9 @@ async function startStudy() {
     latestAiResult = null
     latestAiAt = 0
     latestVideoTime = -1
-    try {
+    if (!useCamera) {
+      cameraMessage.value = '本次仅计时，摄像头未开启。'
+    } else try {
       browserStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false })
       cameraReady.value = true
       cameraMessage.value = '摄像头已开启，正在启动本地识别。'
@@ -251,7 +265,7 @@ async function startStudy() {
       startTelemetry()
     }
     startPolling()
-    ElMessage.success(cameraReady.value ? '自习已开始，本地 模型识别已开启' : '自习计时已开始')
+    ElMessage.success(aiReady.value ? '自习已开始，本地 模型识别已开启' : '自习计时已开始')
   } catch (error: any) {
     ElMessage.error(error.response?.data?.detail || '无法开始自习')
   } finally { loading.value = false }
@@ -266,7 +280,7 @@ async function finishStudy() {
     status.value = data
     stopStudyCamera()
     await loadData()
-    ElMessage.success(`本次自习已保存，综合分 ${Number(data.score || 0).toFixed(1)}`)
+    ElMessage.success(data.score == null ? '已保存自习时长，本次未评估' : `本次自习已保存，综合分 ${Number(data.score || 0).toFixed(1)}`)
   } catch (error: any) {
     ElMessage.error(error.response?.data?.detail || '结束自习失败')
   } finally { loading.value = false }
@@ -325,8 +339,8 @@ onUnmounted(() => {
         <div v-show="cameraReady" class="study-video-wrap"><video ref="videoRef" autoplay muted playsinline aria-label="本地摄像头预览" /></div>
         <div v-if="!cameraReady" class="study-video-placeholder"><span class="study-video-icon">◉</span><b>{{ aiLoading ? '正在加载本地识别服务' : '本地摄像头未开启' }}</b><p class="muted">开始自习时浏览器会请求权限；拒绝授权会切换为仅计时。</p></div>
         <div class="study-metrics">
-          <div><span>实时分</span><strong :class="scoreClass">{{ Number(status.score || 0).toFixed(1) }}</strong></div>
-          <div><span>专注度</span><strong>{{ Number(status.focus || 0).toFixed(1) }}%</strong></div>
+          <div><span>实时分</span><strong :class="scoreClass">{{ assessment(status.score) }}</strong></div>
+          <div><span>专注度</span><strong>{{ assessment(status.focus, '%') }}</strong></div>
           <div><span>本场时长</span><strong>{{ minutes }}:{{ seconds }}</strong></div>
         </div>
       </el-card>
@@ -337,8 +351,9 @@ onUnmounted(() => {
         <div class="study-summary-grid">
           <div><span>累计场次</span><strong>{{ statistics.total_sessions || 0 }}</strong></div>
           <div><span>累计时长</span><strong>{{ Math.round(Number(statistics.total_study_time || 0) / 60) }} 分钟</strong></div>
-          <div><span>平均综合分</span><strong>{{ Number(statistics.average_score || 0).toFixed(1) }}</strong></div>
-          <div><span>最高综合分</span><strong>{{ Number(statistics.best_score || 0).toFixed(1) }}</strong></div>
+          <div><span>有效评估场次</span><strong>{{ statistics.evaluated_sessions || 0 }}</strong></div>
+          <div><span>平均综合分</span><strong>{{ assessment(statistics.average_score) }}</strong></div>
+          <div><span>最高综合分</span><strong>{{ assessment(statistics.best_score) }}</strong></div>
         </div>
         <el-divider />
         <p class="muted small">模型在浏览器本地运行，不上传画面；后端按参考模型计算专注度、实时分和结束综合分。</p>
@@ -375,9 +390,9 @@ onUnmounted(() => {
       <el-table v-else :data="records" stripe>
         <el-table-column prop="date" label="日期" width="130" />
         <el-table-column prop="start_time" label="开始" width="110" />
-        <el-table-column label="时长" width="100"><template #default="scope">{{ Math.round(Number(scope.row.study_time || 0) / 60) }} 分钟</template></el-table-column>
-        <el-table-column label="综合分" width="100"><template #default="scope"><el-tag>{{ Number(scope.row.score || 0).toFixed(1) }}</el-tag></template></el-table-column>
-        <el-table-column label="专注度" width="100"><template #default="scope">{{ Number(scope.row.focus || 0).toFixed(1) }}%</template></el-table-column>
+        <el-table-column label="时长" width="100"><template #default="scope">{{ Math.round(Number(scope.row.elapsed_seconds || 0) / 60) }} 分钟</template></el-table-column>
+        <el-table-column label="综合分" width="100"><template #default="scope"><el-tag>{{ assessment(scope.row.score) }}</el-tag></template></el-table-column>
+        <el-table-column label="专注度" width="100"><template #default="scope">{{ assessment(scope.row.focus, '%') }}</template></el-table-column>
         <el-table-column prop="evaluation" label="评价" min-width="260" />
       </el-table>
     </el-card>

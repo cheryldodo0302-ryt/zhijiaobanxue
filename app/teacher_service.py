@@ -14,7 +14,7 @@ from openpyxl import load_workbook
 
 from campus_service import CampusService, PermissionDenied, ValidationError
 from database import LearningDatabase
-from config import get_runtime_setting, get_student_default_password
+from config import get_runtime_setting
 from institution_anonymization import anonymize_text
 
 
@@ -449,7 +449,7 @@ class TeacherService:
 
     def list_members(self, actor: dict[str, Any], class_id: str) -> list[dict[str, Any]]:
         self.require_class(actor, class_id)
-        return self.db.fetch_all(
+        members = self.db.fetch_all(
             """SELECT m.student_id AS user_id,u.student_number,u.username,u.display_name,
                       u.must_change_password,u.password_changed_at,
                       m.anonymous_id,m.status,m.created_at
@@ -457,6 +457,24 @@ class TeacherService:
                WHERE m.class_id=? ORDER BY m.created_at""",
             (class_id,),
         )
+        # One student account can belong to several course classes. Expose only
+        # this teacher's active memberships, never another teacher's roster.
+        joined = self.db.fetch_all(
+            """SELECT m.student_id,cl.class_id,cl.class_name,cl.course_id,c.course_name,t.term_name
+               FROM class_memberships m JOIN classes cl USING(class_id)
+               JOIN courses c USING(course_id) JOIN terms t USING(term_id)
+               WHERE cl.teacher_id=? AND cl.status='active' AND m.status='active'
+                 AND m.student_id IN (SELECT student_id FROM class_memberships WHERE class_id=?)
+               ORDER BY c.course_name,t.term_name,cl.class_name,cl.class_id""",
+            (actor["user_id"], class_id),
+        )
+        by_student: dict[str, list[dict[str, Any]]] = {}
+        for membership in joined:
+            student_id = membership.pop("student_id")
+            by_student.setdefault(student_id, []).append(membership)
+        for member in members:
+            member["joined_classes"] = by_student.get(member["user_id"], [])
+        return members
 
     def reset_student_password(self, actor: dict[str, Any], class_id: str,
                                student_id: str, new_password: str) -> dict[str, Any]:
@@ -501,10 +519,6 @@ class TeacherService:
             raise ValidationError("学生名单不能为空")
         if len(rows) > 5000:
             raise ValidationError("单次最多导入 5000 行")
-        default_password = get_student_default_password()
-        if not default_password:
-            raise ValidationError("未配置 ZHIJIAO_STUDENT_DEFAULT_PASSWORD，无法创建学生账号")
-
         results: list[dict[str, Any]] = []
         for index, raw in enumerate(rows, 1):
             number = str(raw.get("student_number") or "").strip().lower()
@@ -542,7 +556,7 @@ class TeacherService:
                         conn.execute(
                             """INSERT INTO users(user_id,username,password_hash,role,display_name,student_number,must_change_password)
                                VALUES(?,?,?,'student',?,?,1)""",
-                            (user_id, number, self.passwords.hash(default_password), name, number),
+                            (user_id, number, self.passwords.hash(number), name, number),
                         )
                         created = True
                     # Convert a legacy membership/enrollment that stored the school
@@ -576,7 +590,7 @@ class TeacherService:
                             (scope["course_id"], user_id),
                         )
                         status = "created" if created else "reused"
-                results.append({**base, "user_id": user_id, "status": status, "message": "该学生已在本班，未重复添加" if status == "already_member" else "复用已有学生账号" if status == "reused" else "已创建学生账号"})
+                results.append({**base, "user_id": user_id, "status": status, "message": "该学生已在本班，密码保持不变" if status == "already_member" else "复用已有学生账号，密码保持不变" if status == "reused" else "已创建学生账号，初始密码为本人学号，首次登录需修改密码"})
             except Exception as exc:
                 results.append({**base, "status": "conflict", "message": str(exc)[:160]})
         summary = {key: sum(1 for item in results if item["status"] == key)

@@ -25,28 +25,43 @@ def teacher_scope(tmp_path):
 
 
 def test_import_creates_login_and_forces_password_change(tmp_path, monkeypatch):
-    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "initial-password-123")
+    import config
+    monkeypatch.delenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", raising=False)
+    monkeypatch.setattr(config, "SERVER_ENV", tmp_path / "no-server.env")
     db, campus, auth, service, teacher, course, klass = teacher_scope(tmp_path)
     imported = service.import_members(teacher, klass["class_id"], [
         {"student_number": "20260001", "display_name": "张三"},
         {"student_number": "20260001", "display_name": "重复"},
         {"student_number": "bad number"},
+        {"student_number": "20260002", "display_name": "李四"},
     ])
-    assert imported["summary"] == {"created": 1, "reused": 0, "already_member": 0, "conflict": 1, "invalid": 1}
+    assert imported["summary"] == {"created": 2, "reused": 0, "already_member": 0, "conflict": 1, "invalid": 1}
     row = db.fetch_one("SELECT * FROM users WHERE student_number='20260001'")
-    assert row["password_hash"] != "initial-password-123"
-    PasswordHasher().verify(row["password_hash"], "initial-password-123")
-    student, _, refresh = auth.login("20260001", "initial-password-123")
+    assert row["password_hash"] != "20260001"
+    PasswordHasher().verify(row["password_hash"], "20260001")
+    assert "初始密码为本人学号" in imported["results"][0]["message"]
+    assert auth.login("20260002", "20260002")[0]["must_change_password"] == 1
+    with pytest.raises(PermissionDenied):
+        auth.login("20260002", "20260001")
+    student, _, refresh = auth.login("20260001", "20260001")
     assert student["must_change_password"] == 1
-    updated, _, _ = auth.change_password(student, "initial-password-123", "personal-password-456")
+    updated, _, _ = auth.change_password(student, "20260001", "personal-password-456")
     assert updated["must_change_password"] == 0
     with pytest.raises(PermissionDenied):
         auth.refresh(refresh)
     assert campus.list_courses(updated["user_id"], "student")[0]["course_id"] == course["course_id"]
+    repeated = service.import_members(teacher, klass["class_id"], [{"student_number": "20260001", "display_name": "张三"}])
+    assert repeated["results"][0]["status"] == "already_member"
+    assert "密码保持不变" in repeated["results"][0]["message"]
+    assert auth.login("20260001", "personal-password-456")[0]["must_change_password"] == 0
+    with pytest.raises(PermissionDenied):
+        auth.login("20260001", "20260001")
+    assert not config.SERVER_ENV.exists()
 
 
 def test_import_reuses_student_and_rejects_teacher_collision(tmp_path, monkeypatch):
-    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "initial-password-123")
+    # A leftover deployment setting cannot override the per-student policy.
+    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "ignored-legacy-password")
     _, _, auth, service, teacher, _, klass = teacher_scope(tmp_path)
     existing = auth.create_user("20260002", "existing-password-123", "student")
     auth.create_user("20260003", "teacher-password-123", "teacher")
@@ -56,16 +71,22 @@ def test_import_reuses_student_and_rejects_teacher_collision(tmp_path, monkeypat
     assert [row["status"] for row in result["results"]] == ["reused", "conflict"]
     auth.login("20260002", "existing-password-123")
     assert result["members"][0]["user_id"] == existing["user_id"]
+    created = service.import_members(teacher, klass["class_id"], [{"student_number": "20260004"}])
+    assert created["summary"]["created"] == 1
+    auth.login("20260004", "20260004")
+    with pytest.raises(PermissionDenied):
+        auth.login("20260004", "ignored-legacy-password")
 
 
-def test_csv_and_xlsx_headers_and_limit(tmp_path, monkeypatch):
-    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "initial-password-123")
-    _, _, _, service, teacher, _, klass = teacher_scope(tmp_path)
+def test_csv_and_xlsx_headers_and_limit(tmp_path):
+    _, _, auth, service, teacher, _, klass = teacher_scope(tmp_path)
     csv_result = service.import_member_file(teacher, klass["class_id"], "students.csv", "学号,姓名\n20260011,李四\n".encode())
     assert csv_result["summary"]["created"] == 1
-    workbook = Workbook(); sheet = workbook.active; sheet.append(["student_number", "display_name"]); sheet.append(["20260012", "王五"])
+    auth.login("20260011", "20260011")
+    workbook = Workbook(); sheet = workbook.active; sheet.append(["student_number", "display_name"]); sheet.append(["002612", "王五"])
     stream = io.BytesIO(); workbook.save(stream)
     assert service.import_member_file(teacher, klass["class_id"], "students.xlsx", stream.getvalue())["summary"]["created"] == 1
+    assert auth.login("002612", "002612")[0]["student_number"] == "002612"
     with pytest.raises(ValidationError, match="缺少"):
         service.import_member_file(teacher, klass["class_id"], "bad.csv", b"name\nfoo\n")
     with pytest.raises(ValidationError, match="5000"):

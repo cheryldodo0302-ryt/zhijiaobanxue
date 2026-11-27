@@ -55,7 +55,7 @@ function render(){
     id:node.graph_node_id,name:node.title,value,category:category(node),
     symbolSize:node.is_exam?48:node.is_difficult?42:node.is_key?38:30,
     itemStyle:{opacity:needle&&!String(node.title).toLocaleLowerCase().includes(needle)?.34:1},
-    label:{show:Boolean(needle)||nodeGroups.value.length<80},
+    label:{show:true},
   }})
   const ids=new Set(graphNodes.map(node=>node.id))
   const relationKeys=new Set<string>()

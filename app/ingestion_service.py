@@ -9,6 +9,9 @@ import re
 import shutil
 import subprocess
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
+from threading import Lock
+from parser_transport import parser_failure
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -95,6 +98,9 @@ class IngestionService:
         self.campus = campus
         self.mineru = MinerUClient()
         self.formula = Pix2TextClient()
+        self._health_workers = ThreadPoolExecutor(max_workers=2)
+        self._health_lock = Lock()
+        self._health_pending = {}
         self.semantic = SemanticKnowledgeService(campus.provider_factory)
         self.region_classifier = RegionClassifier()
         self.structure_builder = StructureBuilder()
@@ -303,6 +309,11 @@ class IngestionService:
         page_rows = {int(row.get("page_number") or 0): row for row in (pages or [])}
         for index, block in enumerate(blocks, 1):
             block.setdefault("block_id", f"{document_id or 'source'}_b{index:06d}")
+            # Adaptive batches (including saved batches from older versions)
+            # use page-local IDs, while document_blocks has a global primary key.
+            # Scope them before building any region or outline references.
+            if document_id and not str(block["block_id"]).startswith(f"{document_id}_"):
+                block["block_id"] = f"{document_id}_{block['block_id']}"
             page_number = int(block.get("page_number") or 1)
             page = page_rows.get(page_number, {})
             block.setdefault("page_index", page_number - 1)
@@ -5683,16 +5694,29 @@ html{background:#eef1f5}body{box-sizing:border-box;max-width:960px;min-height:10
 
     def parser_status(self) -> dict[str, Any]:
         def check(client: Any) -> dict[str, Any]:
-            if not client.enabled:
-                return {"enabled": False, "status": "not_configured", "url": ""}
             try:
                 result = client.health()
-                return {**result, "url": client.base_url}
+                return {"enabled": True, "status": result.get("status", "unknown")}
             except Exception as exc:
-                return {"enabled": True, "status": "unreachable", "url": client.base_url, "error": str(exc)[:300]}
+                return {"enabled": True, "status": parser_failure(exc)}
+
+        services = {"mineru": self.mineru, "pix2text": self.formula}
+        with self._health_lock:
+            probes = {}
+            for key, client in services.items():
+                if client.enabled:
+                    pending = self._health_pending.get(key)
+                    if pending is None or pending.done():
+                        pending = self._health_workers.submit(check, client)
+                        self._health_pending[key] = pending
+                    probes[key] = pending
+        finished, _ = wait(probes.values(), timeout=4)
+        status = {key: {"enabled": False, "status": "not_configured"} for key in services}
+        for key, probe in probes.items():
+            status[key] = probe.result() if probe in finished else {"enabled": True, "status": "timeout"}
         settings = get_knowledge_extractor_settings()
         return {
-            "mineru": check(self.mineru), "pix2text": check(self.formula),
+            **status,
             "knowledge_extractor": {
                 "backend": "builtin", "status": "ok", "uses_torch": False,
                 "configured_backend": settings.get("configured_backend", "builtin"),

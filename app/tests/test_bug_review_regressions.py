@@ -44,7 +44,6 @@ def test_calendar_adjustment_atomicity_and_scope(services):
 
 
 def test_student_number_validation_and_duplicate_identity(services, monkeypatch):
-    monkeypatch.setenv('ZHIJIAO_STUDENT_DEFAULT_PASSWORD', 'initial-password-123')
     db, auth, teachers, actor, course, group = setup_class(services)
     def add(number, name='张同学'):
         return teachers.import_members(actor, group['class_id'], [{'student_number': number, 'display_name': name}])['results'][0]

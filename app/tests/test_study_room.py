@@ -77,3 +77,32 @@ def test_metrics_update_focus_realtime_and_final_score_without_zero_defaults():
     assert metrics.realtime_score(now=2.1) > 0
     assert metrics.focus() > 0
     assert metrics.final_score() > 0
+
+def test_timer_only_and_sample_threshold(tmp_path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("browser_study_room_service.time.monotonic", lambda: clock[0])
+    room = BrowserStudyRoomService(tmp_path / "sampling.db")
+    uid = "student"
+    room.start(uid)
+    clock[0] += 120
+    assert room.telemetry(uid, {"camera_available": False})["focus"] is None
+    saved = room.finish(uid)
+    assert saved["score"] is None and saved["elapsed_seconds"] == 120
+    assert room.records(uid)[0]["evaluation"] == "本次仅计时，未进行视觉状态评估"
+    assert room.statistics(uid)["average_score"] is None
+
+    room.start(uid)
+    signal = dict(camera_available=True, face_ok=True, person_ok=True, head_ok=True)
+    for _ in range(60):
+        clock[0] += 1
+        assert room.telemetry(uid, signal)["score"] is None
+    clock[0] += 1
+    assert room.telemetry(uid, signal)["score"] is not None
+    clock[0] += 20
+    assert room.status(uid)["score"] is None
+    record = room.finish(uid)
+    assert record["valid_sample_seconds"] == 60
+    stats = room.statistics(uid)
+    assert stats["evaluated_sessions"] == 1 and stats["total_sessions"] == 2
+    assert stats["average_score"] == record["score"]
+    assert stats["total_study_time"] == 201

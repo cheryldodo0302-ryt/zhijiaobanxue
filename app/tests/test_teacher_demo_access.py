@@ -11,6 +11,7 @@ def test_bundled_demo_teacher_can_use_teacher_service_while_portal_is_closed(tmp
     regular_actor = {"user_id": "teacher_001", "role": "teacher"}
 
     assert config.teacher_portal_enabled_for(demo_actor) is True
+    assert config.teacher_portal_enabled_for({"user_id": "demo_showcase_teacher_001", "role": "teacher"}) is True
     assert config.teacher_portal_enabled_for(regular_actor) is False
 
     db = LearningDatabase(tmp_path / "demo-access.db")

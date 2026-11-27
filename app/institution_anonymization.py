@@ -66,8 +66,13 @@ def _replace_builtin_fingerprints(value: str) -> str:
     for length in lengths:
         index = 0
         while index <= len(result) - length:
-            digest = sha256(result[index:index + length].encode("utf-8")).hexdigest()
+            candidate = result[index:index + length]
+            # Historical English digests were generated from title-case names.
+            canonical = candidate.title() if candidate.isascii() else candidate
+            digest = sha256(canonical.encode("utf-8")).hexdigest()
             replacement = _BUILTIN_FINGERPRINTS.get((length, digest))
+            if replacement is None and canonical != candidate:
+                replacement = _BUILTIN_FINGERPRINTS.get((length, sha256(candidate.encode("utf-8")).hexdigest()))
             if replacement is None:
                 index += 1
                 continue

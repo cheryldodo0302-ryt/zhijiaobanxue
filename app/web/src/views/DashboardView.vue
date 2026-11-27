@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api } from '../api'
-const courses=ref<any[]>([]), classes=ref<any[]>([]), jobs=ref<any[]>([]), questions=ref<any[]>([]), config=ref<any>(null)
+const courses=ref<any[]>([]), classes=ref<any[]>([]), jobs=ref<any[]>([]), questions=ref<any[]>([])
 const loading=ref(true), error=ref('')
 const students=computed(()=>classes.value.reduce((n,x)=>n+Number(x.member_count||0),0))
 const pending=computed(()=>[
@@ -13,8 +13,8 @@ const page=ref(1), visiblePending=computed(()=>pending.value.slice((page.value-1
 async function load(){
  loading.value=true;error.value=''
  try{
-  const [c,k,s]=await Promise.all([api.get('/teacher/courses'),api.get('/teacher/classes'),api.get('/system/student-import-config')])
-  courses.value=c.data;classes.value=k.data;config.value=s.data
+  const [c,k]=await Promise.all([api.get('/teacher/courses'),api.get('/teacher/classes')])
+  courses.value=c.data;classes.value=k.data
   const details=await Promise.all(courses.value.map(async course=>{
    const [j,q]=await Promise.all([api.get(`/teacher/courses/${course.course_id}/ingestion-jobs`),api.get(`/teacher/courses/${course.course_id}/question-bank`)])
    const scope={course_id:course.course_id,course_name:course.course_name}
@@ -29,8 +29,7 @@ onMounted(load)
 <template>
  <main class="content dashboard">
   <header class="dashboard-heading"><div><h1>工作台概览</h1><p>先处理需要关注的内容，再继续课程建设。</p></div><el-button :loading="loading" @click="load">刷新</el-button></header>
-  <el-alert v-if="config&&!config.configured" title="学生初始密码未配置" description="请联系系统维护人员配置后再导入学生名单。" type="error" :closable="false"/>
-  <el-alert v-else-if="config?.security_level==='weak'" title="学生统一初始密码强度较弱" description="建议提升密码强度；学生首次登录仍必须修改密码。" type="warning" :closable="false"/>
+  <el-alert title="新导入学生的账号和初始密码均为本人学号" description="首次登录需修改密码；重复导入已有账号时保留原密码。" type="info" :closable="false"/>
   <section class="overview-totals" aria-label="教学规模"><div><span>共享课程</span><strong>{{courses.length}}</strong></div><div><span>教学班</span><strong>{{classes.length}}</strong></div><div><span>班级成员人次</span><strong>{{students}}</strong></div><el-button @click="$router.push('/teaching')">管理课程与教学班</el-button></section>
   <section class="pending-panel" aria-labelledby="pending-heading">
    <div class="pending-heading"><div><h2 id="pending-heading">待处理事项</h2><p>优先显示处理失败的资料，随后是待审核内容。</p></div><span v-if="!loading&&!error">{{pending.length}} 项</span></div>

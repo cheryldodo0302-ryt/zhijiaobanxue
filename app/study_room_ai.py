@@ -172,13 +172,14 @@ class StudyMetrics:
     telemetry_seen: bool = False
     camera_available: bool = False
     calibration_active: bool = False
+    sampled_intervals_only: bool = False
 
     def _prune_window(self, now: float) -> None:
         cutoff = now - REALTIME_WINDOW_SECONDS
         while self.score_window and self.score_window[0][0] < cutoff:
             self.score_window.popleft()
 
-    def _add_time(self, status: str, delta: float) -> None:
+    def add_observed_time(self, status: str, delta: float) -> None:
         if delta <= 0:
             return
         if status == STATE_STUDYING:
@@ -193,13 +194,14 @@ class StudyMetrics:
         delta = max(0.0, current - self.last_activity)
         self.last_activity = current
         # 与参考 ai_server.py 一致，避免轮询中断造成一次性大幅跳变。
-        self._add_time(self.status, min(delta, 1.0))
+        if not self.sampled_intervals_only:
+            self.add_observed_time(self.status, min(delta, 1.0))
         self._prune_window(current)
         return delta
 
     def set_fallback_timer(self, now: float | None = None) -> None:
         self.advance(now)
-        self.status = STATE_STUDYING
+        self.status = "仅计时"
         self.telemetry_seen = True
         self.camera_available = False
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import re
 import secrets
 import string
 import sys
@@ -32,26 +31,12 @@ def main() -> int:
     campus = CampusService(db)
     credential_file = DATA_DIR / "demo_credentials.txt"
     if args.if_empty and db.fetch_one("SELECT 1 ok FROM users LIMIT 1"):
-        text = credential_file.read_text(encoding="utf-8") if credential_file.exists() else ""
-        teacher_match = re.search(r"教师：demo_teacher\s+密码：(\S+)", text)
-        student_match = re.search(r"学生：demo_student\s+密码：(\S+)", text)
-        teacher = db.fetch_one("SELECT password_hash FROM users WHERE user_id='demo_teacher_001'")
-        student = db.fetch_one("SELECT password_hash FROM users WHERE user_id='demo_student_001'")
-        credentials_match = False
-        if teacher and student and teacher_match and student_match:
-            try:
-                credentials_match = bool(
-                    auth.passwords.verify(teacher["password_hash"], teacher_match.group(1))
-                    and auth.passwords.verify(student["password_hash"], student_match.group(1))
-                )
-            except Exception:
-                credentials_match = False
-        if credentials_match:
-            if args.with_demo_course:
-                campus.seed_demo(MATERIALS_DIR)
-            print("[DEMO] 演示账号、密码文件和课程资料一致，无需重置。")
-            return 0
-        print("[DEMO] 演示账号与本机密码文件不一致，只重建虚构演示账号。")
+        # A copied installation may have a missing or outdated credential note.
+        # Never delete existing users: cascades would also erase their AI settings.
+        if args.with_demo_course:
+            campus.seed_demo(MATERIALS_DIR)
+        print("[DEMO] 已有账号，保留账号、模型配置和课程资料。")
+        return 0
     teacher_password = random_password()
     student_password = random_password()
     with db.connect() as conn:

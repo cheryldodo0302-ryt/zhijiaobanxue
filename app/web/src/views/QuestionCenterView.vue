@@ -6,6 +6,7 @@ import { questionAnswerLabel } from '../question-display'
 import { useTeacherWorkspace } from '../teacher-workspace'
 import { useCoursePreferences } from '../course-preferences'
 import { termLabel } from '../term-label'
+import { apiErrorMessage } from '../api-error'
 
 const courses = ref<any[]>([])
 const courseId = ref('')
@@ -49,7 +50,7 @@ const taskLoading = ref(false)
 const taskPublishing = ref(false)
 const taskPublishAttempted = ref(false)
 const fail = (error: any, fallback: string) =>
-  ElMessage.error(error.response?.data?.detail || fallback)
+  ElMessage.error(apiErrorMessage(error, fallback))
 const hasIssue = (item: any) => item.status === 'draft' && (
   !item.answer_markdown || Number(item.recognition_confidence || 0) < 0.7
   || (item.recognition_notes || []).length > 0
@@ -343,12 +344,15 @@ async function publish(folderId = importFolderId.value) {
   } catch (error) { fail(error, '题库发布失败') }
 }
 async function publishTask() {
+  if (taskPublishing.value) return
   taskPublishAttempted.value = true
   if (!courseId.value || !classId.value || !taskTitle.value.trim() || !taskVersionId.value || !taskDue.value || !taskSelectedItems.value.length) {
     return ElMessage.warning('请完成教学班、任务名称、题库、截止时间和题目选择')
   }
   const dueAt = new Date(taskDue.value)
   if (Number.isNaN(dueAt.getTime())) return ElMessage.warning('截止时间格式无效，请重新选择')
+  if (dueAt.getTime() <= Date.now()) return ElMessage.warning('截止时间必须晚于当前时间')
+  if (taskSelectedItems.value.length > 1000) return ElMessage.warning('单次任务最多选择 1000 道题')
   taskPublishing.value = true
   try {
     await api.post(`/teacher/courses/${courseId.value}/classes/${classId.value}/tasks`, {
@@ -605,7 +609,7 @@ onMounted(loadBase)
         <el-table-column prop="stem_markdown" label="题目" min-width="360" show-overflow-tooltip />
         <el-table-column label="分值" width="210"><template #default="scope"><el-input-number class="task-points-input" :model-value="taskPoints[scope.row.item_id] ?? 1" :min="0.01" :max="1000" :precision="2" @update:model-value="taskPoints[scope.row.item_id]=$event ?? 1" /></template></el-table-column>
       </el-table>
-      <div v-if="classId && taskSelectedItems.length" class="task-selection-summary">已选择 {{ taskSelectedItems.length }} 道题，将发布到“{{ selectedClass?.class_name }}”。</div>
+      <div v-if="classId && taskSelectedItems.length" class="task-selection-summary">已选择 {{ taskSelectedItems.length }} 道题（单次最多 1000 道），将发布到“{{ selectedClass?.class_name }}”。</div>
       <el-divider v-if="classId" />
       <div v-if="classId" class="published-task-list">
         <div class="task-selection-heading"><div><h3>当前班级已发布任务</h3></div></div>

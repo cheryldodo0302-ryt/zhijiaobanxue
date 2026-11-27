@@ -24,7 +24,7 @@ from database import LearningDatabase
 from llm_provider import backend_provider_status
 from ingestion_service import IngestionService
 from question_bank_service import QuestionBankService
-from runtime_contract import RUNTIME_SOURCE_FINGERPRINT
+from runtime_contract import RUNTIME_SOURCE_FINGERPRINT, runtime_instance_id
 from teacher_service import TeacherService
 from browser_study_room_service import BrowserStudyRoomService, StudyRoomUnavailable
 from teaching_archive_service import TeachingArchiveService
@@ -94,7 +94,7 @@ class StudyTelemetryPayload(BaseModel):
     hand_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     head_score: float = Field(default=0.0, ge=0.0, le=1.0)
     calibrating: bool = False
-    camera_available: bool = True
+    camera_available: bool = False
 
 
 class StudyStartPayload(BaseModel):
@@ -425,6 +425,8 @@ def health() -> dict:
     return {
         "status": "ok",
         "runtime_source_fingerprint": RUNTIME_SOURCE_FINGERPRINT,
+        "runtime_instance_id": runtime_instance_id(),
+        "desktop_ui": os.environ.get("ZHIJIAO_DESKTOP") == "1",
         "ai_agent": backend_provider_status(),
     }
 

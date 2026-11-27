@@ -11,10 +11,11 @@ from knowledge_graph_service import KnowledgeGraphService
 from teacher_service import TeacherService
 
 
-SAMPLE_ROOT = Path(os.environ.get(
-    "ZHIJIAO_GRAPH_SAMPLE_ROOT",
-    Path(__file__).resolve().parents[3] / "智慧伴学资料" / "智慧伴学资料" / "知识图谱",
-))
+_sample_dir = Path("智慧伴学资料") / "智慧伴学资料" / "知识图谱"
+SAMPLE_ROOT = (Path(os.environ["ZHIJIAO_GRAPH_SAMPLE_ROOT"])
+               if os.environ.get("ZHIJIAO_GRAPH_SAMPLE_ROOT")
+               else next((parent / _sample_dir for parent in Path(__file__).resolve().parents
+                          if (parent / _sample_dir).is_dir()), _sample_dir))
 
 
 def graph_scope(tmp_path: Path):

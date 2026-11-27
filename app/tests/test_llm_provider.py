@@ -20,6 +20,24 @@ def test_openai_full_endpoint_is_not_duplicated():
     assert provider.session.post.call_args.args[0] == "https://example.com/v1/chat/completions"
 
 
+@pytest.mark.parametrize("host,direct", [
+    ("zhijiao-relay-fqvnmaclgo.cn-beijing.fcapp.run", True),
+    ("example.com", False),
+    ("zhijiao-relay-fqvnmaclgo.cn-beijing.fcapp.run.example.com", False),
+])
+def test_relay_bypasses_environment_proxy_only_for_exact_host(monkeypatch, host, direct):
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:10090")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.setenv("no_proxy", "")
+    provider = OpenAICompatibleProvider("key", f"https://{host}/compatible-mode/v1", "server-managed")
+    provider.session.send = Mock(return_value=_response({"choices": [{"message": {"content": "ok"}}]}))
+    assert provider.generate("system", "user") == "ok"
+    options = provider.session.send.call_args.kwargs
+    assert bool(options["proxies"].get("https") or options["proxies"].get("all")) is not direct
+    assert options["verify"]
+
+
 def test_openai_json_generation_requests_structured_output_and_accepts_trailing_text():
     provider = OpenAICompatibleProvider("key", "https://example.com/v1", "model")
     provider.session.post = Mock(return_value=_response({
@@ -96,4 +114,3 @@ def test_gemini_invalid_key_error_explains_provider_mismatch():
     }, status_code=400))
     with pytest.raises(RuntimeError, match="千问、OpenAI 或其他平台"):
         provider.generate("system", "user")
-

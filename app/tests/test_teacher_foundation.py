@@ -35,7 +35,6 @@ def test_teacher_auth_refresh_and_revocation(services):
 
 
 def test_teacher_course_class_scope_and_membership(services, monkeypatch):
-    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "initial-password-123")
     _, auth, teachers = services
     teacher = auth.create_user("teacher-a", "safe-password-123", "teacher")
     other = auth.create_user("teacher-b", "safe-password-456", "teacher")
@@ -50,8 +49,46 @@ def test_teacher_course_class_scope_and_membership(services, monkeypatch):
         teachers.list_members(other, class_row["class_id"])
 
 
+def test_same_cohort_reuses_accounts_across_courses_and_hides_other_teachers(services):
+    db, auth, teachers = services
+    teacher = auth.create_user("cohort-teacher", "safe-password-123", "teacher")
+    other = auth.create_user("cohort-other", "safe-password-456", "teacher")
+    term = teachers.create_term(teacher, "2026 第一学期")
+    canonical_ids = None
+    password_hash = None
+    classes = []
+    for title in ("数据库原理", "Python程序设计", "人工智能导论"):
+        course = teachers.create_course(teacher, title)
+        classroom = teachers.create_class(teacher, course["course_id"], term["term_id"], "信管1班")
+        classes.append(classroom)
+        imported = teachers.import_members(teacher, classroom["class_id"], [
+            {"student_number": "2026240101", "display_name": "陈**"},
+            {"student_number": "2026240102", "display_name": "林**"},
+        ])
+        ids = {row["student_number"]: row["user_id"] for row in imported["members"]}
+        if canonical_ids is None:
+            canonical_ids = ids
+            password_hash = db.fetch_one("SELECT password_hash FROM users WHERE user_id=?", (ids["2026240101"],))["password_hash"]
+        else:
+            assert ids == canonical_ids
+            assert imported["summary"]["created"] == 0
+            assert imported["summary"]["reused"] == 2
+    assert db.fetch_one("SELECT COUNT(*) n FROM users WHERE role='student'")["n"] == 2
+    # An identical masked name with a different school number is another student.
+    imported = teachers.import_members(teacher, classes[0]["class_id"], [{"student_number": "2026240201", "display_name": "陈**"}])
+    assert next(m for m in imported["members"] if m["student_number"] == "2026240201")["user_id"] != canonical_ids["2026240101"]
+    other_term = teachers.create_term(other, "2026 第一学期")
+    other_course = teachers.create_course(other, "其他教师课程")
+    other_class = teachers.create_class(other, other_course["course_id"], other_term["term_id"], "信管1班")
+    teachers.import_members(other, other_class["class_id"], [{"student_number": "2026240101", "display_name": "陈**"}])
+    for classroom in classes:
+        member = next(m for m in teachers.list_members(teacher, classroom["class_id"]) if m["student_number"] == "2026240101")
+        assert {s["class_id"] for s in member["joined_classes"]} == {c["class_id"] for c in classes}
+    assert len(teachers.list_members(other, other_class["class_id"])[0]["joined_classes"]) == 1
+    assert db.fetch_one("SELECT password_hash FROM users WHERE user_id=?", (canonical_ids["2026240101"],))["password_hash"] == password_hash
+
+
 def test_teacher_can_update_and_delete_own_class(services, monkeypatch):
-    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "initial-password-123")
     db, auth, teachers = services
     teacher = auth.create_user("class-editor", "safe-password-123", "teacher")
     other = auth.create_user("class-editor-other", "safe-password-456", "teacher")
@@ -87,7 +124,6 @@ def test_teacher_can_update_and_delete_own_class(services, monkeypatch):
 
 
 def test_teacher_can_reset_only_own_class_student_password(services, monkeypatch):
-    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "initial-password-123")
     db, auth, teachers = services
     teacher = auth.create_user("reset-teacher", "safe-password-123", "teacher")
     other = auth.create_user("other-reset-teacher", "safe-password-456", "teacher")

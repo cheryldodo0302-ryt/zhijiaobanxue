@@ -20,7 +20,6 @@ from teacher_service import TeacherService
 def system(tmp_path, monkeypatch):
     monkeypatch.setattr(job_secret_store, "KEY_PATH", tmp_path / "key")
     monkeypatch.setenv("ZHIJIAO_AI_MODE", "mock")
-    monkeypatch.setenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "initial-password-123")
     db = LearningDatabase(tmp_path / "audit.db")
     campus = CampusService(db, tmp_path / "uploads", provider_factory=MockProvider)
     auth = AuthService(db, tmp_path / "auth-secret")

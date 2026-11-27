@@ -1088,7 +1088,7 @@ class MemoryLearningSkill:
         dashboard = self.student_dashboard(user_id, course_id)
         document = Document(); document.add_heading(f"{course_name} · 个人背诵本", 0)
         if not dashboard["recitation_book"]:
-            document.add_paragraph("暂无背诵错误记录。")
+            raise ValidationError("本课程暂无背诵错误记录，无可导出的背诵条目。")
         for index, item in enumerate(dashboard["recitation_book"], 1):
             document.add_heading(f"{index}. {item.get('title') or '知识块'}", level=1)
             document.add_paragraph(f"训练方式：{item['mode']}　成绩：{item['score']:.1f}%　时间：{item['created_at']}")

@@ -37,7 +37,6 @@ _AI_NAMES = {
     "ZHIJIAO_AI_BASE_URL",
     "ZHIJIAO_AI_MODEL",
     "ZHIJIAO_AI_READ_TIMEOUT",
-    "ZHIJIAO_STUDENT_DEFAULT_PASSWORD",
     "ZHIJIAO_DEMO_TEACHER_ENABLED",
     "ZHIJIAO_MINERU_URL",
     "ZHIJIAO_MINERU_TOKEN",
@@ -167,14 +166,6 @@ def get_ai_settings(*, use_request: bool = True, mode_override: str | None = Non
     }
 
 
-def get_student_default_password() -> str:
-    """Read the deployment-only initial password without persisting it in SQLite."""
-    return (
-        os.environ.get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
-        or _read_env_file(SERVER_ENV).get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
-    )
-
-
 def _positive_int_setting(name: str, default: int) -> int:
     try:
         return max(1, int(get_runtime_setting(name, str(default))))
@@ -214,16 +205,13 @@ def get_document_ingestion_settings() -> dict[str, int]:
 
 
 def student_import_config_status() -> dict[str, str | bool | int]:
-    environment_value = os.environ.get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
-    file_value = _read_env_file(SERVER_ENV).get("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", "").strip()
-    value = environment_value or file_value
-    length = len(value)
+    """Describe the built-in import policy; no deployment password is required."""
     return {
-        "configured": bool(value),
-        "source": "environment" if environment_value else ("server.env" if file_value else "not_configured"),
-        "password_length": length,
-        "security_level": "not_configured" if not value else ("weak" if length < 6 else ("medium" if length < 10 else "strong")),
-        "config_path": str(SERVER_ENV),
+        "configured": True,
+        "source": "student_number",
+        "password_mode": "student_number",
+        "must_change_password": True,
+        "message": "新导入学生的账号和初始密码均为本人学号，首次登录需修改密码；已有账号保留原密码。",
     }
 
 
@@ -313,7 +301,8 @@ def validate_ai_base_url(base_url: str, *, allow_private: bool = False) -> None:
 
 
 MATERIALS_DIR = BASE_DIR / "course_materials"
-DATA_DIR = Path(os.environ.get("ZHIJIAO_DATA_DIR", BASE_DIR / "data")).resolve()
+_data_location = Path(get_runtime_setting("ZHIJIAO_DATA_DIR", "data")).expanduser()
+DATA_DIR = (_data_location if _data_location.is_absolute() else BASE_DIR / _data_location).resolve()
 DB_PATH = DATA_DIR / "learning.db"
 MAX_UPLOAD_MB = max(1, int(os.environ.get("ZHIJIAO_MAX_UPLOAD_MB", "500")))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
@@ -332,7 +321,7 @@ def teacher_portal_enabled_for(actor: dict | None = None) -> bool:
     actor = actor or {}
     return (
         DEMO_TEACHER_ENABLED
-        and str(actor.get("user_id", "")) == "demo_teacher_001"
+        and str(actor.get("user_id", "")) in {"demo_teacher_001", "demo_showcase_teacher_001"}
         and str(actor.get("role", "")) == "teacher"
     )
 
@@ -343,4 +332,3 @@ AI_PROVIDER = str(_INITIAL_AI["provider"])
 AI_API_KEY = str(_INITIAL_AI["api_key"])
 AI_BASE_URL = str(_INITIAL_AI["base_url"])
 AI_MODEL = str(_INITIAL_AI["model"])
-

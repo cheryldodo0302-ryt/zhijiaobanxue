@@ -16,6 +16,7 @@ import { termLabel } from '../term-label'
 import {parserConnectionDetail,parserConnectionLabel,parserConnectionState} from '../parser-status'
 
 const courses=ref<any[]>([]),jobs=ref<any[]>([]),trash=ref<any[]>([]),courseId=ref(''),selectedDoc=ref<any>(null),analysis=ref<any>(null),readiness=ref<any>(null)
+const coursesLoading=ref(true),coursesError=ref('')
 const {restoreCourse}=useTeacherWorkspace(courses,courseId)
 const outlineMode=ref<'document'|'course'>('document'),nodes=ref<any[]>([]),relations=ref<any[]>([]),partitions=ref<any[]>([]),teachingLevels=ref<any[]>([]),teachingScopeFilter=ref(''),selectedMaterialType=ref(''),selectedNode=ref<any>(null),treeRef=ref<any>(null),checkedOutlineKeys=ref<string[]>([])
 const rememberedTeachingScopeIds=ref<string[]>([])
@@ -177,7 +178,22 @@ async function refreshParserStatus(){try{parserStatus.value=(await api.get('/sys
 function onParserVisibilityChange(){if(document.visibilityState==='visible')void refreshParserStatus()}
 function rememberTeachingScope(ids:string[]){if(!courseId.value)return;const allowed=new Set(teachingLevels.value.map(item=>String(item.class_id)));rememberedTeachingScopeIds.value=[...new Set(ids.map(String))].filter(id=>allowed.has(id))}
 function applyRememberedTeachingScope(){if(!selectedNode.value||selectedNode.value.node_type!=='knowledge_point'||!rememberedTeachingScopeIds.value.length)return;selectedNode.value.class_ids=[...rememberedTeachingScopeIds.value];ElMessage.info('已沿用上次教学层级，请点击“保存教学层级”确认')}
-async function load(){const[c,p]=await Promise.all([api.get('/teacher/courses'),api.get('/system/parser-status')]);courses.value=c.data;parserStatus.value=p.data;restoreCourse();await Promise.all([loadJobs(),loadAiSettings()])}
+async function load(){
+  coursesLoading.value=true
+  coursesError.value=''
+  try{
+    courses.value=(await api.get('/teacher/courses')).data
+    restoreCourse()
+  }catch(e:any){
+    coursesError.value=typeof e.response?.data?.detail==='string'?e.response.data.detail:'课程加载失败，请重试'
+    return
+  }finally{coursesLoading.value=false}
+  // Optional services must never prevent the course selector from becoming usable.
+  await Promise.all([
+    loadJobs().catch(e=>fail(e,'课程资料加载失败，请刷新重试')),
+    loadAiSettings().catch(e=>fail(e,'内容分析服务配置加载失败')),
+  ])
+}
 const materialPending=(job:any)=>Boolean(job&&(job._saved_material_type!==job.material_type||JSON.stringify(job._saved_tags||[])!==JSON.stringify(job.tags||[])))
 async function loadJobs(){if(!courseId.value)return;const id=courseId.value;const[j,r,t]=await Promise.all([api.get(`/teacher/courses/${courseId.value}/ingestion-jobs`),api.get(`/teacher/courses/${courseId.value}/knowledge-workflow`),api.get(`/teacher/courses/${courseId.value}/knowledge-trash`)]);if(courseId.value!==id)return;jobs.value=j.data.map((fresh:any)=>{const old=jobs.value.find((job:any)=>job.document_id===fresh.document_id);const edits=old&&materialPending(old)?{material_type:old.material_type,tags:old.tags}:{};return {...fresh,...edits,_saved_material_type:fresh.material_type,_saved_tags:[...(fresh.tags||[])]}});selectedJobs.value=selectedJobs.value.map((job:any)=>jobs.value.find((fresh:any)=>fresh.document_id===job.document_id)).filter(Boolean);if(!jobs.value.some((job:any)=>job.document_id===resourceJobId.value))resourceJobId.value=jobs.value[0]?.document_id||'';readiness.value=r.data;if(!selectedTrash.value.length)trash.value=t.data;if(selectedDoc.value)selectedDoc.value=jobs.value.find((x:any)=>x.document_id===selectedDoc.value.document_id)||selectedDoc.value}
 async function changeCourse(){readiness.value=null;selectedJobs.value=[];selectedTrash.value=[];selectedDoc.value=null;selectedNode.value=null;selectedCandidateId.value='';candidateDraftId.value='';candidateDraft.value='';analysis.value=null;nodes.value=[];relations.value=[];partitions.value=[];teachingLevels.value=[];trash.value=[];candidates.value=[];previewUrl.value='';downloadUrl.value='';resourceJobId.value='';resourcePickerVisible.value=false;resourceViewMode.value='overview';await loadJobs()}
@@ -334,7 +350,13 @@ async function withdrawPublication(){
 }
 function go(v:any=pageInput.value){page.value=pageInput.value=clampPage(v,totalPages.value,page.value);if(previewKind.value==='pptx')nextTick(()=>focusPptSlide(page.value))}
 watch(reviewMode,async()=>{if(previewKind.value==='pptx'&&pptBuffer.value){await nextTick();pptRenderedWidth=0;await renderPptPreview(true);observePptHost()}})
-onMounted(async()=>{await load();timer=window.setInterval(async()=>{await loadJobs();if(analysis.value&&['queued','running','retry_wait'].includes(analysis.value.status)){analysis.value=(await api.get(`/teacher/analysis-jobs/${analysis.value.analysis_job_id}`)).data;if(analysis.value.status==='review_required')await Promise.all([loadOutline(),loadIngestionMetadata()])}},4000);parserTimer=window.setInterval(()=>void refreshParserStatus(),15000);document.addEventListener('visibilitychange',onParserVisibilityChange)})
+onMounted(()=>{
+  void load()
+  void refreshParserStatus()
+  timer=window.setInterval(async()=>{try{await loadJobs();if(analysis.value&&['queued','running','retry_wait'].includes(analysis.value.status)){analysis.value=(await api.get(`/teacher/analysis-jobs/${analysis.value.analysis_job_id}`)).data;if(analysis.value.status==='review_required')await Promise.all([loadOutline(),loadIngestionMetadata()])}}catch{/* Retry background status on the next tick. */}},4000)
+  parserTimer=window.setInterval(()=>void refreshParserStatus(),15000)
+  document.addEventListener('visibilitychange',onParserVisibilityChange)
+})
 onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(parserTimer);document.removeEventListener('visibilitychange',onParserVisibilityChange);stopPptObserver()})
 </script>
 
@@ -379,13 +401,14 @@ onUnmounted(()=>{if(timer)clearInterval(timer);if(parserTimer)clearInterval(pars
     </div>
   </div>
   <el-alert v-if="readiness&&!readiness.can_publish" class="readiness-alert" type="warning" :closable="false"><template #title>知识库尚未达到发布条件</template><span v-for="item in readiness.blockers" :key="item.code">{{item.message}}（{{item.count}}）　</span></el-alert>
-  <el-alert v-if="!courses.length" class="readiness-alert" type="warning" :closable="false" title="当前教师账号还没有共享课程">
+  <el-alert v-if="coursesError" class="readiness-alert" type="error" :closable="false" :title="coursesError"><el-button type="primary" link :loading="coursesLoading" @click="load">重新加载课程</el-button></el-alert>
+  <el-alert v-else-if="!coursesLoading&&!courses.length" class="readiness-alert" type="warning" :closable="false" title="当前教师账号还没有共享课程">
     请先在教学管理中创建共享课程，再返回这里上传课程资料。
     <el-button type="primary" link @click="router.push('/teaching')">前往教学管理</el-button>
   </el-alert>
   <el-card shadow="never" class="resource-toolbar-card">
     <div class="resource-toolbar">
-      <div class="resource-course-select"><span class="toolbar-label">当前课程</span><el-select v-model="courseId" placeholder="请先创建共享课程" :disabled="uploading||completingReview||!courses.length" @change="changeCourse"><el-option v-for="x in courses" :key="x.course_id" :label="x.course_name" :value="x.course_id"/></el-select></div>
+      <div class="resource-course-select"><span class="toolbar-label">当前课程</span><el-select v-model="courseId" :placeholder="coursesLoading?'正在加载课程':coursesError?'课程加载失败':courses.length?'请选择课程':'请先创建共享课程'" :loading="coursesLoading" :disabled="uploading||completingReview||coursesLoading||!courses.length" @change="changeCourse"><el-option v-for="x in courses" :key="x.course_id" :label="x.course_name" :value="x.course_id"/></el-select></div>
       <div class="resource-toolbar-copy"><span class="toolbar-kicker">课程知识建设</span><strong>资料、解析和审核集中管理</strong><small>平时只显示两项处理状态，需要时再打开上传进度或知识点回收站。</small></div>
       <div class="resource-toolbar-actions"><el-button type="primary" :disabled="!courseId" @click="uploadDialogVisible=true">上传资料</el-button><el-button plain :disabled="!jobs.length" @click="progressDialogVisible=true">查看处理进度</el-button><el-button plain :disabled="!courseId" @click="trashDialogVisible=true">知识点回收站 <span class="toolbar-count">{{trash.length}}</span></el-button><el-button circle :disabled="!courseId" @click="loadJobs" aria-label="刷新"><span class="refresh-symbol">↻</span></el-button></div>
     </div>

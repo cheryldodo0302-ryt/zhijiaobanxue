@@ -20,6 +20,17 @@ class StudyRoomUnavailable(RuntimeError):
     """Raised when a student has no active browser study session."""
 
 
+MINIMUM_SAMPLE_SECONDS = 60
+
+
+def apply_assessment_limit(record, valid_seconds):
+    if valid_seconds < MINIMUM_SAMPLE_SECONDS:
+        record.update(score=None, average_score=None, focus=None, stability=None,
+                      presence_rate=None, score_level="未评估",
+                      evaluation="本次仅计时，未进行视觉状态评估")
+    return record
+
+
 class BrowserStudyRoomService:
     """浏览器本地识别 + 后端脱敏状态聚合的 AI 自习室服务。"""
 
@@ -142,9 +153,9 @@ class BrowserStudyRoomService:
 
     def _base_status(self) -> dict[str, Any]:
         return {
-            "status": "等待开始", "score": 0.0, "average_score": 0.0,
+            "status": "等待开始", "score": None, "average_score": None,
             "study_time": 0.0, "distract_time": 0.0, "away_time": 0.0,
-            "focus": 0.0, "learning": False, "session_id": None,
+            "focus": None, "learning": False, "session_id": None,
             "start_time": "", "update_time": self._now_label(), "score_level": "未评分",
             "evaluation": "等待开始学习", "stability": 0.0, "presence_rate": 0.0,
             "camera_available": False, "dependency_ready": True, "mode": "browser",
@@ -155,9 +166,14 @@ class BrowserStudyRoomService:
 
     def _session_status(self, session: dict[str, Any]) -> dict[str, Any]:
         metrics: StudyMetrics = session["metrics"]
-        metrics.advance()
+        fresh = session["sample_valid"] and time.monotonic() - session["sample_last"] <= 3
+        if not fresh:
+            metrics.set_fallback_timer()
+        else:
+            metrics.advance()
         return {
-            **self._base_status(), **metrics.snapshot(),
+            **self._base_status(), **apply_assessment_limit(metrics.snapshot(), session["valid_sample_seconds"] if fresh else 0),
+            "elapsed_seconds": time.monotonic() - session["started_monotonic"],
             "learning": True, "session_id": session["session_id"],
             "start_time": session["start_time"], "mode": "browser", "ai_mode": "local-model",
             "client_camera": True,
@@ -195,7 +211,7 @@ class BrowserStudyRoomService:
                     "session_id": uuid4().hex,
                     "start_time": self._now_label(),
                     "started_monotonic": time.monotonic(),
-                    "metrics": StudyMetrics(),
+                    "metrics": StudyMetrics(sampled_intervals_only=True),
                     "sharing_grant_id": grant_id, "course_id": course_id, "class_id": class_id,
                     "started_at_utc": stamp(utc_now()), "sample_last": None,
                     "sample_valid": False, "sample_focused": False,
@@ -213,17 +229,18 @@ class BrowserStudyRoomService:
             sample_now = time.monotonic()
             # Only bounded intervals between two valid telemetry samples count.
             # No polling/status call or stale frame extrapolates focus across a disconnect.
-            valid = bool(payload.get("camera_available", True)) and not payload.get("calibrating", False)
+            valid = bool(payload.get("camera_available", False)) and not payload.get("calibrating", False)
             previous = session["sample_last"]
             gap = sample_now - previous if previous is not None else 0
             if valid and session["sample_valid"] and 0 < gap <= 3:
+                metrics.add_observed_time(metrics.status, gap)
                 session["valid_sample_seconds"] += gap
                 if session["sample_focused"]:
                     session["focused_sample_seconds"] += gap
             session["sample_last"] = sample_now
             session["sample_valid"] = valid
             session["sample_focused"] = bool(payload.get("face_ok") and payload.get("head_ok") and payload.get("person_ok") and not payload.get("eye_closed"))
-            result = metrics.ingest(
+            metrics.ingest(
                 face_ok=bool(payload.get("face_ok", False)),
                 head_ok=bool(payload.get("head_ok", False)),
                 eye_closed=bool(payload.get("eye_closed", False)),
@@ -233,17 +250,9 @@ class BrowserStudyRoomService:
                 hand_confidence=max(0.0, min(1.0, float(payload.get("hand_confidence", 0.0) or 0.0))),
                 head_score=max(0.0, min(1.0, float(payload.get("head_score", 0.0) or 0.0))),
                 calibrating=bool(payload.get("calibrating", False)),
-                camera_available=bool(payload.get("camera_available", True)),
+                camera_available=bool(payload.get("camera_available", False)),
             )
-            return {
-                **self._base_status(), **result,
-                "learning": True, "session_id": session["session_id"],
-                "start_time": session["start_time"], "mode": "browser", "ai_mode": "local-model",
-                "client_camera": True,
-                "course_id": session.get("course_id"), "class_id": session.get("class_id"),
-                "sharing_grant_id": session.get("sharing_grant_id"),
-                "warning": "摄像头画面只在当前浏览器显示，仅上传识别后的统计信号。",
-            }
+            return self._session_status(session)
 
     def finish(self, student_id: str) -> dict[str, Any]:
         with self._lock:
@@ -271,6 +280,7 @@ class BrowserStudyRoomService:
             from class_task_service import stamp, utc_now
             record.update({key: session[key] for key in ("sharing_grant_id", "course_id", "class_id", "started_at_utc", "valid_sample_seconds", "focused_sample_seconds")})
             record.update(ended_at_utc=stamp(utc_now()), elapsed_seconds=max(0, time.monotonic()-session["started_monotonic"]))
+            apply_assessment_limit(record, session["valid_sample_seconds"])
             with self.engine.begin() as connection:
                 connection.execute(
                     text("INSERT INTO study_room_records(student_id,data,created_at) VALUES(:student_id,:data,:created_at)"),
@@ -290,24 +300,26 @@ class BrowserStudyRoomService:
         result: list[dict[str, Any]] = []
         for row in rows:
             try:
-                result.append(json.loads(row[0]))
+                record = json.loads(row[0])
+                record.setdefault("elapsed_seconds", sum(record.get(key, 0) or 0 for key in
+                                                       ("study_time", "distract_time", "away_time")))
+                if "valid_sample_seconds" in record or not record.get("ai_frame_count"):
+                    apply_assessment_limit(record, record.get("valid_sample_seconds", 0))
+                result.append(record)
             except (TypeError, json.JSONDecodeError):
                 continue
         return result
 
     def statistics(self, student_id: str) -> dict[str, Any]:
         records = self.records(student_id, 1000)
-        if not records:
-            return {"total_sessions": 0, "total_study_time": 0.0, "average_score": 0.0,
-                    "average_focus": 0.0, "best_score": 0.0}
-        scores = [float(item.get("score", 0) or 0) for item in records]
-        focuses = [float(item.get("focus", 0) or 0) for item in records]
+        scores = [item["score"] for item in records if item.get("score") is not None]
+        focuses = [item["focus"] for item in records if item.get("focus") is not None]
         return {
-            "total_sessions": len(records),
-            "total_study_time": round(sum(float(item.get("study_time", 0) or 0) for item in records), 1),
-            "average_score": round(sum(scores) / len(scores), 1),
-            "average_focus": round(sum(focuses) / len(focuses), 1),
-            "best_score": round(max(scores), 1),
+            "total_sessions": len(records), "evaluated_sessions": len(scores),
+            "total_study_time": round(sum(item["elapsed_seconds"] for item in records), 1),
+            "average_score": round(sum(scores) / len(scores), 1) if scores else None,
+            "average_focus": round(sum(focuses) / len(focuses), 1) if focuses else None,
+            "best_score": max(scores, default=None),
         }
 
     def clear_records(self, student_id: str) -> None:

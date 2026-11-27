@@ -247,7 +247,7 @@ onUnmounted(() => { disposed = true; requestVersion++ })
             <el-table-column label="错误率" width="180">
               <template #default="{ row }">
                 <el-progress v-if="row.attempts" :percentage="row.error_rate" :color="errorRateColor(row.error_rate)" />
-                <span class="muted">尚未作答</span>
+                <span v-else class="muted">尚未作答</span>
               </template>
             </el-table-column>
           </el-table></template></ExpandableList>

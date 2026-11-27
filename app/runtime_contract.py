@@ -9,6 +9,11 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 
 
+def runtime_instance_id() -> str:
+    from config import DB_PATH
+    return hashlib.sha256(str(DB_PATH.resolve()).encode("utf-8")).hexdigest()[:20]
+
+
 def source_fingerprint() -> str:
     digest = hashlib.sha256()
     paths = list(PROJECT_DIR.glob("*.py")) + list((PROJECT_DIR / "scripts").glob("*.py"))

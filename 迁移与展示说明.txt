@@ -1,0 +1,36 @@
+﻿智教伴学：整目录迁移与展示
+
+1. 关闭智教伴学启动窗口后，自行压缩当前整个文件夹。
+2. 在新 Windows 电脑完整解压，直接双击“智教伴学.exe”。无需输入 PowerShell 指令。
+3. 不要漏掉 app/data（包括隐藏密钥）、app/web/dist、installers 和配置文件。
+4. 账号、学生、课程、教学档案和已上传文件均在 app/data 中，首次启动自动修复旧路径。
+5. 未随包准备离线依赖时，新电脑首次安装 Python 依赖需要联网，无需预装 Node.js。
+
+新增展示教师：showcase_teacher
+教师密码与完整说明：app/data/showcase/展示账号说明.txt
+展示学生：2026240101（账号和初始密码相同）
+完整60人名单：app/data/showcase/学生账号名单.csv
+
+3门展示课程、6个教学班；每班30人，共60名虚构学生跨课程复用。
+每门课已有教学大纲、16次教案、16周进度、8个实验、8条反思及考核方案。
+原有账号和上传资料保留。
+
+详细迁移说明：app/docs/演示迁移说明.md
+
+OpenClaw 共用知识库 API：
+完整复制整个文件夹后，在新电脑双击“启动OpenClaw.cmd”。对话与课程问答将共用绑定教师
+在知识库 API 分析中保存的接口、模型和 API Key，不需要在 OpenClaw 再填一份密钥。
+保留 app/data/.job-secret.key、数据库、installers，以及直接复制时的 .runtime 隐藏目录。
+启动器自动准备便携 Node.js、修复 Python 环境，并为新电脑或新路径生成本机 OpenClaw 配置。
+第一次准备依赖需要联网；仍使用原账号登录。
+
+
+本版 app/wheelhouse 随附 Windows x64、Python 3.12 离线依赖。完整复制该目录即可。需要重建时，可在对应环境的 app 目录运行：
+py -3.12 -m pip download --only-binary=:all: -r requirements-lock.txt -d wheelhouse
+下载成功后随包复制整个 wheelhouse。启动脚本检测到该目录后会离线安装。
+在比赛电脑的最终路径完整解压，启动并登录，重启后再次验证。
+现场展示使用随包已上传的资料。在教师端进入“教学档案”，选择“数据库原理与应用”，在“文件管理”中预览 DB2026-教学大纲.txt。
+从解压后的根目录查找原件，示例路径如下。
+课程学习手册：app/data/uploads/sc_3c36f1d4049b/doc_7a290bb301d84ad2adcd7ceaa912d9bd_数据库原理与应用-学习手册_演示_.txt
+教学大纲：app/data/uploads/teaching_archive/taib_9f62fcc3ca4044079dc8e11c1e3a909f/taif_b2cab3f0e34045e2b171ebcdbbcb1843.txt
+文件管理页显示上传时的原名。保留 uploads 下的文件名和目录结构，系统通过数据库记录定位原件。

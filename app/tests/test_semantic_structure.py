@@ -340,14 +340,16 @@ def test_published_retrieval_can_filter_material_partition(tmp_path):
     assert evidence and {item.material_label for item in evidence} == {"课件"}
 
 
-def test_short_default_password_is_allowed_and_reported_weak(tmp_path, monkeypatch):
+def test_student_import_policy_uses_school_number_despite_legacy_setting(tmp_path, monkeypatch):
     import config
     monkeypatch.delenv("ZHIJIAO_STUDENT_DEFAULT_PASSWORD", raising=False)
     config_file = tmp_path / "server.env"
     config_file.write_text("ZHIJIAO_STUDENT_DEFAULT_PASSWORD=123\n", encoding="utf-8")
     monkeypatch.setattr(config, "SERVER_ENV", config_file)
     status = student_import_config_status()
-    assert status["configured"] is True and status["security_level"] == "weak"
+    assert status["configured"] is True and status["password_mode"] == "student_number"
+    assert status["must_change_password"] is True
+    assert "初始密码均为本人学号" in status["message"]
 
 
 def test_numbered_headings_keep_the_complete_original_title():

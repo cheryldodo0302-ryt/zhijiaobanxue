@@ -197,20 +197,31 @@ class LearningDatabase:
                 CREATE INDEX IF NOT EXISTS idx_ai_practice_course ON ai_practice_attempts(course_id, user_id);
             """)
             apply_migrations(conn)
+            self._relocate_legacy_data_paths(conn)
             self._backfill_class_scope(conn)
         self._reconcile_missing_document_sources()
+
+    def _relocate_legacy_data_paths(self, conn: sqlite3.Connection) -> None:
+        from portable_storage import relocate_database_paths
+        relocate_database_paths(conn, self.db_path.resolve().parent)
 
     def _reconcile_missing_document_sources(self) -> None:
         """Do not advertise a document as ready when its source file is gone."""
         rows = self.fetch_all(
-            "SELECT document_id,stored_path FROM course_documents WHERE status='ready' AND TRIM(stored_path)<>''"
+            "SELECT document_id,stored_path,status FROM course_documents WHERE TRIM(stored_path)<>'' "
+            "AND (status='ready' OR (status='failed' AND error_message='源文件缺失，请重新上传'))"
         )
         for row in rows:
             try:
                 source_exists = Path(str(row["stored_path"])).is_file()
             except (OSError, ValueError):
                 source_exists = False
-            if not source_exists:
+            if source_exists and row["status"] == "failed":
+                self.execute(
+                    "UPDATE course_documents SET status='ready',error_message='' WHERE document_id=?",
+                    (row["document_id"],),
+                )
+            elif not source_exists and row["status"] == "ready":
                 self.execute(
                     "UPDATE course_documents SET status='failed',error_message='源文件缺失，请重新上传' WHERE document_id=?",
                     (row["document_id"],),

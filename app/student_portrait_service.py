@@ -149,7 +149,8 @@ class StudentPortraitService:
             if stale:
                 self.db.execute("UPDATE student_portrait_evaluations SET invalidated=1 WHERE evaluation_id=?", (evaluation["evaluation_id"],))
             evaluation = {"evaluation_id": evaluation["evaluation_id"], "status": "stale" if stale else "draft", "created_at": evaluation["created_at"],
-                "content": None if stale else json.loads(evaluation["content_json"]), "label": "AI 草案"}
+                "content": None if stale else json.loads(evaluation["content_json"]),
+                "label": "演示模拟评价" if evaluation["evaluation_id"].startswith("showcase_eval_") else "AI 草案"}
         return {"course_id": course_id, "class_id": class_id, "student_id": student_id, "start_at": stamp(start), "end_at": stamp(end),
             "metrics_version": METRICS_VERSION, "evidence_version": version, "metrics": metrics, "tasks": tasks, "trends": trends,
             "evidence": evidence, "evaluation": evaluation,
